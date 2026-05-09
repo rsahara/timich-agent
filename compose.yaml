@@ -1,0 +1,26 @@
+name: timich-agent
+
+services:
+  timich-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: timich-agent:local
+    container_name: timich-agent
+    init: true
+    restart: unless-stopped
+    environment:
+      TIMICH_AGENT_NAME: "${TIMICH_AGENT_NAME:-Timich Agent}"
+      TIMICH_AGENT_DEVICE_LIMIT: "${TIMICH_AGENT_DEVICE_LIMIT:-32}"
+      TIMICH_AGENT_REMOTE_BROWSING_ENABLED: "${TIMICH_AGENT_REMOTE_BROWSING_ENABLED:-true}"
+    ports:
+      - "8081:8081"
+      - "8082:8082"
+    volumes:
+      - ./.local:/var/lib/timich-agent
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
