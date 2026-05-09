@@ -14,11 +14,12 @@ report security issues privately before sharing details in public.
 
 ## Reporting a Vulnerability
 
-Do not open a public issue for a vulnerability. Use GitHub's private
-vulnerability reporting flow for this repository if it is available. If that
-flow is not available, open a minimal public issue asking for a private
-disclosure channel without including exploit details, secrets, tokens, logs, or
-private network information.
+Use GitHub's private vulnerability reporting flow for this repository from the
+Security tab's "Report a vulnerability" action.
+
+Do not open a public issue, discussion, or pull request for a vulnerability
+report. Do not include exploit details, secrets, tokens, logs, private network
+information, or private media metadata in public project spaces.
 
 Helpful reports include:
 
