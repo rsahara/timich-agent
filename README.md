@@ -3,6 +3,10 @@
 `timich-agent` is the local Timich runtime for datasource configuration,
 pairing, direct LAN media delivery, and Timich Reach relay responses.
 
+If you want MCP clients such as Codex to search and preview media through a
+paired Agent, run [`timich-mcp`](https://github.com/rsahara/timich-mcp) on the
+machine where the MCP client runs.
+
 The current implementation focuses on a local operator loop that actually runs:
 
 - persistent local config
