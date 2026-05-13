@@ -25,6 +25,18 @@ func TestLoadDefaultsWhenConfigFileIsMissing(t *testing.T) {
 	if resolved.DeviceLimit != DefaultDeviceLimit {
 		t.Fatalf("DeviceLimit = %d, want default %d", resolved.DeviceLimit, DefaultDeviceLimit)
 	}
+	if resolved.ControlPlaneAddress != DefaultRelayConnectionAddress {
+		t.Fatalf("relay connection address = %q, want default %q", resolved.ControlPlaneAddress, DefaultRelayConnectionAddress)
+	}
+	if resolved.AppLinkBaseURL != DefaultAppLinkBaseURL {
+		t.Fatalf("app link base URL = %q, want default %q", resolved.AppLinkBaseURL, DefaultAppLinkBaseURL)
+	}
+	if resolved.AdvertisedMediaBaseURL != "" {
+		t.Fatalf("advertised media base URL = %q, want empty default", resolved.AdvertisedMediaBaseURL)
+	}
+	if resolved.Hosted.ServerURL != DefaultRemoteBrowsingServerURL {
+		t.Fatalf("remote browsing server URL = %q, want default %q", resolved.Hosted.ServerURL, DefaultRemoteBrowsingServerURL)
+	}
 	if !filepath.IsAbs(resolved.DataDir) {
 		t.Fatalf("DataDir should be absolute, got %q", resolved.DataDir)
 	}
@@ -58,8 +70,10 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	t.Setenv("TIMICH_AGENT_NAME", "  kitchen-agent  ")
 	t.Setenv("TIMICH_AGENT_ADMIN_LISTEN_ADDR", "127.0.0.1:19081")
 	t.Setenv("TIMICH_AGENT_MEDIA_LISTEN_ADDR", "0.0.0.0:19082")
+	t.Setenv("TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL", "http://10.0.1.4:19082")
 	t.Setenv("TIMICH_AGENT_DATA_DIR", "env-state")
 	t.Setenv("TIMICH_AGENT_DEVICE_LIMIT", "9")
+	t.Setenv("TIMICH_AGENT_APP_LINK_BASE_URL", "https://link.dev.timich.runo.jp")
 	t.Setenv("TIMICH_AGENT_RELAY_CONNECTION_ADDR", "https://relay-connection.example")
 	t.Setenv("TIMICH_AGENT_CONTROL_PLANE_SERVER_NAME", "control.example")
 	t.Setenv("TIMICH_AGENT_REMOTE_BROWSING_SERVER_URL", "https://relay.example")
@@ -81,6 +95,12 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	}
 	if resolved.ControlPlaneAddress != "https://relay-connection.example" {
 		t.Fatalf("relay connection address = %q, want env override", resolved.ControlPlaneAddress)
+	}
+	if resolved.AppLinkBaseURL != "https://link.dev.timich.runo.jp" {
+		t.Fatalf("app link base URL = %q, want env override", resolved.AppLinkBaseURL)
+	}
+	if resolved.AdvertisedMediaBaseURL != "http://10.0.1.4:19082" {
+		t.Fatalf("advertised media base URL = %q, want env override", resolved.AdvertisedMediaBaseURL)
 	}
 	if resolved.ControlPlaneServerName != "control.example" {
 		t.Fatalf("ControlPlaneServerName = %q, want env override", resolved.ControlPlaneServerName)
@@ -112,6 +132,39 @@ func TestLoadAcceptsRemoteBrowsingConfig(t *testing.T) {
 	}
 	if resolved.Hosted.ServerURL != "https://relay-server.example" {
 		t.Fatalf("relay server URL = %q, want config value", resolved.Hosted.ServerURL)
+	}
+}
+
+func TestLoadUpgradesLegacyProductionRelayConnectionAddress(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	raw := []byte("{\n  \"relayConnectionAddress\": \"https://timich.runo.jp\",\n  \"remoteBrowsing\": {\"enabled\": true, \"serverURL\": \"https://timich.runo.jp\"}\n}\n")
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.ControlPlaneAddress != DefaultRelayConnectionAddress {
+		t.Fatalf("relay connection address = %q, want upgraded default %q", resolved.ControlPlaneAddress, DefaultRelayConnectionAddress)
+	}
+}
+
+func TestLoadPreservesExplicitRelayConnectionEnvironmentOverride(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	raw := []byte("{\n  \"relayConnectionAddress\": \"https://timich.runo.jp\",\n  \"remoteBrowsing\": {\"enabled\": true, \"serverURL\": \"https://timich.runo.jp\"}\n}\n")
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	t.Setenv("TIMICH_AGENT_RELAY_CONNECTION_ADDR", "https://timich.runo.jp")
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.ControlPlaneAddress != "https://timich.runo.jp" {
+		t.Fatalf("relay connection address = %q, want explicit env override preserved", resolved.ControlPlaneAddress)
 	}
 }
 
@@ -169,6 +222,9 @@ func TestWriteDefaultFileCreatesConfig(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"relayConnectionAddress"`) {
 		t.Fatalf("config missing relayConnectionAddress key: %s", string(raw))
+	}
+	if !strings.Contains(string(raw), DefaultRelayConnectionAddress) {
+		t.Fatalf("config missing default relay connection address %q: %s", DefaultRelayConnectionAddress, string(raw))
 	}
 	if strings.Contains(string(raw), `"hosted"`) {
 		t.Fatalf("config should not write legacy hosted key: %s", string(raw))
@@ -279,6 +335,9 @@ func TestUpdatePrimaryDatasourceFilePreservesFileBackedSettingsOnly(t *testing.T
 	if updated.AdminListenAddress != "127.0.0.1:8081" {
 		t.Fatalf("AdminListenAddress = %q, want file-backed value", updated.AdminListenAddress)
 	}
+	if updated.ControlPlaneAddress != DefaultRelayConnectionAddress {
+		t.Fatalf("relay connection address = %q, want current default %q", updated.ControlPlaneAddress, DefaultRelayConnectionAddress)
+	}
 	if len(updated.Datasources) != 2 {
 		t.Fatalf("Datasources length = %d, want preserved additional datasource", len(updated.Datasources))
 	}
@@ -306,6 +365,7 @@ func TestApplyRuntimeOverridesResolvesRelativeDataDirFromWorkingDirectory(t *tes
 			MediaListenAddress:  "0.0.0.0:8082",
 			DataDir:             filepath.Join(t.TempDir(), "state"),
 			DeviceLimit:         5,
+			AppLinkBaseURL:      DefaultAppLinkBaseURL,
 			ControlPlaneAddress: "https://timich.runo.jp",
 			Hosted: RemoteBrowsingConfig{
 				ServerURL: "https://timich.runo.jp",
@@ -337,5 +397,18 @@ func TestLoadAllowsLoopbackAdminListenAddressOptOut(t *testing.T) {
 	}
 	if resolved.AdminListenAddress != "127.0.0.1:8081" {
 		t.Fatalf("AdminListenAddress = %q, want loopback opt-out", resolved.AdminListenAddress)
+	}
+}
+
+func TestLoadValidatesAdvertisedMediaBaseURL(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	raw := []byte("{\n  \"advertisedMediaBaseURL\": \"ftp://agent.local:8082\"\n}\n")
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	_, err := Load(configPath)
+	if err == nil || !strings.Contains(err.Error(), "advertised media base URL") {
+		t.Fatalf("Load() error = %v, want advertised media base URL validation error", err)
 	}
 }

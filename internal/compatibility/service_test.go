@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,7 +72,10 @@ func TestRunReturnsOKWhenDatasourceAndRemoteBrowsingChecksPass(t *testing.T) {
 		},
 	}
 
-	report := NewService("test-agent-version", "agent-home", "relay-key", "private-key", cfg, catalog.NewService(cfg.Datasources), false).Run(context.Background())
+	report := NewService("test-agent-version", "agent-home", "relay-key", "private-key", cfg, catalog.NewService(cfg.Datasources), RelayRegistrationState{
+		CredentialSynced: true,
+		Ready:            true,
+	}).Run(context.Background())
 	if report.Status != StatusOK {
 		t.Fatalf("report status = %q, want %q", report.Status, StatusOK)
 	}
@@ -93,7 +97,7 @@ func TestRunFailsWhenRemoteBrowsingDisabled(t *testing.T) {
 		},
 	}
 
-	report := NewService("test-agent-version", "agent-home", "", "", cfg, catalog.NewService(nil), false).Run(context.Background())
+	report := NewService("test-agent-version", "agent-home", "", "", cfg, catalog.NewService(nil), RelayRegistrationState{}).Run(context.Background())
 	if report.Status != StatusFailed {
 		t.Fatalf("report status = %q, want %q", report.Status, StatusFailed)
 	}
@@ -113,12 +117,111 @@ func TestAgentConfigCheckAllowsUnsyncedRelayCredentialWithSigningKey(t *testing.
 		},
 	}
 
-	check := NewService("test-agent-version", "agent-home", "relay-key", "private-key", cfg, catalog.NewService(nil), false).runAgentConfigCheck()
+	check := NewService("test-agent-version", "agent-home", "relay-key", "private-key", cfg, catalog.NewService(nil), RelayRegistrationState{}).runAgentConfigCheck()
 	if check.Status != StatusOK {
 		t.Fatalf("agent_config status = %q, want %q", check.Status, StatusOK)
 	}
 	if check.Details["relayCredentialSynced"] != false {
 		t.Fatalf("relayCredentialSynced = %#v, want false", check.Details["relayCredentialSynced"])
+	}
+}
+
+func TestRunWarnsWhenRelayCredentialIsNotRegisteredYet(t *testing.T) {
+	datasourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/search/metadata":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"assets": map[string]any{
+					"items":    []map[string]any{},
+					"total":    0,
+					"nextPage": nil,
+				},
+			})
+		case "/api/search/statistics":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"images": 12,
+			})
+		default:
+			t.Fatalf("unexpected datasource path %s", r.URL.Path)
+		}
+	}))
+	defer datasourceServer.Close()
+
+	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/version" {
+			t.Fatalf("unexpected relay server path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"service": "timich-server",
+			"version": "test-server",
+		})
+	}))
+	defer relayServer.Close()
+
+	cfg := agentconfig.ResolvedConfig{
+		Config: agentconfig.Config{
+			Hosted: agentconfig.RemoteBrowsingConfig{
+				Enabled:   true,
+				ServerURL: relayServer.URL,
+			},
+			ControlPlaneAddress: "http://127.0.0.1:1",
+			Datasources: []agentconfig.DatasourceConfig{{
+				Name:        "Home Immich",
+				Kind:        "immich",
+				URL:         datasourceServer.URL,
+				AccessToken: "test-token",
+			}},
+		},
+	}
+
+	report := NewService("test-agent-version", "agent-home", "relay-key", "private-key", cfg, catalog.NewService(cfg.Datasources), RelayRegistrationState{
+		CredentialSynced: false,
+		Ready:            false,
+		BlockedBy:        []string{"paired device"},
+	}).Run(context.Background())
+	if report.Status != StatusWarning {
+		t.Fatalf("report status = %q, want %q", report.Status, StatusWarning)
+	}
+	relayConnection := report.Checks[3]
+	if relayConnection.Status != StatusWarning {
+		t.Fatalf("relay_connection status = %q, want %q", relayConnection.Status, StatusWarning)
+	}
+	if !strings.Contains(relayConnection.Summary, "setup is not complete") {
+		t.Fatalf("relay_connection summary = %q, want setup-incomplete message", relayConnection.Summary)
+	}
+	if !strings.Contains(relayConnection.Remediation, "paired device") {
+		t.Fatalf("relay_connection remediation = %q, want paired device blocker", relayConnection.Remediation)
+	}
+	if _, ok := relayConnection.Details["ack"]; ok {
+		t.Fatalf("relay_connection details included ack even though the probe should not run: %#v", relayConnection.Details)
+	}
+}
+
+func TestRelayConnectionCheckExplainsLegacyProductionTarget(t *testing.T) {
+	cfg := agentconfig.ResolvedConfig{
+		Config: agentconfig.Config{
+			Hosted: agentconfig.RemoteBrowsingConfig{
+				Enabled:   true,
+				ServerURL: agentconfig.DefaultRemoteBrowsingServerURL,
+			},
+			ControlPlaneAddress: agentconfig.DefaultRemoteBrowsingServerURL,
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	check := NewService("test-agent-version", "agent-home", "relay-key", "private-key", cfg, catalog.NewService(nil), RelayRegistrationState{
+		CredentialSynced: true,
+		Ready:            true,
+	}).runRelayConnectionCheck(ctx)
+	if check.Status != StatusFailed {
+		t.Fatalf("relay_connection status = %q, want %q", check.Status, StatusFailed)
+	}
+	if !strings.Contains(check.Remediation, agentconfig.DefaultRelayConnectionAddress) {
+		t.Fatalf("relay_connection remediation = %q, want production control-plane address", check.Remediation)
 	}
 }
 

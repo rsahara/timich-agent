@@ -7,11 +7,14 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRegisterRelayCredentialSendsSignedProof(t *testing.T) {
@@ -50,6 +53,46 @@ func TestRegisterRelayCredentialSendsSignedProof(t *testing.T) {
 	}
 }
 
+func TestRunOnceTimesOutStalledDial(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			accepted <- conn
+			return
+		}
+		close(accepted)
+	}()
+
+	originalTimeout := controlPlaneDialTimeout
+	controlPlaneDialTimeout = 50 * time.Millisecond
+	defer func() { controlPlaneDialTimeout = originalTimeout }()
+
+	client := &Client{
+		target:  listener.Addr().String(),
+		agentID: "agent-home",
+		version: "test",
+	}
+	err = client.runOnce(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runOnce() error = %v, want deadline exceeded", err)
+	}
+
+	select {
+	case conn, ok := <-accepted:
+		if ok {
+			conn.Close()
+		}
+	default:
+	}
+}
+
 func TestHandleHostedPairingRequiresHostedBaseURL(t *testing.T) {
 	client := &Client{}
 	response := client.handleHostedPairing(&RelayRequest{
@@ -69,15 +112,16 @@ func TestHandleHostedPairingRequiresHostedBaseURL(t *testing.T) {
 
 func TestHandleMediaRequestRequiresHostedBaseURL(t *testing.T) {
 	client := &Client{}
-	parsedURL, err := url.ParseRequestURI("/v1/catalog")
+	parsedURL, err := url.ParseRequestURI("/v1/assets/search")
 	if err != nil {
 		t.Fatalf("ParseRequestURI() error = %v", err)
 	}
 
 	response := client.handleMediaRequest(&RelayRequest{
 		FetchID: "fetch-2",
-		Method:  http.MethodGet,
-		Path:    "/v1/catalog",
+		Method:  http.MethodPost,
+		Path:    "/v1/assets/search",
+		Body:    []byte(`{"collection":{"kind":"timeline"},"page":{"index":0,"size":60}}`),
 	}, parsedURL)
 
 	if response.StatusCode != http.StatusInternalServerError {

@@ -1,6 +1,7 @@
 package mediaapi
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,70 @@ import (
 
 	"github.com/rsahara/timich-agent/internal/catalog"
 )
+
+func TestMuxRootOnlyServesRouteIndex(t *testing.T) {
+	t.Parallel()
+
+	handler := NewMux(nil)
+	tests := []struct {
+		name        string
+		path        string
+		wantStatus  int
+		wantKey     string
+		wantValue   string
+		wantMessage string
+	}{
+		{
+			name:       "root route index",
+			path:       "/",
+			wantStatus: http.StatusOK,
+			wantKey:    "service",
+			wantValue:  "timich-agent-media",
+		},
+		{
+			name:       "unknown route",
+			path:       "/missing",
+			wantStatus: http.StatusNotFound,
+			wantKey:    "error",
+			wantValue:  "route_not_found",
+		},
+		{
+			name:        "removed catalog route",
+			path:        "/v1/catalog",
+			wantStatus:  http.StatusGone,
+			wantKey:     "error",
+			wantValue:   "catalog_endpoint_removed",
+			wantMessage: "GET /v1/catalog has been removed. Use POST /v1/assets/search instead.",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, tc.path, nil))
+
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d body=%s", recorder.Code, tc.wantStatus, recorder.Body.String())
+			}
+			if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+				t.Fatalf("Content-Type = %q, want application/json", got)
+			}
+
+			var payload map[string]any
+			if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
+			}
+			if payload[tc.wantKey] != tc.wantValue {
+				t.Fatalf("%s = %v, want %q payload=%v", tc.wantKey, payload[tc.wantKey], tc.wantValue, payload)
+			}
+			if tc.wantMessage != "" && payload["message"] != tc.wantMessage {
+				t.Fatalf("message = %v, want %q payload=%v", payload["message"], tc.wantMessage, payload)
+			}
+		})
+	}
+}
 
 func TestCopyProxyResponseCopiesStreamingHeaders(t *testing.T) {
 	t.Parallel()

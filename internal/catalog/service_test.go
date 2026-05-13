@@ -132,6 +132,113 @@ func TestCatalogPageUsesStatisticsTotal(t *testing.T) {
 	}
 }
 
+func TestTimelineSearchWithFiltersUsesSearchTotal(t *testing.T) {
+	t.Parallel()
+
+	from := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, time.February, 1, 0, 0, 0, 0, time.UTC)
+	service := NewService([]config.DatasourceConfig{{
+		Name:        "test",
+		Kind:        "immich",
+		URL:         "http://immich.test",
+		AccessToken: "test-key",
+	}})
+	metadataRequests := 0
+	statisticsRequests := 0
+	service.client = &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			var body string
+			switch r.URL.Path {
+			case "/api/search/metadata":
+				metadataRequests++
+				var requestBody map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+					t.Fatalf("decode metadata request body: %v", err)
+				}
+				if requestBody["type"] != "VIDEO" {
+					t.Fatalf("metadata request type = %v, want VIDEO", requestBody["type"])
+				}
+				if requestBody["takenAfter"] != from.Format(time.RFC3339Nano) {
+					t.Fatalf("metadata request takenAfter = %v, want %s", requestBody["takenAfter"], from.Format(time.RFC3339Nano))
+				}
+				if requestBody["takenBefore"] != to.Format(time.RFC3339Nano) {
+					t.Fatalf("metadata request takenBefore = %v, want %s", requestBody["takenBefore"], to.Format(time.RFC3339Nano))
+				}
+				body = `{
+					"assets": {
+						"total": 6,
+						"items": [
+							{
+								"id": "video-123",
+								"type": "VIDEO",
+								"originalFileName": "clip.mov",
+								"fileCreatedAt": "2026-01-07T09:57:15.053Z",
+								"duration": "0:00:10.000000"
+							}
+						]
+					}
+				}`
+			case "/api/search/statistics":
+				statisticsRequests++
+				body = `{
+					"images": 124,
+					"videos": 6
+				}`
+			default:
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{}`)),
+				}, nil
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type": []string{"application/json"},
+				},
+				Body: io.NopCloser(strings.NewReader(body)),
+			}, nil
+		}),
+	}
+
+	page, err := service.SearchAssets(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind: CollectionKindTimeline,
+			Filters: AssetSearchFilters{
+				MediaTypes: []string{"video"},
+				CapturedAt: &AssetSearchCapturedTime{
+					From: &from,
+					To:   &to,
+				},
+			},
+		},
+		Page: AssetSearchPageRequest{
+			Index: 0,
+			Size:  60,
+		},
+	})
+	if err != nil {
+		t.Fatalf("filtered timeline search: %v", err)
+	}
+
+	if page.Total != 6 {
+		t.Fatalf("filtered timeline total = %d, want search response total 6", page.Total)
+	}
+	if page.TotalAccuracy != TotalAccuracyExact {
+		t.Fatalf("filtered timeline total accuracy = %q, want %q", page.TotalAccuracy, TotalAccuracyExact)
+	}
+	if metadataRequests != 1 {
+		t.Fatalf("metadata requests = %d, want 1", metadataRequests)
+	}
+	if statisticsRequests != 0 {
+		t.Fatalf("statistics requests = %d, want no statistics request for filtered timeline", statisticsRequests)
+	}
+	if len(page.Items) != 1 || page.Items[0].Type != "video" {
+		t.Fatalf("items = %#v, want one video item", page.Items)
+	}
+}
+
 func TestStaticDemoCatalogAndMedia(t *testing.T) {
 	t.Parallel()
 
@@ -180,8 +287,8 @@ func TestStaticDemoCatalogAndMedia(t *testing.T) {
 	if page.Total != 1 || len(page.Items) != 1 {
 		t.Fatalf("page = %#v, want one static asset", page)
 	}
-	if !page.Items[0].FileCreatedAt.Equal(time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)) {
-		t.Fatalf("FileCreatedAt = %v", page.Items[0].FileCreatedAt)
+	if !page.Items[0].CapturedAt.Equal(time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("CapturedAt = %v", page.Items[0].CapturedAt)
 	}
 
 	response, err := service.Preview(nil, "demo-0001")

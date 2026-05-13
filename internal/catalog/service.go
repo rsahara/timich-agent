@@ -2,6 +2,8 @@ package catalog
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -31,6 +33,8 @@ import (
 var ErrNoDatasourceConfigured = errors.New("no datasource configured")
 var ErrMediaTooLarge = errors.New("media response too large")
 var ErrAssetNotFound = errors.New("asset not found")
+var ErrInvalidSearchRequest = errors.New("invalid search request")
+var ErrUnsupportedSearch = errors.New("unsupported search")
 
 const (
 	previewSize                = "thumbnail"
@@ -42,6 +46,8 @@ const (
 	detailPreviewMaxBytes      = 1 << 20
 	detailPreviewMaxSource     = 32 << 20
 	statisticsTotalCacheTTL    = time.Minute
+	defaultPageSize            = 60
+	maxPageSize                = 200
 )
 
 var (
@@ -49,22 +55,148 @@ var (
 	detailPreviewJPEGQualities = []int{detailPreviewJPEGQuality, 70, 58, 50, 42}
 )
 
-// Asset matches the app-facing asset model returned to iOS clients.
+// Asset matches the Timich app-facing asset model returned to clients.
 type Asset struct {
-	ID               string    `json:"id"`
-	Type             string    `json:"type"`
-	OriginalFileName string    `json:"originalFileName"`
-	FileCreatedAt    time.Time `json:"fileCreatedAt"`
-	Duration         *string   `json:"duration,omitempty"`
+	ID         string    `json:"id"`
+	Type       string    `json:"type"`
+	Filename   string    `json:"filename"`
+	CapturedAt time.Time `json:"capturedAt"`
+	Duration   *string   `json:"duration,omitempty"`
 }
 
-// AssetPage summarizes one paginated catalog response.
-type AssetPage struct {
-	PageIndex     int     `json:"pageIndex"`
-	Items         []Asset `json:"items"`
-	Total         int     `json:"total"`
-	NextPageIndex *int    `json:"nextPageIndex,omitempty"`
+// AssetSearchRequest describes a page from a browsable Timich asset collection.
+type AssetSearchRequest struct {
+	Collection AssetCollectionRequest `json:"collection"`
+	Page       AssetSearchPageRequest `json:"page"`
 }
+
+type AssetCollectionRequest struct {
+	Kind    string             `json:"kind"`
+	Query   *AssetSearchQuery  `json:"query,omitempty"`
+	Filters AssetSearchFilters `json:"filters,omitempty"`
+	Sort    *AssetSearchSort   `json:"sort,omitempty"`
+}
+
+type AssetSearchQuery struct {
+	Text string `json:"text,omitempty"`
+	Mode string `json:"mode,omitempty"`
+}
+
+type AssetSearchFilters struct {
+	MediaTypes []string                 `json:"mediaTypes,omitempty"`
+	CapturedAt *AssetSearchCapturedTime `json:"capturedAt,omitempty"`
+}
+
+type AssetSearchCapturedTime struct {
+	From *time.Time `json:"from,omitempty"`
+	To   *time.Time `json:"to,omitempty"`
+}
+
+func (f *AssetSearchCapturedTime) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		From *string `json:"from"`
+		To   *string `json:"to"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.From != nil {
+		from, err := parseUTCSearchTime(*raw.From)
+		if err != nil {
+			return err
+		}
+		f.From = &from
+	}
+	if raw.To != nil {
+		to, err := parseUTCSearchTime(*raw.To)
+		if err != nil {
+			return err
+		}
+		f.To = &to
+	}
+	return nil
+}
+
+type AssetSearchSort struct {
+	Field     string `json:"field"`
+	Direction string `json:"direction"`
+}
+
+type AssetSearchPageRequest struct {
+	Index int `json:"index"`
+	Size  int `json:"size"`
+}
+
+// AssetSearchPage summarizes one paginated asset collection response.
+type AssetSearchPage struct {
+	CollectionKey string                 `json:"collectionKey"`
+	Page          AssetSearchPageRequest `json:"page"`
+	Items         []Asset                `json:"items"`
+	Total         int                    `json:"total"`
+	TotalAccuracy string                 `json:"totalAccuracy"`
+	NextPageIndex *int                   `json:"nextPageIndex,omitempty"`
+	Boundary      *AssetSearchBoundary   `json:"boundary,omitempty"`
+	Resolved      AssetSearchResolved    `json:"resolved"`
+}
+
+type AssetSearchBoundary struct {
+	Kind string `json:"kind"`
+}
+
+type AssetSearchResolved struct {
+	CollectionKind string          `json:"collectionKind"`
+	QueryMode      string          `json:"queryMode"`
+	Sort           AssetSearchSort `json:"sort"`
+	TimelineLike   bool            `json:"timelineLike"`
+}
+
+type AssetSearchCapabilities struct {
+	QueryModes    []string                      `json:"queryModes"`
+	Filters       AssetSearchFilterCapabilities `json:"filters"`
+	Sorts         []AssetSearchSortCapability   `json:"sorts"`
+	TotalAccuracy []string                      `json:"totalAccuracy"`
+	Page          AssetSearchPageCapabilities   `json:"page"`
+}
+
+type AssetSearchFilterCapabilities struct {
+	MediaTypes []string `json:"mediaTypes"`
+	CapturedAt bool     `json:"capturedAt"`
+}
+
+type AssetSearchSortCapability struct {
+	Field      string   `json:"field"`
+	Directions []string `json:"directions"`
+}
+
+type AssetSearchPageCapabilities struct {
+	MaxSize int `json:"maxSize"`
+}
+
+type normalizedAssetSearch struct {
+	Request       AssetSearchRequest
+	Resolved      AssetSearchResolved
+	CollectionKey string
+}
+
+const (
+	CollectionKindTimeline = "timeline"
+	CollectionKindSearch   = "search"
+
+	QueryModeNone     = "none"
+	QueryModeAuto     = "auto"
+	QueryModeSemantic = "semantic"
+	QueryModeFilename = "filename"
+
+	SortFieldCapturedAt = "capturedAt"
+	SortFieldRelevance  = "relevance"
+	SortDirectionDesc   = "desc"
+
+	TotalAccuracyExact      = "exact"
+	TotalAccuracyEstimated  = "estimated"
+	TotalAccuracyLowerBound = "lowerBound"
+
+	BoundaryPastEnd = "pastEnd"
+)
 
 // UpstreamMediaResponse holds a proxied upstream media response.
 type UpstreamMediaResponse struct {
@@ -139,61 +271,64 @@ func (s *Service) Ready() bool {
 	return true
 }
 
-// CatalogPage returns one paginated asset page proxied from the configured datasource.
-func (s *Service) CatalogPage(pageIndex int, pageSize int) (AssetPage, error) {
+// SearchAssets returns one paginated asset page from the configured datasource.
+func (s *Service) SearchAssets(searchRequest AssetSearchRequest) (AssetSearchPage, error) {
 	if !s.Ready() {
-		return AssetPage{}, ErrNoDatasourceConfigured
+		return AssetSearchPage{}, ErrNoDatasourceConfigured
+	}
+	normalized, err := normalizeAssetSearchRequest(searchRequest)
+	if err != nil {
+		return AssetSearchPage{}, err
 	}
 	if s.datasource.Kind == config.DatasourceKindStaticDemo {
 		if s.staticDemoErr != nil {
-			return AssetPage{}, s.staticDemoErr
+			return AssetSearchPage{}, s.staticDemoErr
 		}
-		return s.staticDemo.CatalogPage(pageIndex, pageSize)
+		return s.staticDemo.SearchAssets(normalized)
 	}
 
-	apiPage := pageIndex + 1
-	body, err := json.Marshal(map[string]any{
-		"page":  apiPage,
-		"size":  pageSize,
-		"order": "desc",
-	})
+	return s.searchImmichAssets(normalized)
+}
+
+func (s *Service) searchImmichAssets(normalized normalizedAssetSearch) (AssetSearchPage, error) {
+	body, endpoint, totalAccuracy, err := immichSearchRequest(normalized)
 	if err != nil {
-		return AssetPage{}, fmt.Errorf("marshal metadata request: %w", err)
+		return AssetSearchPage{}, err
 	}
 
 	request, err := s.newRequest(
 		http.MethodPost,
-		"/api/search/metadata",
+		endpoint,
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return AssetPage{}, err
+		return AssetSearchPage{}, err
 	}
 	request.Header.Set("Content-Type", "application/json")
 
 	response, err := s.client.Do(request)
 	if err != nil {
-		return AssetPage{}, fmt.Errorf("perform metadata request: %w", err)
+		return AssetSearchPage{}, fmt.Errorf("perform search request: %w", err)
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return AssetPage{}, fmt.Errorf("metadata request returned status %d", response.StatusCode)
+		return AssetSearchPage{}, fmt.Errorf("search request returned status %d", response.StatusCode)
 	}
 
 	var envelope searchAssetsEnvelope
 	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
-		return AssetPage{}, fmt.Errorf("decode metadata response: %w", err)
+		return AssetSearchPage{}, fmt.Errorf("decode search response: %w", err)
 	}
 
 	items := make([]Asset, 0, len(envelope.Assets.Items))
 	for _, asset := range envelope.Assets.Items {
 		items = append(items, Asset{
-			ID:               asset.ID,
-			Type:             asset.Type,
-			OriginalFileName: asset.OriginalFileName,
-			FileCreatedAt:    asset.FileCreatedAt.Time.UTC(),
-			Duration:         asset.Duration,
+			ID:         asset.ID,
+			Type:       normalizeAssetType(asset.Type),
+			Filename:   asset.OriginalFileName,
+			CapturedAt: asset.FileCreatedAt.Time.UTC(),
+			Duration:   asset.Duration,
 		})
 	}
 
@@ -206,19 +341,313 @@ func (s *Service) CatalogPage(pageIndex int, pageSize int) (AssetPage, error) {
 	}
 
 	total := envelope.Assets.Total
-	if statisticsTotal, err := s.timelineAssetTotal(); err == nil {
-		total = max(total, statisticsTotal)
+	if shouldUseTimelineStatisticsTotal(normalized) {
+		if statisticsTotal, err := s.timelineAssetTotal(); err == nil {
+			total = max(total, statisticsTotal)
+			totalAccuracy = TotalAccuracyExact
+		}
 	}
 	if total == 0 && len(items) > 0 {
-		total = pageIndex*pageSize + len(items)
+		total = normalized.Request.Page.Index*normalized.Request.Page.Size + len(items)
+		totalAccuracy = TotalAccuracyLowerBound
 	}
 
-	return AssetPage{
-		PageIndex:     pageIndex,
+	boundary := searchBoundary(normalized.Request.Page, len(items))
+	return AssetSearchPage{
+		CollectionKey: normalized.CollectionKey,
+		Page:          normalized.Request.Page,
 		Items:         items,
 		Total:         total,
+		TotalAccuracy: totalAccuracy,
 		NextPageIndex: nextPageIndex,
+		Boundary:      boundary,
+		Resolved:      normalized.Resolved,
 	}, nil
+}
+
+func shouldUseTimelineStatisticsTotal(normalized normalizedAssetSearch) bool {
+	if normalized.Resolved.CollectionKind != CollectionKindTimeline || normalized.Resolved.QueryMode != QueryModeNone {
+		return false
+	}
+	return !hasAssetSearchFilters(normalized.Request.Collection.Filters)
+}
+
+func hasAssetSearchFilters(filters AssetSearchFilters) bool {
+	if len(filters.MediaTypes) > 0 {
+		return true
+	}
+	return filters.CapturedAt != nil &&
+		(filters.CapturedAt.From != nil || filters.CapturedAt.To != nil)
+}
+
+// CatalogPage preserves internal callers while the public API moves to SearchAssets.
+func (s *Service) CatalogPage(pageIndex int, pageSize int) (AssetSearchPage, error) {
+	return s.SearchAssets(AssetSearchRequest{
+		Collection: AssetCollectionRequest{Kind: CollectionKindTimeline},
+		Page: AssetSearchPageRequest{
+			Index: pageIndex,
+			Size:  pageSize,
+		},
+	})
+}
+
+func searchBoundary(page AssetSearchPageRequest, itemCount int) *AssetSearchBoundary {
+	if page.Index <= 0 || itemCount > 0 {
+		return nil
+	}
+	return &AssetSearchBoundary{Kind: BoundaryPastEnd}
+}
+
+func immichSearchRequest(normalized normalizedAssetSearch) ([]byte, string, string, error) {
+	body := map[string]any{
+		"page": normalized.Request.Page.Index + 1,
+		"size": normalized.Request.Page.Size,
+	}
+	filters := normalized.Request.Collection.Filters
+	if len(filters.MediaTypes) == 1 {
+		body["type"] = immichAssetType(filters.MediaTypes[0])
+	}
+	if filters.CapturedAt != nil {
+		if filters.CapturedAt.From != nil {
+			body["takenAfter"] = filters.CapturedAt.From.UTC().Format(time.RFC3339Nano)
+		}
+		if filters.CapturedAt.To != nil {
+			body["takenBefore"] = filters.CapturedAt.To.UTC().Format(time.RFC3339Nano)
+		}
+	}
+
+	switch normalized.Resolved.QueryMode {
+	case QueryModeSemantic:
+		if normalized.Request.Collection.Query == nil {
+			return nil, "", "", ErrInvalidSearchRequest
+		}
+		body["query"] = normalized.Request.Collection.Query.Text
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("marshal smart search request: %w", err)
+		}
+		return raw, "/api/search/smart", TotalAccuracyEstimated, nil
+	case QueryModeFilename:
+		if normalized.Request.Collection.Query == nil {
+			return nil, "", "", ErrInvalidSearchRequest
+		}
+		body["originalFileName"] = normalized.Request.Collection.Query.Text
+		fallthrough
+	case QueryModeNone:
+		body["order"] = SortDirectionDesc
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("marshal metadata search request: %w", err)
+		}
+		return raw, "/api/search/metadata", TotalAccuracyExact, nil
+	default:
+		return nil, "", "", ErrUnsupportedSearch
+	}
+}
+
+func normalizeAssetSearchRequest(searchRequest AssetSearchRequest) (normalizedAssetSearch, error) {
+	request := searchRequest
+	request.Collection.Kind = strings.TrimSpace(request.Collection.Kind)
+	if request.Collection.Kind == "" {
+		request.Collection.Kind = CollectionKindTimeline
+	}
+	if request.Collection.Kind != CollectionKindTimeline && request.Collection.Kind != CollectionKindSearch {
+		return normalizedAssetSearch{}, fmt.Errorf("%w: unsupported collection kind", ErrInvalidSearchRequest)
+	}
+
+	if request.Page.Index < 0 {
+		return normalizedAssetSearch{}, fmt.Errorf("%w: page index must be non-negative", ErrInvalidSearchRequest)
+	}
+	if request.Page.Size == 0 {
+		request.Page.Size = defaultPageSize
+	}
+	if request.Page.Size < 1 {
+		return normalizedAssetSearch{}, fmt.Errorf("%w: page size must be positive", ErrInvalidSearchRequest)
+	}
+	if request.Page.Size > maxPageSize {
+		request.Page.Size = maxPageSize
+	}
+
+	mediaTypes, err := normalizeMediaTypes(request.Collection.Filters.MediaTypes)
+	if err != nil {
+		return normalizedAssetSearch{}, err
+	}
+	request.Collection.Filters.MediaTypes = mediaTypes
+	if request.Collection.Filters.CapturedAt != nil {
+		from := request.Collection.Filters.CapturedAt.From
+		to := request.Collection.Filters.CapturedAt.To
+		if from != nil {
+			utc := from.UTC()
+			request.Collection.Filters.CapturedAt.From = &utc
+		}
+		if to != nil {
+			utc := to.UTC()
+			request.Collection.Filters.CapturedAt.To = &utc
+		}
+		if request.Collection.Filters.CapturedAt.From != nil &&
+			request.Collection.Filters.CapturedAt.To != nil &&
+			!request.Collection.Filters.CapturedAt.From.Before(*request.Collection.Filters.CapturedAt.To) {
+			return normalizedAssetSearch{}, fmt.Errorf("%w: capturedAt from must be before to", ErrInvalidSearchRequest)
+		}
+	}
+
+	var text string
+	queryMode := QueryModeNone
+	if request.Collection.Query != nil {
+		text = strings.TrimSpace(request.Collection.Query.Text)
+		mode := strings.TrimSpace(request.Collection.Query.Mode)
+		if mode == "" {
+			mode = QueryModeAuto
+		}
+		request.Collection.Query.Text = text
+		request.Collection.Query.Mode = mode
+		switch mode {
+		case QueryModeAuto:
+			if text != "" {
+				queryMode = QueryModeSemantic
+			}
+		case QueryModeSemantic, QueryModeFilename:
+			if text == "" {
+				return normalizedAssetSearch{}, fmt.Errorf("%w: query text is required", ErrInvalidSearchRequest)
+			}
+			queryMode = mode
+		default:
+			return normalizedAssetSearch{}, fmt.Errorf("%w: unsupported query mode", ErrInvalidSearchRequest)
+		}
+	}
+	if request.Collection.Kind == CollectionKindTimeline && queryMode != QueryModeNone {
+		return normalizedAssetSearch{}, fmt.Errorf("%w: timeline collection does not accept query text", ErrInvalidSearchRequest)
+	}
+
+	resolvedSort := AssetSearchSort{Field: SortFieldCapturedAt, Direction: SortDirectionDesc}
+	if queryMode == QueryModeSemantic {
+		resolvedSort.Field = SortFieldRelevance
+	}
+	if request.Collection.Sort != nil {
+		field := strings.TrimSpace(request.Collection.Sort.Field)
+		direction := strings.TrimSpace(request.Collection.Sort.Direction)
+		if field == "" {
+			field = resolvedSort.Field
+		}
+		if direction == "" {
+			direction = SortDirectionDesc
+		}
+		if direction != SortDirectionDesc || field != resolvedSort.Field {
+			return normalizedAssetSearch{}, fmt.Errorf("%w: unsupported sort", ErrUnsupportedSearch)
+		}
+		request.Collection.Sort = &AssetSearchSort{Field: field, Direction: direction}
+	} else {
+		request.Collection.Sort = &resolvedSort
+	}
+
+	resolved := AssetSearchResolved{
+		CollectionKind: request.Collection.Kind,
+		QueryMode:      queryMode,
+		Sort:           resolvedSort,
+		TimelineLike:   queryMode != QueryModeSemantic,
+	}
+	key, err := collectionKey(request, resolved)
+	if err != nil {
+		return normalizedAssetSearch{}, err
+	}
+	return normalizedAssetSearch{Request: request, Resolved: resolved, CollectionKey: key}, nil
+}
+
+func normalizeMediaTypes(values []string) ([]string, error) {
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "":
+		case "image":
+			seen["image"] = struct{}{}
+		case "video":
+			seen["video"] = struct{}{}
+		default:
+			return nil, fmt.Errorf("%w: unsupported media type", ErrInvalidSearchRequest)
+		}
+	}
+	result := make([]string, 0, len(seen))
+	for _, value := range []string{"image", "video"} {
+		if _, ok := seen[value]; ok {
+			result = append(result, value)
+		}
+	}
+	return result, nil
+}
+
+func parseUTCSearchTime(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || !strings.HasSuffix(value, "Z") {
+		return time.Time{}, fmt.Errorf("%w: capturedAt filters require UTC RFC3339 timestamps", ErrInvalidSearchRequest)
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%w: capturedAt filters require UTC RFC3339 timestamps", ErrInvalidSearchRequest)
+	}
+	return parsed.UTC(), nil
+}
+
+func collectionKey(request AssetSearchRequest, resolved AssetSearchResolved) (string, error) {
+	canonical := struct {
+		Collection AssetCollectionRequest `json:"collection"`
+		Resolved   AssetSearchResolved    `json:"resolved"`
+		Version    int                    `json:"version"`
+	}{
+		Collection: request.Collection,
+		Resolved:   resolved,
+		Version:    1,
+	}
+	raw, err := json.Marshal(canonical)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return "search_v1:" + base64.RawURLEncoding.EncodeToString(sum[:16]), nil
+}
+
+func normalizeAssetType(value string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "VIDEO":
+		return "video"
+	default:
+		return "image"
+	}
+}
+
+func immichAssetType(value string) string {
+	switch value {
+	case "video":
+		return "VIDEO"
+	default:
+		return "IMAGE"
+	}
+}
+
+// SearchCapabilities returns the search features supported by the active datasource.
+func (s *Service) SearchCapabilities() AssetSearchCapabilities {
+	queryModes := []string{}
+	sorts := []AssetSearchSortCapability{
+		{Field: SortFieldCapturedAt, Directions: []string{SortDirectionDesc}},
+	}
+	totalAccuracy := []string{TotalAccuracyExact}
+	if s.datasource != nil && s.datasource.Kind != config.DatasourceKindStaticDemo {
+		queryModes = []string{QueryModeAuto, QueryModeSemantic, QueryModeFilename}
+		sorts = append(sorts, AssetSearchSortCapability{
+			Field:      SortFieldRelevance,
+			Directions: []string{SortDirectionDesc},
+		})
+		totalAccuracy = []string{TotalAccuracyExact, TotalAccuracyEstimated, TotalAccuracyLowerBound}
+	}
+	return AssetSearchCapabilities{
+		QueryModes: queryModes,
+		Filters: AssetSearchFilterCapabilities{
+			MediaTypes: []string{"image", "video"},
+			CapturedAt: true,
+		},
+		Sorts:         sorts,
+		TotalAccuracy: totalAccuracy,
+		Page:          AssetSearchPageCapabilities{MaxSize: maxPageSize},
+	}
 }
 
 func (s *Service) timelineAssetTotal() (int, error) {

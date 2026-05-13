@@ -213,11 +213,15 @@ const dashboardHTML = `<!doctype html>
     button:disabled { opacity: .55; cursor: default; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .muted { color: var(--muted); }
+    .section-note { margin: -4px 0 12px; max-width: 760px; color: var(--muted); }
     .status-ok { color: var(--ok); }
     .status-warn { color: var(--warn); }
     .status-failed { color: var(--danger); }
     .stack { display: grid; gap: 10px; }
-    .pairing { display: grid; gap: 6px; margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+    .pairing { display: grid; gap: 12px; margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+    .pairing-grid { display: grid; grid-template-columns: minmax(180px, 280px) minmax(0, 1fr); gap: 14px; align-items: start; }
+    .pairing-qr { width: 100%; max-width: 280px; aspect-ratio: 1; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+    .pairing-link { min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; color: var(--muted); }
     .pairing-code-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
     .code { min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 18px; overflow-wrap: anywhere; }
     .checks { display: grid; gap: 10px; }
@@ -232,7 +236,7 @@ const dashboardHTML = `<!doctype html>
     .task { display: grid; gap: 4px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
     .task strong { display: flex; justify-content: space-between; gap: 8px; }
     form { margin: 0; }
-    @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } section { grid-column: 1; } .tasks { grid-template-columns: 1fr; } .bar { align-items: flex-start; flex-direction: column; padding: 14px 0; } dl { grid-template-columns: 1fr; } th:nth-child(3), td:nth-child(3) { display: none; } }
+    @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } section { grid-column: 1; } .tasks { grid-template-columns: 1fr; } .pairing-grid { grid-template-columns: 1fr; } .bar { align-items: flex-start; flex-direction: column; padding: 14px 0; } dl { grid-template-columns: 1fr; } th:nth-child(3), td:nth-child(3) { display: none; } }
   </style>
 </head>
 <body>
@@ -296,9 +300,10 @@ const dashboardHTML = `<!doctype html>
         <div id="devices"></div>
       </section>
       <section class="wide">
-        <h2>Remote Browsing Check</h2>
+        <h2>Remote Browsing Readiness</h2>
+        <p class="section-note">Remote browsing lets the Timich app browse through the Timich relay when the device is away from the home network. This check verifies datasource access and the relay path; pair at least one device first so the agent can register its relay credential.</p>
         <div class="actions">
-          <button id="runCompatibility">Run remote browsing check</button>
+          <button id="runCompatibility">Run readiness check</button>
           <span class="muted" id="compatSummary"></span>
         </div>
         <div class="checks" id="compatChecks"></div>
@@ -358,6 +363,22 @@ const dashboardHTML = `<!doctype html>
       if (!value) return '';
       const parsed = new Date(value);
       return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+    }
+
+    function compatibilityStatusLabel(status) {
+      if (status === 'ok') return 'Ready';
+      if (status === 'warning') return 'Setup incomplete';
+      if (status === 'failed') return 'Needs attention';
+      return status || '';
+    }
+
+    function compatibilityCheckLabel(name) {
+      return ({
+        agent_config: 'Agent configuration',
+        datasource: 'Datasource',
+        relay_server: 'Relay server',
+        relay_connection: 'Relay connection',
+      })[name] || name;
     }
 
     function taskStatusClass(status) {
@@ -468,6 +489,7 @@ const dashboardHTML = `<!doctype html>
         ['Devices', String(status.pairedDeviceCount || 0) + ' / ' + String(status.deviceLimit || 0)],
         ['Pairing sessions', status.activePairingCount || 0],
         ['Media API', status.mediaListenAddress],
+        ['Advertised Media URL', status.advertisedMediaBaseURL || 'Derived from Admin UI host'],
       ]);
       remoteBrowsingList.innerHTML = rows([
         ['Enabled', status.remoteBrowsing?.enabled ? 'Yes' : 'No'],
@@ -527,8 +549,28 @@ const dashboardHTML = `<!doctype html>
       try {
         const pairing = await api('/v1/pairing-sessions', { method: 'POST' });
         const code = pairing.pairingCode || pairing.code || '';
-        pairingResult.innerHTML = '<div class="pairing"><div class="muted">Device pairing code</div><div class="pairing-code-row"><div class="code">' + escapeHTML(code) + '</div><button type="button" id="copyPairingCode">Copy</button></div><div class="muted">Enter this code in the Timich app.</div><div class="muted">Expires ' + escapeHTML(date(pairing.expiresAt)) + '</div><div class="muted" id="copyPairingStatus"></div></div>';
+        const pairingURL = pairing.pairingURL || '';
+        const qrCodeDataURL = pairing.pairingQRCodeDataURL || '';
+        const agentBaseURL = pairing.pairingPayload?.agentBaseURL || '';
+        const pairingLinkWarning = pairing.pairingLinkWarning?.message || '';
+        const pairingIntro = qrCodeDataURL ? 'Scan the QR code with the device that has Timich installed, or copy the code manually.' : 'Copy the code manually to pair the device.';
+        pairingResult.innerHTML =
+          '<div class="pairing">' +
+            '<div class="muted">' + escapeHTML(pairingIntro) + '</div>' +
+            '<div class="pairing-grid">' +
+              (qrCodeDataURL ? '<img class="pairing-qr" id="pairingQRCode" alt="Timich app pairing QR code" src="' + escapeHTML(qrCodeDataURL) + '">' : '<div class="notice warn">QR code unavailable' + (pairingLinkWarning ? '<div class="muted">' + escapeHTML(pairingLinkWarning) + '</div>' : '') + '</div>') +
+              '<div class="stack">' +
+                '<div class="muted">Device pairing code</div>' +
+                '<div class="pairing-code-row"><div class="code">' + escapeHTML(code) + '</div><button type="button" id="copyPairingCode">Copy code</button></div>' +
+                (pairingURL ? '<div class="muted">Timich app link</div><div class="pairing-code-row"><div class="pairing-link">' + escapeHTML(pairingURL) + '</div><button type="button" id="copyPairingLink">Copy link</button></div>' : '') +
+                (agentBaseURL ? '<div class="muted">Agent URL ' + escapeHTML(agentBaseURL) + '</div>' : '') +
+                '<div class="muted">Expires ' + escapeHTML(date(pairing.expiresAt)) + '</div>' +
+                '<div class="muted" id="copyPairingStatus"></div>' +
+              '</div>' +
+            '</div>' +
+          '</div>';
         const copyButton = pairingResult.querySelector('#copyPairingCode');
+        const copyLinkButton = pairingResult.querySelector('#copyPairingLink');
         const copyStatus = pairingResult.querySelector('#copyPairingStatus');
         copyButton.addEventListener('click', async () => {
           copyButton.disabled = true;
@@ -543,6 +585,21 @@ const dashboardHTML = `<!doctype html>
             copyButton.disabled = false;
           }
         });
+        if (copyLinkButton) {
+          copyLinkButton.addEventListener('click', async () => {
+            copyLinkButton.disabled = true;
+            try {
+              await copyText(pairingURL);
+              copyStatus.textContent = 'Link copied';
+              copyStatus.className = 'status-ok';
+            } catch (_) {
+              copyStatus.textContent = 'Copy failed';
+              copyStatus.className = 'status-failed';
+            } finally {
+              copyLinkButton.disabled = false;
+            }
+          });
+        }
         await loadStatus();
       } catch (error) {
         pairingResult.innerHTML = '<div class="pairing status-failed">' + escapeHTML(error.message) + '</div>';
@@ -558,12 +615,12 @@ const dashboardHTML = `<!doctype html>
       compatChecks.innerHTML = '';
       try {
         const report = await api('/v1/compatibility-check', { method: 'POST' });
-        compatSummary.textContent = report.status || '';
+        compatSummary.textContent = compatibilityStatusLabel(report.status);
         compatSummary.className = report.status === 'ok' ? 'status-ok' : report.status === 'warning' ? 'status-warn' : 'status-failed';
         compatChecks.innerHTML = (report.checks || []).map(check => {
           const statusClass = check.status === 'ok' ? 'status-ok' : check.status === 'warning' ? 'status-warn' : 'status-failed';
           const remediation = check.remediation ? '<span class="muted">' + escapeHTML(check.remediation) + '</span>' : '';
-          return '<div class="check"><strong>' + escapeHTML(check.name) + ' <span class="' + statusClass + '">' + escapeHTML(check.status) + '</span></strong><span>' + escapeHTML(check.summary || '') + '</span>' + remediation + '</div>';
+          return '<div class="check"><strong>' + escapeHTML(compatibilityCheckLabel(check.name)) + ' <span class="' + statusClass + '">' + escapeHTML(compatibilityStatusLabel(check.status)) + '</span></strong><span>' + escapeHTML(check.summary || '') + '</span>' + remediation + '</div>';
         }).join('');
       } catch (error) {
         compatSummary.textContent = error.message;

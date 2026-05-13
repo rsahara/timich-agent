@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rsahara/timich-agent/internal/catalog"
 	"github.com/rsahara/timich-agent/internal/config"
 	"github.com/rsahara/timich-agent/internal/pairing"
 	"github.com/rsahara/timich-agent/internal/store"
@@ -231,6 +232,59 @@ func TestRemoteRegistrationReadyAllowsStaticDemoWithoutAccessToken(t *testing.T)
 	ready, reason := runtime.RemoteRegistrationReady()
 	if !ready || reason != "" {
 		t.Fatalf("RemoteRegistrationReady() = %v/%q, want ready", ready, reason)
+	}
+}
+
+func TestSearchAssetsReturnsSignedTimichAssetIDs(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntime(t, BuildInfo{}, []config.DatasourceConfig{
+		{
+			Name: "Static demo",
+			Kind: config.DatasourceKindStaticDemo,
+			URL:  writeStaticDemoManifest(t),
+		},
+	})
+
+	page, err := runtime.SearchAssets(catalog.AssetSearchRequest{
+		Collection: catalog.AssetCollectionRequest{Kind: catalog.CollectionKindTimeline},
+		Page:       catalog.AssetSearchPageRequest{Index: 0, Size: 1},
+	})
+	if err != nil {
+		t.Fatalf("SearchAssets() error = %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("Items length = %d, want 1", len(page.Items))
+	}
+	if !strings.HasPrefix(page.Items[0].ID, timichAssetIDPrefix) {
+		t.Fatalf("asset ID = %q, want Timich asset ID prefix", page.Items[0].ID)
+	}
+
+	sourceKey, upstreamAssetID, err := decodeTimichAssetID(runtime.assetIDKey, page.Items[0].ID)
+	if err != nil {
+		t.Fatalf("decodeTimichAssetID() error = %v", err)
+	}
+	if sourceKey != runtime.config.Datasources[0].SourceKey {
+		t.Fatalf("sourceKey = %q, want %q", sourceKey, runtime.config.Datasources[0].SourceKey)
+	}
+	if upstreamAssetID != "demo-0001" {
+		t.Fatalf("upstreamAssetID = %q, want demo-0001", upstreamAssetID)
+	}
+}
+
+func TestMediaRoutesRejectUnsignedAssetIDs(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntime(t, BuildInfo{}, []config.DatasourceConfig{
+		{
+			Name: "Static demo",
+			Kind: config.DatasourceKindStaticDemo,
+			URL:  writeStaticDemoManifest(t),
+		},
+	})
+
+	if _, err := runtime.Preview(nil, "demo-0001"); !errors.Is(err, catalog.ErrAssetNotFound) {
+		t.Fatalf("Preview(unsigned ID) error = %v, want ErrAssetNotFound", err)
 	}
 }
 

@@ -165,45 +165,75 @@ func staticDemoFilePath(root string, relPath string) (string, error) {
 	return fullAbs, nil
 }
 
-func (s *staticDemoSource) CatalogPage(pageIndex int, pageSize int) (AssetPage, error) {
-	if pageIndex < 0 {
-		pageIndex = 0
+func (s *staticDemoSource) SearchAssets(normalized normalizedAssetSearch) (AssetSearchPage, error) {
+	if normalized.Resolved.QueryMode != QueryModeNone {
+		return AssetSearchPage{}, ErrUnsupportedSearch
 	}
-	if pageSize < 1 {
-		pageSize = 1
-	}
-
+	filtered := s.filteredAssets(normalized.Request.Collection.Filters)
+	pageIndex := normalized.Request.Page.Index
+	pageSize := normalized.Request.Page.Size
 	start := pageIndex * pageSize
-	if start > len(s.assets) {
-		start = len(s.assets)
+	if start > len(filtered) {
+		start = len(filtered)
 	}
 	end := start + pageSize
-	if end > len(s.assets) {
-		end = len(s.assets)
+	if end > len(filtered) {
+		end = len(filtered)
 	}
 
 	items := make([]Asset, 0, end-start)
-	for _, asset := range s.assets[start:end] {
+	for _, asset := range filtered[start:end] {
 		items = append(items, Asset{
-			ID:               asset.ID,
-			Type:             asset.Type,
-			OriginalFileName: asset.OriginalFileName,
-			FileCreatedAt:    asset.FileCreatedAt.UTC(),
-			Duration:         asset.Duration,
+			ID:         asset.ID,
+			Type:       normalizeAssetType(asset.Type),
+			Filename:   asset.OriginalFileName,
+			CapturedAt: asset.FileCreatedAt.UTC(),
+			Duration:   asset.Duration,
 		})
 	}
 
 	var nextPageIndex *int
-	if end < len(s.assets) {
+	if end < len(filtered) {
 		next := pageIndex + 1
 		nextPageIndex = &next
 	}
-	return AssetPage{
-		PageIndex:     pageIndex,
+	total := len(filtered)
+	return AssetSearchPage{
+		CollectionKey: normalized.CollectionKey,
+		Page:          normalized.Request.Page,
 		Items:         items,
-		Total:         len(s.assets),
+		Total:         total,
+		TotalAccuracy: TotalAccuracyExact,
 		NextPageIndex: nextPageIndex,
+		Boundary:      searchBoundary(normalized.Request.Page, len(items)),
+		Resolved:      normalized.Resolved,
 	}, nil
+}
+
+func (s *staticDemoSource) filteredAssets(filters AssetSearchFilters) []staticDemoAsset {
+	result := make([]staticDemoAsset, 0, len(s.assets))
+	mediaTypes := map[string]struct{}{}
+	for _, mediaType := range filters.MediaTypes {
+		mediaTypes[mediaType] = struct{}{}
+	}
+	for _, asset := range s.assets {
+		if len(mediaTypes) > 0 {
+			if _, ok := mediaTypes[normalizeAssetType(asset.Type)]; !ok {
+				continue
+			}
+		}
+		if filters.CapturedAt != nil {
+			capturedAt := asset.FileCreatedAt.UTC()
+			if filters.CapturedAt.From != nil && capturedAt.Before(filters.CapturedAt.From.UTC()) {
+				continue
+			}
+			if filters.CapturedAt.To != nil && !capturedAt.Before(filters.CapturedAt.To.UTC()) {
+				continue
+			}
+		}
+		result = append(result, asset)
+	}
+	return result
 }
 
 func (s *staticDemoSource) MediaResponse(clientRequest *http.Request, assetID string, variant string) (*UpstreamMediaResponse, error) {

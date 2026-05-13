@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,13 @@ const (
 	// DefaultConfigPath is the repo-local config path used for local agent development.
 	DefaultConfigPath = ".local/agent.json"
 	defaultDataDir    = ".local/state"
+	// DefaultRemoteBrowsingServerURL is the public Timich Reach HTTP endpoint.
+	DefaultRemoteBrowsingServerURL = "https://timich.runo.jp"
+	// DefaultAppLinkBaseURL is the production Timich Universal Link origin.
+	DefaultAppLinkBaseURL = "https://link.timich.runo.jp"
+	// DefaultRelayConnectionAddress is the production Timich Reach control-plane endpoint.
+	DefaultRelayConnectionAddress       = "https://control.timich.runo.jp:18090"
+	legacyDefaultRelayConnectionAddress = "https://timich.runo.jp"
 	// DefaultDeviceLimit is high enough for typical household device churn while still bounding registry growth.
 	DefaultDeviceLimit       = 32
 	DatasourceKindImmich     = "immich"
@@ -26,6 +35,7 @@ const (
 
 // DatasourceConfig describes one upstream datasource the local agent can manage.
 type DatasourceConfig struct {
+	SourceKey   string `json:"sourceKey,omitempty"`
 	Name        string `json:"name"`
 	Kind        string `json:"kind"`
 	URL         string `json:"url"`
@@ -43,8 +53,10 @@ type Config struct {
 	AgentName              string               `json:"agentName"`
 	AdminListenAddress     string               `json:"adminListenAddress"`
 	MediaListenAddress     string               `json:"mediaListenAddress"`
+	AdvertisedMediaBaseURL string               `json:"advertisedMediaBaseURL,omitempty"`
 	DataDir                string               `json:"dataDir"`
 	DeviceLimit            int                  `json:"deviceLimit"`
+	AppLinkBaseURL         string               `json:"appLinkBaseURL"`
 	ControlPlaneAddress    string               `json:"controlPlaneAddress"`
 	ControlPlaneServerName string               `json:"controlPlaneServerName,omitempty"`
 	Hosted                 RemoteBrowsingConfig `json:"-"`
@@ -55,8 +67,10 @@ type configJSON struct {
 	AgentName              string               `json:"agentName"`
 	AdminListenAddress     string               `json:"adminListenAddress"`
 	MediaListenAddress     string               `json:"mediaListenAddress"`
+	AdvertisedMediaBaseURL string               `json:"advertisedMediaBaseURL,omitempty"`
 	DataDir                string               `json:"dataDir"`
 	DeviceLimit            int                  `json:"deviceLimit"`
+	AppLinkBaseURL         string               `json:"appLinkBaseURL"`
 	RelayConnectionAddress string               `json:"relayConnectionAddress"`
 	ControlPlaneServerName string               `json:"controlPlaneServerName,omitempty"`
 	RemoteBrowsing         RemoteBrowsingConfig `json:"remoteBrowsing"`
@@ -67,8 +81,10 @@ type configOverrideJSON struct {
 	AgentName              *string             `json:"agentName"`
 	AdminListenAddress     *string             `json:"adminListenAddress"`
 	MediaListenAddress     *string             `json:"mediaListenAddress"`
+	AdvertisedMediaBaseURL *string             `json:"advertisedMediaBaseURL"`
 	DataDir                *string             `json:"dataDir"`
 	DeviceLimit            *int                `json:"deviceLimit"`
+	AppLinkBaseURL         *string             `json:"appLinkBaseURL"`
 	RelayConnectionAddress *string             `json:"relayConnectionAddress"`
 	ControlPlaneAddress    *string             `json:"controlPlaneAddress"`
 	ControlPlaneServerName *string             `json:"controlPlaneServerName"`
@@ -89,8 +105,10 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		AgentName:              c.AgentName,
 		AdminListenAddress:     c.AdminListenAddress,
 		MediaListenAddress:     c.MediaListenAddress,
+		AdvertisedMediaBaseURL: c.AdvertisedMediaBaseURL,
 		DataDir:                c.DataDir,
 		DeviceLimit:            c.DeviceLimit,
+		AppLinkBaseURL:         c.AppLinkBaseURL,
 		RelayConnectionAddress: c.ControlPlaneAddress,
 		ControlPlaneServerName: c.ControlPlaneServerName,
 		RemoteBrowsing:         c.Hosted,
@@ -112,11 +130,17 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	if payload.MediaListenAddress != nil {
 		c.MediaListenAddress = *payload.MediaListenAddress
 	}
+	if payload.AdvertisedMediaBaseURL != nil {
+		c.AdvertisedMediaBaseURL = *payload.AdvertisedMediaBaseURL
+	}
 	if payload.DataDir != nil {
 		c.DataDir = *payload.DataDir
 	}
 	if payload.DeviceLimit != nil {
 		c.DeviceLimit = *payload.DeviceLimit
+	}
+	if payload.AppLinkBaseURL != nil {
+		c.AppLinkBaseURL = *payload.AppLinkBaseURL
 	}
 	if payload.ControlPlaneAddress != nil {
 		c.ControlPlaneAddress = *payload.ControlPlaneAddress
@@ -168,11 +192,12 @@ func Default() Config {
 		MediaListenAddress:     "0.0.0.0:8082",
 		DataDir:                defaultDataDir,
 		DeviceLimit:            DefaultDeviceLimit,
-		ControlPlaneAddress:    "https://timich.runo.jp",
+		AppLinkBaseURL:         DefaultAppLinkBaseURL,
+		ControlPlaneAddress:    DefaultRelayConnectionAddress,
 		ControlPlaneServerName: "",
 		Hosted: RemoteBrowsingConfig{
 			Enabled:   false,
-			ServerURL: "https://timich.runo.jp",
+			ServerURL: DefaultRemoteBrowsingServerURL,
 		},
 		Datasources: []DatasourceConfig{},
 	}
@@ -204,13 +229,22 @@ func Load(configPath string) (ResolvedConfig, error) {
 		if err := json.Unmarshal(raw, &cfg); err != nil {
 			return ResolvedConfig{}, fmt.Errorf("parse config file %s: %w", resolvedPath, err)
 		}
+		if changed, err := EnsureDatasourceSourceKeys(&cfg); err != nil {
+			return ResolvedConfig{}, err
+		} else if changed {
+			if err := WriteFile(resolvedPath, cfg); err != nil {
+				return ResolvedConfig{}, fmt.Errorf("persist datasource source keys: %w", err)
+			}
+		}
 		source = "file"
 		baseDir = filepath.Dir(resolvedPath)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return ResolvedConfig{}, fmt.Errorf("read config file %s: %w", resolvedPath, err)
 	}
 
+	relayConnectionEnvProvided := relayConnectionAddressEnvProvided()
 	applyEnvOverrides(&cfg)
+	upgradeLegacyRelayConnectionAddress(&cfg, relayConnectionEnvProvided)
 	cfg.DataDir = resolveDataDir(baseDir, cfg.DataDir)
 
 	if err := validate(cfg); err != nil {
@@ -274,6 +308,9 @@ func WriteFile(configPath string, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("resolve config path: %w", err)
 	}
+	if _, err := EnsureDatasourceSourceKeys(&cfg); err != nil {
+		return err
+	}
 	if err := validate(cfg); err != nil {
 		return err
 	}
@@ -314,13 +351,31 @@ func UpdatePrimaryDatasourceFile(configPath string, datasource DatasourceConfig)
 	}
 
 	if len(cfg.Datasources) == 0 {
+		if strings.TrimSpace(datasource.SourceKey) == "" {
+			sourceKey, err := GenerateDatasourceSourceKey()
+			if err != nil {
+				return Config{}, err
+			}
+			datasource.SourceKey = sourceKey
+		}
 		cfg.Datasources = []DatasourceConfig{datasource}
 	} else {
+		if strings.TrimSpace(datasource.SourceKey) == "" {
+			datasource.SourceKey = cfg.Datasources[0].SourceKey
+		}
+		if strings.TrimSpace(datasource.SourceKey) == "" {
+			sourceKey, err := GenerateDatasourceSourceKey()
+			if err != nil {
+				return Config{}, err
+			}
+			datasource.SourceKey = sourceKey
+		}
 		if strings.TrimSpace(datasource.AccessToken) == "" {
 			datasource.AccessToken = cfg.Datasources[0].AccessToken
 		}
 		cfg.Datasources[0] = datasource
 	}
+	upgradeLegacyRelayConnectionAddress(&cfg, false)
 	if err := WriteFile(resolvedPath, cfg); err != nil {
 		return Config{}, err
 	}
@@ -331,8 +386,10 @@ func applyEnvOverrides(cfg *Config) {
 	applyStringEnv("TIMICH_AGENT_NAME", &cfg.AgentName)
 	applyStringEnv("TIMICH_AGENT_ADMIN_LISTEN_ADDR", &cfg.AdminListenAddress)
 	applyStringEnv("TIMICH_AGENT_MEDIA_LISTEN_ADDR", &cfg.MediaListenAddress)
+	applyStringEnv("TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL", &cfg.AdvertisedMediaBaseURL)
 	applyStringEnv("TIMICH_AGENT_DATA_DIR", &cfg.DataDir)
 	applyIntEnv("TIMICH_AGENT_DEVICE_LIMIT", &cfg.DeviceLimit)
+	applyStringEnv("TIMICH_AGENT_APP_LINK_BASE_URL", &cfg.AppLinkBaseURL)
 	applyStringEnv("TIMICH_AGENT_CONTROL_PLANE_ADDR", &cfg.ControlPlaneAddress)
 	applyStringEnv("TIMICH_AGENT_RELAY_CONNECTION_ADDR", &cfg.ControlPlaneAddress)
 	applyStringEnv("TIMICH_AGENT_CONTROL_PLANE_SERVER_NAME", &cfg.ControlPlaneServerName)
@@ -340,6 +397,23 @@ func applyEnvOverrides(cfg *Config) {
 	applyBoolEnv("TIMICH_AGENT_HOSTED_ENABLED", &cfg.Hosted.Enabled)
 	applyStringEnv("TIMICH_AGENT_REMOTE_BROWSING_SERVER_URL", &cfg.Hosted.ServerURL)
 	applyBoolEnv("TIMICH_AGENT_REMOTE_BROWSING_ENABLED", &cfg.Hosted.Enabled)
+}
+
+func relayConnectionAddressEnvProvided() bool {
+	return strings.TrimSpace(os.Getenv("TIMICH_AGENT_CONTROL_PLANE_ADDR")) != "" ||
+		strings.TrimSpace(os.Getenv("TIMICH_AGENT_RELAY_CONNECTION_ADDR")) != ""
+}
+
+func upgradeLegacyRelayConnectionAddress(cfg *Config, relayConnectionEnvProvided bool) {
+	if relayConnectionEnvProvided {
+		return
+	}
+	if strings.TrimRight(strings.TrimSpace(cfg.Hosted.ServerURL), "/") != DefaultRemoteBrowsingServerURL {
+		return
+	}
+	if strings.TrimRight(strings.TrimSpace(cfg.ControlPlaneAddress), "/") == legacyDefaultRelayConnectionAddress {
+		cfg.ControlPlaneAddress = DefaultRelayConnectionAddress
+	}
 }
 
 func applyStringEnv(key string, target *string) {
@@ -378,11 +452,19 @@ func validate(cfg Config) error {
 	if strings.TrimSpace(cfg.MediaListenAddress) == "" {
 		return errors.New("media listen address must not be empty")
 	}
+	if strings.TrimSpace(cfg.AdvertisedMediaBaseURL) != "" {
+		if _, err := parseHTTPURL(cfg.AdvertisedMediaBaseURL); err != nil {
+			return fmt.Errorf("advertised media base URL: %w", err)
+		}
+	}
 	if strings.TrimSpace(cfg.DataDir) == "" {
 		return errors.New("data directory must not be empty")
 	}
 	if cfg.DeviceLimit < 1 {
 		return errors.New("device limit must be at least 1")
+	}
+	if _, err := parseHTTPSURL(cfg.AppLinkBaseURL); err != nil {
+		return fmt.Errorf("app link base URL: %w", err)
 	}
 
 	if err := validateListenAddress(cfg.AdminListenAddress); err != nil {
@@ -400,6 +482,9 @@ func validate(cfg Config) error {
 	}
 
 	for index, datasource := range cfg.Datasources {
+		if err := ValidateDatasourceSourceKey(datasource.SourceKey); err != nil {
+			return fmt.Errorf("datasource %d: source key: %w", index, err)
+		}
 		if strings.TrimSpace(datasource.Name) == "" {
 			return fmt.Errorf("datasource %d: name must not be empty", index)
 		}
@@ -421,6 +506,69 @@ func validate(cfg Config) error {
 		}
 	}
 
+	return nil
+}
+
+// EnsureDatasourceSourceKeys assigns stable 64-bit source keys to configured datasources.
+func EnsureDatasourceSourceKeys(cfg *Config) (bool, error) {
+	if cfg == nil {
+		return false, errors.New("config must not be nil")
+	}
+	changed := false
+	seen := map[string]struct{}{}
+	for index := range cfg.Datasources {
+		key := strings.ToLower(strings.TrimSpace(cfg.Datasources[index].SourceKey))
+		if key == "" {
+			generated, err := GenerateDatasourceSourceKey()
+			if err != nil {
+				return false, err
+			}
+			key = generated
+			cfg.Datasources[index].SourceKey = key
+			changed = true
+		} else if key != cfg.Datasources[index].SourceKey {
+			cfg.Datasources[index].SourceKey = key
+			changed = true
+		}
+		if err := ValidateDatasourceSourceKey(key); err != nil {
+			return false, fmt.Errorf("datasource %d: %w", index, err)
+		}
+		if _, ok := seen[key]; ok {
+			return false, fmt.Errorf("datasource %d: duplicate source key", index)
+		}
+		seen[key] = struct{}{}
+	}
+	return changed, nil
+}
+
+// GenerateDatasourceSourceKey returns a non-zero random 64-bit source key.
+func GenerateDatasourceSourceKey() (string, error) {
+	for {
+		var raw [8]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return "", fmt.Errorf("generate datasource source key: %w", err)
+		}
+		if raw == [8]byte{} {
+			continue
+		}
+		return hex.EncodeToString(raw[:]), nil
+	}
+}
+
+// ValidateDatasourceSourceKey verifies the persisted 64-bit lowercase hex key.
+func ValidateDatasourceSourceKey(value string) error {
+	key := strings.TrimSpace(value)
+	if len(key) != 16 {
+		return errors.New("must be 16 lowercase hex characters")
+	}
+	if key == "0000000000000000" {
+		return errors.New("must not be zero")
+	}
+	for _, char := range key {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return errors.New("must be 16 lowercase hex characters")
+		}
+	}
 	return nil
 }
 
@@ -498,6 +646,28 @@ func parseURL(raw string) (*url.URL, error) {
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return nil, fmt.Errorf("invalid URL %q", raw)
+	}
+	return parsed, nil
+}
+
+func parseHTTPSURL(raw string) (*url.URL, error) {
+	parsed, err := parseURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	if parsed.Scheme != "https" {
+		return nil, fmt.Errorf("must use https URL %q", raw)
+	}
+	return parsed, nil
+}
+
+func parseHTTPURL(raw string) (*url.URL, error) {
+	parsed, err := parseURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("must use http or https URL %q", raw)
 	}
 	return parsed, nil
 }
