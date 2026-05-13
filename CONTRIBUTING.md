@@ -6,16 +6,16 @@ distribution repository for the local agent runtime.
 ## Project Shape
 
 Timich Agent source snapshots are exported from the Timich codebase. Keep
-changes compatible with that export flow. Broad product documentation and
-README changes should normally be made in the Timich source of truth and then
-synced here, unless a change is specific to this standalone public repository.
+changes compatible with that export flow. Product source, README content, OSS
+governance files, and release bundle contents should normally be changed in the
+Timich source of truth and then synced here.
 
 Good standalone-repository changes include:
 
-- OSS governance files
-- release and distribution metadata
-- issue, pull request, and security process documentation
-- fixes that are also ready to be carried back into the Timich source tree
+- GitHub-only CI, release, issue, or pull request metadata
+- repository settings and hosting process documentation
+- emergency fixes that are also ready to be carried back into the Timich source
+  tree
 
 ## Local Setup
 
@@ -53,14 +53,16 @@ state, or private deployment files.
 - Prefer existing project patterns over new abstractions.
 - Use the project logging path for diagnostics, and never log secrets or
   sensitive user data.
-- Call out whether the change needs to be reflected in the Timich source tree.
+- Call out whether the change needs to be reflected in the companion Timich MCP
+  repository.
 
 ## Security-Sensitive Changes
 
 Changes touching authentication, pairing, token handling, datasource secrets,
 remote browsing, media authorization, or local network exposure should include
 extra verification notes in the pull request. Avoid putting real tokens,
-private hostnames, IP addresses, or media metadata in tests and examples.
+private hostnames, IP addresses, Agent URLs, or media metadata in tests and
+examples.
 
 ## License
 

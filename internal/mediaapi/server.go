@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/rsahara/timich-agent/internal/catalog"
@@ -20,14 +19,19 @@ const maxJSONBodyBytes = 1 << 20
 // NewMux returns the local LAN-facing media API scaffold.
 func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			writeRouteNotFound(w, "Unknown media route.")
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"service": "timich-agent-media",
 			"routes": []string{
 				"/healthz",
 				"/version",
 				"/v1/info",
-				"/v1/catalog",
+				"/v1/assets/search",
+				"/v1/assets/search/capabilities",
 				"/v1/pairing/redeem",
 				"/v1/session/refresh",
 				"/v1/assets/{assetID}/preview",
@@ -35,6 +39,12 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 				"/v1/assets/{assetID}/original",
 				"/v1/webrtc/offer",
 			},
+		})
+	})
+	mux.HandleFunc("/v1/catalog", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusGone, map[string]string{
+			"error":   "catalog_endpoint_removed",
+			"message": "GET /v1/catalog has been removed. Use POST /v1/assets/search instead.",
 		})
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -116,25 +126,35 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, sessionBundle)
 	})
-	mux.HandleFunc("/v1/catalog", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/assets/search/capabilities", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			writeMethodNotAllowed(w, "Use GET to read the local catalog.")
+			writeMethodNotAllowed(w, "Use GET to read search capabilities.")
+			return
+		}
+		if _, ok := authenticateRequest(w, runtime, r); !ok {
+			return
+		}
+		writeJSON(w, http.StatusOK, runtime.SearchCapabilities())
+	})
+	mux.HandleFunc("/v1/assets/search", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeMethodNotAllowed(w, "Use POST to search assets.")
 			return
 		}
 		if _, ok := authenticateRequest(w, runtime, r); !ok {
 			return
 		}
 
-		pageIndex := parsePositiveInt(r.URL.Query().Get("page"), 0)
-		pageSize := parsePositiveInt(r.URL.Query().Get("size"), 60)
-		if pageSize < 1 {
-			pageSize = 1
-		}
-		if pageSize > 200 {
-			pageSize = 200
+		var request catalog.AssetSearchRequest
+		if err := decodeJSONRequest(w, r, &request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_request",
+				"message": "Could not parse the asset search request.",
+			})
+			return
 		}
 
-		page, err := runtime.CatalogPage(pageIndex, pageSize)
+		page, err := runtime.SearchAssets(request)
 		if err != nil {
 			writeCatalogError(w, err)
 			return
@@ -180,10 +200,7 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 
 		assetID, variant, ok := parseAssetRequest(r.URL.Path)
 		if !ok {
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":   "route_not_found",
-				"message": "Unknown media route.",
-			})
+			writeRouteNotFound(w, "Unknown media route.")
 			return
 		}
 
@@ -212,13 +229,14 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 		defer response.Body.Close()
 		copyProxyResponse(w, r.Method, response)
 	})
-	mux.HandleFunc("/v1/catalog-placeholder", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusNotImplemented, map[string]any{
-			"error":   "catalog_not_implemented",
-			"message": "This route is deprecated; use /v1/catalog instead.",
-		})
-	})
 	return mux
+}
+
+func writeRouteNotFound(w http.ResponseWriter, message string) {
+	writeJSON(w, http.StatusNotFound, map[string]string{
+		"error":   "route_not_found",
+		"message": message,
+	})
 }
 
 func decodeJSONRequest(w http.ResponseWriter, r *http.Request, payload any) error {
@@ -269,14 +287,6 @@ func bearerTokenFromHeader(value string) string {
 		return ""
 	}
 	return strings.TrimSpace(trimmedValue[len("Bearer "):])
-}
-
-func parsePositiveInt(rawValue string, fallback int) int {
-	value, err := strconv.Atoi(strings.TrimSpace(rawValue))
-	if err != nil || value < 0 {
-		return fallback
-	}
-	return value
 }
 
 func parseAssetRequest(path string) (assetID string, variant string, ok bool) {
@@ -383,6 +393,14 @@ func writeCatalogError(w http.ResponseWriter, err error) {
 		status = http.StatusServiceUnavailable
 		errorCode = "datasource_not_configured"
 		message = "No datasource is configured on this agent."
+	} else if errors.Is(err, catalog.ErrInvalidSearchRequest) {
+		status = http.StatusBadRequest
+		errorCode = "invalid_search_request"
+		message = "The asset search request is not valid."
+	} else if errors.Is(err, catalog.ErrUnsupportedSearch) {
+		status = http.StatusBadRequest
+		errorCode = "unsupported_search"
+		message = "The requested asset search is not supported by this datasource."
 	} else if errors.Is(err, catalog.ErrAssetNotFound) {
 		status = http.StatusNotFound
 		errorCode = "asset_not_found"

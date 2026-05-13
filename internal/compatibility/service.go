@@ -15,8 +15,9 @@ import (
 type Status string
 
 const (
-	StatusOK     Status = "ok"
-	StatusFailed Status = "failed"
+	StatusOK      Status = "ok"
+	StatusWarning Status = "warning"
+	StatusFailed  Status = "failed"
 )
 
 type Check struct {
@@ -35,26 +36,37 @@ type Report struct {
 	Checks    []Check   `json:"checks"`
 }
 
-type Service struct {
-	version               string
-	agentID               string
-	relayKeyID            string
-	privateKey            string
-	relayCredentialSynced bool
-	cfg                   config.ResolvedConfig
-	catalog               *catalog.Service
-	client                *http.Client
+// RelayRegistrationState summarizes whether the agent can authenticate to the relay.
+type RelayRegistrationState struct {
+	CredentialSynced bool
+	Ready            bool
+	BlockedBy        []string
 }
 
-func NewService(version string, agentID string, relayKeyID string, privateKey string, cfg config.ResolvedConfig, catalogService *catalog.Service, relayCredentialSynced bool) *Service {
+type Service struct {
+	version           string
+	agentID           string
+	relayKeyID        string
+	privateKey        string
+	relayRegistration RelayRegistrationState
+	cfg               config.ResolvedConfig
+	catalog           *catalog.Service
+	client            *http.Client
+}
+
+func NewService(version string, agentID string, relayKeyID string, privateKey string, cfg config.ResolvedConfig, catalogService *catalog.Service, relayRegistration RelayRegistrationState) *Service {
 	return &Service{
-		version:               strings.TrimSpace(version),
-		agentID:               strings.TrimSpace(agentID),
-		relayKeyID:            strings.TrimSpace(relayKeyID),
-		privateKey:            strings.TrimSpace(privateKey),
-		relayCredentialSynced: relayCredentialSynced,
-		cfg:                   cfg,
-		catalog:               catalogService,
+		version:    strings.TrimSpace(version),
+		agentID:    strings.TrimSpace(agentID),
+		relayKeyID: strings.TrimSpace(relayKeyID),
+		privateKey: strings.TrimSpace(privateKey),
+		relayRegistration: RelayRegistrationState{
+			CredentialSynced: relayRegistration.CredentialSynced,
+			Ready:            relayRegistration.Ready,
+			BlockedBy:        append([]string(nil), relayRegistration.BlockedBy...),
+		},
+		cfg:     cfg,
+		catalog: catalogService,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -75,6 +87,9 @@ func (s *Service) Run(ctx context.Context) Report {
 			reportStatus = StatusFailed
 			break
 		}
+		if check.Status == StatusWarning {
+			reportStatus = StatusWarning
+		}
 	}
 
 	return Report{
@@ -93,7 +108,11 @@ func (s *Service) runAgentConfigCheck() Check {
 		"relayConnectionAddress": s.cfg.ControlPlaneAddress,
 		"relayKeyID":             s.relayKeyID,
 		"hasRelaySigningKey":     s.relayKeyID != "" && s.privateKey != "",
-		"relayCredentialSynced":  s.relayCredentialSynced,
+		"relayCredentialSynced":  s.relayRegistration.CredentialSynced,
+		"relayRegistrationReady": s.relayRegistration.Ready,
+	}
+	if len(s.relayRegistration.BlockedBy) > 0 {
+		details["relayRegistrationBlockedBy"] = append([]string(nil), s.relayRegistration.BlockedBy...)
 	}
 
 	if !s.cfg.Hosted.Enabled {
@@ -239,7 +258,56 @@ func (s *Service) runRelayServerCheck(ctx context.Context) Check {
 func (s *Service) runRelayConnectionCheck(ctx context.Context) Check {
 	details := map[string]any{
 		"relayConnectionAddress": s.cfg.ControlPlaneAddress,
+		"relayCredentialSynced":  s.relayRegistration.CredentialSynced,
+		"relayRegistrationReady": s.relayRegistration.Ready,
 	}
+	if len(s.relayRegistration.BlockedBy) > 0 {
+		details["relayRegistrationBlockedBy"] = append([]string(nil), s.relayRegistration.BlockedBy...)
+	}
+
+	if !s.cfg.Hosted.Enabled {
+		return Check{
+			Name:        "relay_connection",
+			Status:      StatusWarning,
+			Summary:     "Remote browsing is disabled, so no relay connection round trip was run.",
+			Remediation: "Enable remote browsing in the agent config before checking relay connectivity.",
+			Details:     details,
+		}
+	}
+	if strings.TrimSpace(s.cfg.ControlPlaneAddress) == "" {
+		return Check{
+			Name:        "relay_connection",
+			Status:      StatusWarning,
+			Summary:     "The relay connection address is missing, so no relay connection round trip was run.",
+			Remediation: "Set relayConnectionAddress to the relay connection URL and rerun the check.",
+			Details:     details,
+		}
+	}
+	if s.relayKeyID == "" || s.privateKey == "" {
+		return Check{
+			Name:        "relay_connection",
+			Status:      StatusWarning,
+			Summary:     "The agent relay signing key is missing, so no relay connection round trip was run.",
+			Remediation: "Restart the agent so it can repair its local relay credential state, then rerun the check.",
+			Details:     details,
+		}
+	}
+	if !s.relayRegistration.CredentialSynced {
+		summary := "The relay credential is not registered yet, so the relay connection round trip has not run yet."
+		remediation := "Wait for the agent to register its relay credential, then rerun the check."
+		if len(s.relayRegistration.BlockedBy) > 0 {
+			summary = "Remote browsing setup is not complete, so the relay connection round trip has not run yet."
+			remediation = "Finish setup (" + strings.Join(s.relayRegistration.BlockedBy, ", ") + "), then wait for relay credential registration and rerun the check."
+		}
+		return Check{
+			Name:        "relay_connection",
+			Status:      StatusWarning,
+			Summary:     summary,
+			Remediation: remediation,
+			Details:     details,
+		}
+	}
+
 	keyID := ""
 	privateKey := ""
 	if shouldSignRelayConnectionProbe(s.cfg.ControlPlaneAddress) {
@@ -263,7 +331,7 @@ func (s *Service) runRelayConnectionCheck(ctx context.Context) Check {
 			Name:        "relay_connection",
 			Status:      StatusFailed,
 			Summary:     "The relay connection could not complete a hello/ack round trip.",
-			Remediation: "Confirm relay TLS, relay credential registration, and outbound reachability to the relay connection host.",
+			Remediation: s.relayConnectionFailureRemediation(),
 			Details:     details,
 		}
 	}
@@ -279,4 +347,11 @@ func (s *Service) runRelayConnectionCheck(ctx context.Context) Check {
 
 func shouldSignRelayConnectionProbe(target string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(target)), "https://")
+}
+
+func (s *Service) relayConnectionFailureRemediation() string {
+	if strings.TrimRight(strings.TrimSpace(s.cfg.ControlPlaneAddress), "/") == config.DefaultRemoteBrowsingServerURL {
+		return "The relay connection target is the public Timich Reach web/API URL. Set relayConnectionAddress or TIMICH_AGENT_RELAY_CONNECTION_ADDR to " + config.DefaultRelayConnectionAddress + "."
+	}
+	return "Confirm relay TLS, relay credential registration, and outbound reachability to the relay connection host."
 }

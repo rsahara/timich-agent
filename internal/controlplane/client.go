@@ -25,6 +25,8 @@ const (
 	hostedRelayResponseMaxBodySize = controlplanetransport.MaxRelayMessageBytes
 )
 
+var controlPlaneDialTimeout = 15 * time.Second
+
 type Client struct {
 	version                       string
 	target                        string
@@ -231,11 +233,10 @@ func (c *Client) runOnce(ctx context.Context) error {
 		dialOptions = append(dialOptions, grpc.WithPerRPCCredentials(c.tokenSigner))
 	}
 
-	conn, err := grpc.DialContext(
-		ctx,
-		target,
-		dialOptions...,
-	)
+	dialCtx, cancelDial := context.WithTimeout(ctx, controlPlaneDialTimeout)
+	defer cancelDial()
+
+	conn, err := grpc.DialContext(dialCtx, target, dialOptions...)
 	if err != nil {
 		return err
 	}

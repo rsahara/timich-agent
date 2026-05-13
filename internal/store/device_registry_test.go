@@ -128,7 +128,9 @@ func TestDeviceRegistryStoreLoadsLegacyPlaintextRefreshToken(t *testing.T) {
 
 	dataDir := t.TempDir()
 	registryPath := filepath.Join(dataDir, deviceRegistryFileName)
-	raw := []byte("{\n  \"pairingSessions\": [],\n  \"devices\": [\n    {\n      \"deviceId\": \"device-123\",\n      \"deviceName\": \"Legacy iPhone\",\n      \"createdAt\": \"2026-04-11T00:00:00Z\",\n      \"lastRefreshedAt\": \"2026-04-11T00:00:00Z\",\n      \"currentRefreshToken\": \"legacy-refresh-token\",\n      \"refreshTokenExpiresAt\": \"2026-05-11T00:00:00Z\"\n    }\n  ]\n}\n")
+	now := time.Now().UTC().Truncate(time.Second)
+	expiresAt := now.Add(24 * time.Hour)
+	raw := []byte("{\n  \"pairingSessions\": [],\n  \"devices\": [\n    {\n      \"deviceId\": \"device-123\",\n      \"deviceName\": \"Legacy iPhone\",\n      \"createdAt\": \"2026-04-11T00:00:00Z\",\n      \"lastRefreshedAt\": \"2026-04-11T00:00:00Z\",\n      \"currentRefreshToken\": \"legacy-refresh-token\",\n      \"refreshTokenExpiresAt\": \"" + expiresAt.Format(time.RFC3339) + "\"\n    }\n  ]\n}\n")
 	if err := os.WriteFile(registryPath, raw, 0o600); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
@@ -140,8 +142,8 @@ func TestDeviceRegistryStoreLoadsLegacyPlaintextRefreshToken(t *testing.T) {
 
 	rotated, err := registry.RotateRefreshToken(
 		"legacy-refresh-token",
-		time.Now().UTC().Add(24*time.Hour).Truncate(time.Second),
-		time.Now().UTC().Add(48*time.Hour).Truncate(time.Second),
+		expiresAt,
+		now.Add(48*time.Hour),
 	)
 	if err != nil {
 		t.Fatalf("RotateRefreshToken() error = %v", err)

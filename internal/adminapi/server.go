@@ -304,7 +304,12 @@ func (s *server) pairingSessions(w http.ResponseWriter, r *http.Request) {
 		writePairingError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, pairingSession)
+	response, err := s.buildPairingSessionAPIResponse(r, pairingSession)
+	if err != nil {
+		writePairingLinkError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *server) compatibilityCheck(w http.ResponseWriter, r *http.Request) {
@@ -431,6 +436,10 @@ func writePairingError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusInternalServerError, "pairing_session_create_failed", "Could not create a pairing session.")
+}
+
+func writePairingLinkError(w http.ResponseWriter, err error) {
+	writeError(w, http.StatusInternalServerError, "pairing_link_create_failed", "Could not create a pairing link.")
 }
 
 func writeDatasourceError(w http.ResponseWriter, err error) {

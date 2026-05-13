@@ -30,16 +30,16 @@ var (
 
 // AgentRuntime exposes redacted runtime state to the local admin and media APIs.
 type AgentRuntime struct {
-	mu        sync.RWMutex
-	build     BuildInfo
-	config    config.ResolvedConfig
-	state     store.LoadedState
-	startedAt time.Time
-	registry  *store.DeviceRegistryStore
-	pairing   *pairing.Service
-	catalog   *catalog.Service
-	checker   *compatibility.Service
-	webrtc    *webrtcmedia.Manager
+	mu         sync.RWMutex
+	build      BuildInfo
+	config     config.ResolvedConfig
+	state      store.LoadedState
+	assetIDKey []byte
+	startedAt  time.Time
+	registry   *store.DeviceRegistryStore
+	pairing    *pairing.Service
+	catalog    *catalog.Service
+	webrtc     *webrtcmedia.Manager
 }
 
 type BuildInfo struct {
@@ -95,44 +95,47 @@ type SetupTask struct {
 
 // StatusResponse summarizes the runtime state for diagnostics.
 type StatusResponse struct {
-	Service            string                `json:"service"`
-	Version            string                `json:"version"`
-	Commit             string                `json:"commit,omitempty"`
-	BuiltAt            string                `json:"builtAt,omitempty"`
-	Mode               string                `json:"mode"`
-	AgentID            string                `json:"agentId"`
-	AgentName          string                `json:"agentName"`
-	StartedAt          time.Time             `json:"startedAt"`
-	UptimeSeconds      int64                 `json:"uptimeSeconds"`
-	ConfigSource       string                `json:"configSource"`
-	ConfigPath         string                `json:"configPath"`
-	DataDir            string                `json:"dataDir"`
-	StatePath          string                `json:"statePath"`
-	AdminListenAddress string                `json:"adminListenAddress"`
-	MediaListenAddress string                `json:"mediaListenAddress"`
-	DeviceLimit        int                   `json:"deviceLimit"`
-	PairedDeviceCount  int                   `json:"pairedDeviceCount"`
-	ActivePairingCount int                   `json:"activePairingCount"`
-	SessionKeyReady    bool                  `json:"sessionKeyReady"`
-	AdminAuthReady     bool                  `json:"adminAuthReady"`
-	RemoteBrowsing     RemoteBrowsingSummary `json:"remoteBrowsing"`
-	Datasources        []DatasourceSummary   `json:"datasources"`
-	SetupTasks         []SetupTask           `json:"setupTasks"`
+	Service                string                `json:"service"`
+	Version                string                `json:"version"`
+	Commit                 string                `json:"commit,omitempty"`
+	BuiltAt                string                `json:"builtAt,omitempty"`
+	Mode                   string                `json:"mode"`
+	AgentID                string                `json:"agentId"`
+	AgentName              string                `json:"agentName"`
+	StartedAt              time.Time             `json:"startedAt"`
+	UptimeSeconds          int64                 `json:"uptimeSeconds"`
+	ConfigSource           string                `json:"configSource"`
+	ConfigPath             string                `json:"configPath"`
+	DataDir                string                `json:"dataDir"`
+	StatePath              string                `json:"statePath"`
+	AdminListenAddress     string                `json:"adminListenAddress"`
+	MediaListenAddress     string                `json:"mediaListenAddress"`
+	AdvertisedMediaBaseURL string                `json:"advertisedMediaBaseURL,omitempty"`
+	DeviceLimit            int                   `json:"deviceLimit"`
+	PairedDeviceCount      int                   `json:"pairedDeviceCount"`
+	ActivePairingCount     int                   `json:"activePairingCount"`
+	SessionKeyReady        bool                  `json:"sessionKeyReady"`
+	AdminAuthReady         bool                  `json:"adminAuthReady"`
+	RemoteBrowsing         RemoteBrowsingSummary `json:"remoteBrowsing"`
+	Datasources            []DatasourceSummary   `json:"datasources"`
+	SetupTasks             []SetupTask           `json:"setupTasks"`
 }
 
 // ConfigResponse exposes the current redacted config plus state location.
 type ConfigResponse struct {
-	AgentName          string                `json:"agentName"`
-	ConfigSource       string                `json:"configSource"`
-	ConfigPath         string                `json:"configPath"`
-	DataDir            string                `json:"dataDir"`
-	StatePath          string                `json:"statePath"`
-	AdminListenAddress string                `json:"adminListenAddress"`
-	MediaListenAddress string                `json:"mediaListenAddress"`
-	DeviceLimit        int                   `json:"deviceLimit"`
-	AdminAuthReady     bool                  `json:"adminAuthReady"`
-	RemoteBrowsing     RemoteBrowsingSummary `json:"remoteBrowsing"`
-	Datasources        []DatasourceSummary   `json:"datasources"`
+	AgentName              string                `json:"agentName"`
+	ConfigSource           string                `json:"configSource"`
+	ConfigPath             string                `json:"configPath"`
+	DataDir                string                `json:"dataDir"`
+	StatePath              string                `json:"statePath"`
+	AdminListenAddress     string                `json:"adminListenAddress"`
+	MediaListenAddress     string                `json:"mediaListenAddress"`
+	AdvertisedMediaBaseURL string                `json:"advertisedMediaBaseURL,omitempty"`
+	DeviceLimit            int                   `json:"deviceLimit"`
+	AppLinkBaseURL         string                `json:"appLinkBaseURL"`
+	AdminAuthReady         bool                  `json:"adminAuthReady"`
+	RemoteBrowsing         RemoteBrowsingSummary `json:"remoteBrowsing"`
+	Datasources            []DatasourceSummary   `json:"datasources"`
 }
 
 // InfoResponse is the public LAN-facing metadata summary for the media API.
@@ -156,6 +159,13 @@ type InfoResponse struct {
 // NewAgentRuntime builds the redacted runtime view shared by local HTTP surfaces.
 func NewAgentRuntime(build BuildInfo, cfg config.ResolvedConfig, state store.LoadedState, startedAt time.Time) (*AgentRuntime, error) {
 	normalizedBuild := build.withDefaults()
+	if _, err := config.EnsureDatasourceSourceKeys(&cfg.Config); err != nil {
+		return nil, err
+	}
+	assetIDKey, err := deriveAssetIDKey(state.State.SessionSigningKey)
+	if err != nil {
+		return nil, err
+	}
 	registry, err := store.LoadOrCreateDeviceRegistry(cfg.DataDir, cfg.DeviceLimit)
 	if err != nil {
 		return nil, err
@@ -170,23 +180,41 @@ func NewAgentRuntime(build BuildInfo, cfg config.ResolvedConfig, state store.Loa
 		return nil, err
 	}
 	catalogService := catalog.NewService(cfg.Datasources)
-	webrtcManager := webrtcmedia.NewManager(catalogService.Original)
-
-	return &AgentRuntime{
-		build:     normalizedBuild,
-		config:    cfg,
-		state:     state,
-		startedAt: startedAt.UTC(),
-		registry:  registry,
-		pairing:   pairingService,
-		catalog:   catalogService,
-		checker:   newCompatibilityService(normalizedBuild, state, cfg, catalogService),
-		webrtc:    webrtcManager,
-	}, nil
+	runtime := &AgentRuntime{
+		build:      normalizedBuild,
+		config:     cfg,
+		state:      state,
+		assetIDKey: assetIDKey,
+		startedAt:  startedAt.UTC(),
+		registry:   registry,
+		pairing:    pairingService,
+		catalog:    catalogService,
+	}
+	runtime.webrtc = webrtcmedia.NewManager(runtime.Original)
+	return runtime, nil
 }
 
-func newCompatibilityService(build BuildInfo, state store.LoadedState, cfg config.ResolvedConfig, catalogService *catalog.Service) *compatibility.Service {
-	return compatibility.NewService(build.Version, state.State.AgentID, state.State.RelayKeyID, state.State.RelayPrivateKey, cfg, catalogService, state.State.RelayCredentialSyncedAt != nil)
+func newCompatibilityService(
+	build BuildInfo,
+	state store.LoadedState,
+	cfg config.ResolvedConfig,
+	catalogService *catalog.Service,
+	registrationReady bool,
+	registrationBlockedBy []string,
+) *compatibility.Service {
+	return compatibility.NewService(
+		build.Version,
+		state.State.AgentID,
+		state.State.RelayKeyID,
+		state.State.RelayPrivateKey,
+		cfg,
+		catalogService,
+		compatibility.RelayRegistrationState{
+			CredentialSynced: state.State.RelayCredentialSyncedAt != nil,
+			Ready:            registrationReady,
+			BlockedBy:        registrationBlockedBy,
+		},
+	)
 }
 
 // StatusResponse returns the admin diagnostics summary.
@@ -196,29 +224,30 @@ func (a *AgentRuntime) StatusResponse() StatusResponse {
 
 	snapshot := a.registry.Snapshot()
 	return StatusResponse{
-		Service:            "timich-agent",
-		Version:            a.build.Version,
-		Commit:             emptyIfUnknown(a.build.Commit),
-		BuiltAt:            emptyIfUnknown(a.build.BuiltAt),
-		Mode:               a.modeLocked(),
-		AgentID:            a.state.State.AgentID,
-		AgentName:          a.config.AgentName,
-		StartedAt:          a.startedAt,
-		UptimeSeconds:      int64(time.Since(a.startedAt).Seconds()),
-		ConfigSource:       a.config.ConfigSource,
-		ConfigPath:         a.config.ConfigPath,
-		DataDir:            a.config.DataDir,
-		StatePath:          a.state.Path,
-		AdminListenAddress: a.config.AdminListenAddress,
-		MediaListenAddress: a.config.MediaListenAddress,
-		DeviceLimit:        a.config.DeviceLimit,
-		PairedDeviceCount:  len(snapshot.Devices),
-		ActivePairingCount: len(snapshot.PairingSessions),
-		SessionKeyReady:    a.state.State.SessionSigningKey != "",
-		AdminAuthReady:     a.adminAuthReadyLocked(),
-		RemoteBrowsing:     a.remoteBrowsingSummaryLocked(),
-		Datasources:        a.datasourceSummariesLocked(),
-		SetupTasks:         a.setupTasksLocked(snapshot),
+		Service:                "timich-agent",
+		Version:                a.build.Version,
+		Commit:                 emptyIfUnknown(a.build.Commit),
+		BuiltAt:                emptyIfUnknown(a.build.BuiltAt),
+		Mode:                   a.modeLocked(),
+		AgentID:                a.state.State.AgentID,
+		AgentName:              a.config.AgentName,
+		StartedAt:              a.startedAt,
+		UptimeSeconds:          int64(time.Since(a.startedAt).Seconds()),
+		ConfigSource:           a.config.ConfigSource,
+		ConfigPath:             a.config.ConfigPath,
+		DataDir:                a.config.DataDir,
+		StatePath:              a.state.Path,
+		AdminListenAddress:     a.config.AdminListenAddress,
+		MediaListenAddress:     a.config.MediaListenAddress,
+		AdvertisedMediaBaseURL: a.config.AdvertisedMediaBaseURL,
+		DeviceLimit:            a.config.DeviceLimit,
+		PairedDeviceCount:      len(snapshot.Devices),
+		ActivePairingCount:     len(snapshot.PairingSessions),
+		SessionKeyReady:        a.state.State.SessionSigningKey != "",
+		AdminAuthReady:         a.adminAuthReadyLocked(),
+		RemoteBrowsing:         a.remoteBrowsingSummaryLocked(),
+		Datasources:            a.datasourceSummariesLocked(),
+		SetupTasks:             a.setupTasksLocked(snapshot),
 	}
 }
 
@@ -228,17 +257,19 @@ func (a *AgentRuntime) ConfigResponse() ConfigResponse {
 	defer a.mu.RUnlock()
 
 	return ConfigResponse{
-		AgentName:          a.config.AgentName,
-		ConfigSource:       a.config.ConfigSource,
-		ConfigPath:         a.config.ConfigPath,
-		DataDir:            a.config.DataDir,
-		StatePath:          a.state.Path,
-		AdminListenAddress: a.config.AdminListenAddress,
-		MediaListenAddress: a.config.MediaListenAddress,
-		DeviceLimit:        a.config.DeviceLimit,
-		AdminAuthReady:     a.adminAuthReadyLocked(),
-		RemoteBrowsing:     a.remoteBrowsingSummaryLocked(),
-		Datasources:        a.datasourceSummariesLocked(),
+		AgentName:              a.config.AgentName,
+		ConfigSource:           a.config.ConfigSource,
+		ConfigPath:             a.config.ConfigPath,
+		DataDir:                a.config.DataDir,
+		StatePath:              a.state.Path,
+		AdminListenAddress:     a.config.AdminListenAddress,
+		MediaListenAddress:     a.config.MediaListenAddress,
+		AdvertisedMediaBaseURL: a.config.AdvertisedMediaBaseURL,
+		DeviceLimit:            a.config.DeviceLimit,
+		AppLinkBaseURL:         a.config.AppLinkBaseURL,
+		AdminAuthReady:         a.adminAuthReadyLocked(),
+		RemoteBrowsing:         a.remoteBrowsingSummaryLocked(),
+		Datasources:            a.datasourceSummariesLocked(),
 	}
 }
 
@@ -501,7 +532,6 @@ func (a *AgentRuntime) UpdateRelayCredentialSyncedAt(syncedAt time.Time) error {
 		return err
 	}
 	a.state = next
-	a.checker = newCompatibilityService(a.build, a.state, a.config, a.catalog)
 	return nil
 }
 
@@ -528,6 +558,7 @@ func (a *AgentRuntime) UpdatePrimaryDatasource(input config.DatasourceConfig) (P
 		kind = "immich"
 	}
 	nextDatasource := config.DatasourceConfig{
+		SourceKey:   strings.TrimSpace(input.SourceKey),
 		Name:        name,
 		Kind:        kind,
 		URL:         strings.TrimSpace(input.URL),
@@ -542,6 +573,16 @@ func (a *AgentRuntime) UpdatePrimaryDatasource(input config.DatasourceConfig) (P
 
 	nextConfig := a.config
 	nextConfig.Datasources = append([]config.DatasourceConfig(nil), a.config.Datasources...)
+	if nextDatasource.SourceKey == "" && len(nextConfig.Datasources) > 0 {
+		nextDatasource.SourceKey = nextConfig.Datasources[0].SourceKey
+	}
+	if nextDatasource.SourceKey == "" {
+		sourceKey, err := config.GenerateDatasourceSourceKey()
+		if err != nil {
+			return PrimaryDatasourceResponse{}, err
+		}
+		nextDatasource.SourceKey = sourceKey
+	}
 	if datasourceRequiresAccessToken(nextDatasource.Kind) && nextDatasource.AccessToken == "" && len(nextConfig.Datasources) > 0 {
 		nextDatasource.AccessToken = nextConfig.Datasources[0].AccessToken
 	}
@@ -562,8 +603,7 @@ func (a *AgentRuntime) UpdatePrimaryDatasource(input config.DatasourceConfig) (P
 	nextConfig.ConfigSource = "file"
 	a.config = nextConfig
 	a.catalog = catalogService
-	a.checker = newCompatibilityService(a.build, a.state, nextConfig, catalogService)
-	a.webrtc = webrtcmedia.NewManager(catalogService.Original)
+	a.webrtc = webrtcmedia.NewManager(a.Original)
 	return a.primaryDatasourceLocked(), nil
 }
 
@@ -641,28 +681,61 @@ func (a *AgentRuntime) RevokeDevice(deviceID string) error {
 	return a.registry.RevokeDevice(deviceID)
 }
 
-// CatalogPage returns one local catalog page from the configured datasource proxy.
-func (a *AgentRuntime) CatalogPage(pageIndex int, pageSize int) (catalog.AssetPage, error) {
+// SearchAssets returns one app-facing search page with Timich-owned opaque asset IDs.
+func (a *AgentRuntime) SearchAssets(request catalog.AssetSearchRequest) (catalog.AssetSearchPage, error) {
+	catalogService, assetIDKey, sourceKey := a.catalogSnapshot()
+	page, err := catalogService.SearchAssets(request)
+	if err != nil {
+		return catalog.AssetSearchPage{}, err
+	}
+	return signAssetSearchPage(page, assetIDKey, sourceKey)
+}
+
+// SearchCapabilities returns the search features supported by the active datasource.
+func (a *AgentRuntime) SearchCapabilities() catalog.AssetSearchCapabilities {
 	catalogService := a.catalogService()
-	return catalogService.CatalogPage(pageIndex, pageSize)
+	return catalogService.SearchCapabilities()
+}
+
+// CatalogPage returns one local timeline page from the configured datasource proxy.
+func (a *AgentRuntime) CatalogPage(pageIndex int, pageSize int) (catalog.AssetSearchPage, error) {
+	return a.SearchAssets(catalog.AssetSearchRequest{
+		Collection: catalog.AssetCollectionRequest{Kind: catalog.CollectionKindTimeline},
+		Page: catalog.AssetSearchPageRequest{
+			Index: pageIndex,
+			Size:  pageSize,
+		},
+	})
 }
 
 // Preview proxies a preview image response for a local client.
 func (a *AgentRuntime) Preview(request *http.Request, assetID string) (*catalog.UpstreamMediaResponse, error) {
-	catalogService := a.catalogService()
-	return catalogService.Preview(request, assetID)
+	catalogService, assetIDKey, sourceKey := a.catalogSnapshot()
+	upstreamAssetID, err := decodeClientAssetID(assetIDKey, sourceKey, assetID)
+	if err != nil {
+		return nil, err
+	}
+	return catalogService.Preview(request, upstreamAssetID)
 }
 
 // DetailPreview returns a detail-preview image response for a client.
 func (a *AgentRuntime) DetailPreview(request *http.Request, assetID string) (*catalog.UpstreamMediaResponse, error) {
-	catalogService := a.catalogService()
-	return catalogService.DetailPreview(request, assetID)
+	catalogService, assetIDKey, sourceKey := a.catalogSnapshot()
+	upstreamAssetID, err := decodeClientAssetID(assetIDKey, sourceKey, assetID)
+	if err != nil {
+		return nil, err
+	}
+	return catalogService.DetailPreview(request, upstreamAssetID)
 }
 
 // Original proxies an original asset response for a local client.
 func (a *AgentRuntime) Original(request *http.Request, assetID string) (*catalog.UpstreamMediaResponse, error) {
-	catalogService := a.catalogService()
-	return catalogService.Original(request, assetID)
+	catalogService, assetIDKey, sourceKey := a.catalogSnapshot()
+	upstreamAssetID, err := decodeClientAssetID(assetIDKey, sourceKey, assetID)
+	if err != nil {
+		return nil, err
+	}
+	return catalogService.Original(request, upstreamAssetID)
 }
 
 // AnswerWebRTCOffer answers a remote media DataChannel offer for prototype streaming.
@@ -684,11 +757,55 @@ func (a *AgentRuntime) catalogService() *catalog.Service {
 	return a.catalog
 }
 
+func (a *AgentRuntime) catalogSnapshot() (*catalog.Service, []byte, string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	return a.catalog, append([]byte(nil), a.assetIDKey...), a.primaryDatasourceSourceKeyLocked()
+}
+
+func (a *AgentRuntime) primaryDatasourceSourceKeyLocked() string {
+	if len(a.config.Datasources) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(a.config.Datasources[0].SourceKey)
+}
+
+func signAssetSearchPage(
+	page catalog.AssetSearchPage,
+	assetIDKey []byte,
+	sourceKey string,
+) (catalog.AssetSearchPage, error) {
+	if strings.TrimSpace(sourceKey) == "" {
+		return catalog.AssetSearchPage{}, catalog.ErrNoDatasourceConfigured
+	}
+	for index := range page.Items {
+		assetID, err := encodeTimichAssetID(assetIDKey, sourceKey, page.Items[index].ID)
+		if err != nil {
+			return catalog.AssetSearchPage{}, err
+		}
+		page.Items[index].ID = assetID
+	}
+	return page, nil
+}
+
+func decodeClientAssetID(assetIDKey []byte, expectedSourceKey string, assetID string) (string, error) {
+	sourceKey, upstreamAssetID, err := decodeTimichAssetID(assetIDKey, assetID)
+	if err != nil {
+		return "", catalog.ErrAssetNotFound
+	}
+	if strings.TrimSpace(expectedSourceKey) == "" || sourceKey != strings.TrimSpace(expectedSourceKey) {
+		return "", catalog.ErrAssetNotFound
+	}
+	return upstreamAssetID, nil
+}
+
 func (a *AgentRuntime) compatibilityChecker() *compatibility.Service {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	return a.checker
+	ready, blockedBy := a.remoteRegistrationReadyLocked(a.registry.Snapshot())
+	return newCompatibilityService(a.build, a.state, a.config, a.catalog, ready, blockedBy)
 }
 
 func (a *AgentRuntime) webrtcManager() *webrtcmedia.Manager {
