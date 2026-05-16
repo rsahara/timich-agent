@@ -50,6 +50,7 @@ func NewMuxWithOptions(runtime *runtimestate.AgentRuntime, options Options) http
 	mux.HandleFunc("/status", api.requireAdmin(api.status))
 	mux.HandleFunc("/config", api.requireAdmin(api.config))
 	mux.HandleFunc("/v1/datasource/primary", api.requireAdmin(api.primaryDatasource))
+	mux.HandleFunc("/v1/datasource/primary/check", api.requireAdmin(api.primaryDatasourceCheck))
 	mux.HandleFunc("/v1/pairing-sessions", api.requireAdmin(api.pairingSessions))
 	mux.HandleFunc("/v1/pairing-links", api.requireAdmin(api.pairingLinks))
 	mux.HandleFunc("/v1/compatibility-check", api.requireAdmin(api.compatibilityCheck))
@@ -293,6 +294,16 @@ func (s *server) primaryDatasource(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeMethodNotAllowed(w, "Use GET or PUT for the primary datasource.")
 	}
+}
+
+func (s *server) primaryDatasourceCheck(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to check the primary datasource.") {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	check := s.runtime.DatasourceCheck(ctx)
+	writeJSON(w, http.StatusOK, check)
 }
 
 func (s *server) pairingSessions(w http.ResponseWriter, r *http.Request) {

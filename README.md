@@ -116,7 +116,8 @@ First-run setup in the Admin UI:
 
 1. Create an admin token with at least 16 characters.
 2. Configure the primary Immich datasource with the Immich server URL and an
-   Immich API key.
+   Immich API key. For the common Docker Compose layout where this Agent joins
+   Immich's `immich_default` network, use `http://immich_server:2283`.
 3. Create a pairing code and enter it in the Timich iOS app.
 4. Confirm the app can load the gallery on the trusted LAN.
 5. Optional: run Remote Browsing checks if you want Timich Reach access away
@@ -164,6 +165,24 @@ host-side media port to `18082` makes the Admin UI offer
 QR candidate. Set `TIMICH_AGENT_MEDIA_PUBLISHED_ADDR` when the automatic port
 hint is not the URL phones should use, for example a host-side port such as
 `18082` or a LAN address such as `10.0.111.128:18082`.
+
+If Immich runs in its own Docker Compose project, add the bundled optional
+override so the Agent can resolve Immich's container name:
+
+```bash
+docker compose -f compose.yaml -f compose.immich-network.example.yaml up -d --build
+```
+
+Then use this datasource URL in the Admin UI:
+
+```text
+http://immich_server:2283
+```
+
+Do not use `localhost` or `127.0.0.1` for a Docker-hosted Immich datasource
+unless Immich is running inside the same container. Inside Docker, those names
+refer to the Agent container itself. If Immich runs directly on the host instead
+of Docker, use a host or LAN URL that the Agent container can reach.
 
 Set `TIMICH_AGENT_REMOTE_BROWSING_ENABLED=false` before starting compose if you
 want the agent to stay local-only.
@@ -229,7 +248,7 @@ The Admin UI currently covers:
 - agent status and remote browsing readiness
 - first-run admin-token setup
 - agent update checks
-- primary Immich datasource editing
+- primary Immich datasource editing and reachability checks
 - pairing-code creation
 - paired-device listing and revoke
 - remote browsing checks
@@ -255,6 +274,7 @@ Admin API:
 - `POST http://AGENT_LAN_HOST:8081/setup-admin-token`
 - `GET http://AGENT_LAN_HOST:8081/v1/datasource/primary`
 - `PUT http://AGENT_LAN_HOST:8081/v1/datasource/primary`
+- `POST http://AGENT_LAN_HOST:8081/v1/datasource/primary/check`
 - `POST http://AGENT_LAN_HOST:8081/v1/pairing-sessions`
 - `POST http://AGENT_LAN_HOST:8081/v1/pairing-links`
 - `POST http://AGENT_LAN_HOST:8081/v1/compatibility-check`

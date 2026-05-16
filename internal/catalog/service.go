@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -288,6 +289,38 @@ func (s *Service) SearchAssets(searchRequest AssetSearchRequest) (AssetSearchPag
 	}
 
 	return s.searchImmichAssets(normalized)
+}
+
+// Probe verifies that the active datasource is reachable from the agent runtime.
+func (s *Service) Probe(ctx context.Context) error {
+	if !s.Ready() {
+		return ErrNoDatasourceConfigured
+	}
+	if s.datasource.Kind == config.DatasourceKindStaticDemo {
+		return nil
+	}
+
+	request, err := s.newRequest(
+		http.MethodPost,
+		"/api/search/metadata",
+		strings.NewReader(`{"page":1,"size":1,"order":"desc"}`),
+	)
+	if err != nil {
+		return err
+	}
+	request = request.WithContext(ctx)
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := s.client.Do(request)
+	if err != nil {
+		return fmt.Errorf("perform datasource probe: %w", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("datasource probe returned status %d", response.StatusCode)
+	}
+	return nil
 }
 
 func (s *Service) searchImmichAssets(normalized normalizedAssetSearch) (AssetSearchPage, error) {

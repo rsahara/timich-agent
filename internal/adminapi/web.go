@@ -278,7 +278,7 @@ const dashboardHTML = `<!doctype html>
             <input id="datasourceName" name="name" autocomplete="off" placeholder="Immich">
           </label>
           <label>Immich URL
-            <input id="datasourceURL" name="url" inputmode="url" autocomplete="off" placeholder="http://immich.local:2283" required>
+            <input id="datasourceURL" name="url" inputmode="url" autocomplete="off" placeholder="http://immich_server:2283" required>
           </label>
           <label>Immich API key
             <input id="datasourceAccessToken" name="accessToken" type="password" autocomplete="off" placeholder="Leave blank to keep existing key">
@@ -707,9 +707,10 @@ const dashboardHTML = `<!doctype html>
           body: JSON.stringify(payload)
         });
         datasourceAccessToken.value = '';
-        datasourceMessage.textContent = 'Saved';
-        datasourceMessage.className = 'status-ok';
+        datasourceMessage.textContent = 'Saved. Checking datasource...';
+        datasourceMessage.className = 'muted';
         await loadStatus();
+        await checkDatasource();
       } catch (error) {
         datasourceMessage.textContent = error.message;
         datasourceMessage.className = 'status-failed';
@@ -717,6 +718,18 @@ const dashboardHTML = `<!doctype html>
         button.disabled = false;
       }
     });
+
+    async function checkDatasource() {
+      const check = await api('/v1/datasource/primary/check', { method: 'POST' });
+      if (check.status === 'ok') {
+        datasourceMessage.textContent = 'Saved. Datasource reachable from Agent.';
+        datasourceMessage.className = 'status-ok';
+        return;
+      }
+      const detail = check.remediation ? ' ' + check.remediation : '';
+      datasourceMessage.textContent = (check.summary || 'Datasource check failed.') + detail;
+      datasourceMessage.className = check.status === 'warning' ? 'status-warn' : 'status-failed';
+    }
 
     document.querySelector('#restartAgent').addEventListener('click', async event => {
       const button = event.currentTarget;
