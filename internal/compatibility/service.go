@@ -76,7 +76,7 @@ func NewService(version string, agentID string, relayKeyID string, privateKey st
 func (s *Service) Run(ctx context.Context) Report {
 	checks := []Check{
 		s.runAgentConfigCheck(),
-		s.runDatasourceCheck(),
+		s.RunDatasourceCheck(ctx),
 		s.runRelayServerCheck(ctx),
 		s.runRelayConnectionCheck(ctx),
 	}
@@ -150,7 +150,7 @@ func (s *Service) runAgentConfigCheck() Check {
 	}
 }
 
-func (s *Service) runDatasourceCheck() Check {
+func (s *Service) RunDatasourceCheck(ctx context.Context) Check {
 	details := map[string]any{
 		"datasourceCount": len(s.cfg.Datasources),
 	}
@@ -160,31 +160,33 @@ func (s *Service) runDatasourceCheck() Check {
 			Name:        "datasource",
 			Status:      StatusFailed,
 			Summary:     "No datasource is configured on this agent.",
-			Remediation: "Add an Immich datasource and API key, then rerun the remote browsing check.",
+			Remediation: "Add an Immich datasource and API key, then rerun the datasource check.",
 			Details:     details,
 		}
 	}
 
-	page, err := s.catalog.CatalogPage(0, 1)
+	err := s.catalog.Probe(ctx)
 	if err != nil {
 		details["error"] = err.Error()
-		details["datasourceURL"] = s.cfg.Datasources[0].URL
+		if len(s.cfg.Datasources) > 0 {
+			details["datasourceURL"] = s.cfg.Datasources[0].URL
+		}
 		return Check{
 			Name:        "datasource",
 			Status:      StatusFailed,
 			Summary:     "The configured datasource could not be queried.",
-			Remediation: "Confirm the Immich URL, API key, and local network reachability.",
+			Remediation: "Confirm the Immich URL, API key, and network path from the agent runtime to Immich.",
 			Details:     details,
 		}
 	}
 
-	details["datasourceURL"] = s.cfg.Datasources[0].URL
-	details["returnedItems"] = len(page.Items)
-	details["reportedTotal"] = page.Total
+	if len(s.cfg.Datasources) > 0 {
+		details["datasourceURL"] = s.cfg.Datasources[0].URL
+	}
 	return Check{
 		Name:    "datasource",
 		Status:  StatusOK,
-		Summary: "The configured datasource returned metadata successfully.",
+		Summary: "The configured datasource accepted a metadata request from this agent.",
 		Details: details,
 	}
 }

@@ -1,0 +1,17 @@
+# Optional override for Docker Compose installs where Immich runs in another
+# Compose project with the default network name `immich_default`.
+#
+# Use with:
+#   docker compose -f compose.yaml -f compose.immich-network.example.yaml up -d
+#
+# Then configure the Agent datasource URL as:
+#   http://immich_server:2283
+services:
+  timich-agent:
+    networks:
+      - default
+      - immich_default
+
+networks:
+  immich_default:
+    external: true

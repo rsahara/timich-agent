@@ -164,6 +164,12 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 	if !bytes.Contains(body, []byte("/v1/update-check")) {
 		t.Fatalf("dashboard body is missing update-check API call: %s", recorder.Body.String())
 	}
+	if !bytes.Contains(body, []byte("http://immich_server:2283")) {
+		t.Fatalf("dashboard body is missing Immich Docker datasource placeholder: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("/v1/datasource/primary/check")) {
+		t.Fatalf("dashboard body is missing datasource check API call: %s", recorder.Body.String())
+	}
 }
 
 func TestAdminRoutesRequireAuthentication(t *testing.T) {
@@ -177,6 +183,7 @@ func TestAdminRoutesRequireAuthentication(t *testing.T) {
 		{method: http.MethodGet, path: "/config"},
 		{method: http.MethodGet, path: "/v1/datasource/primary"},
 		{method: http.MethodPut, path: "/v1/datasource/primary"},
+		{method: http.MethodPost, path: "/v1/datasource/primary/check"},
 		{method: http.MethodPost, path: "/v1/pairing-sessions"},
 		{method: http.MethodPost, path: "/v1/pairing-links"},
 		{method: http.MethodPost, path: "/v1/compatibility-check"},
@@ -342,6 +349,94 @@ func TestPrimaryDatasourceGetAndUpdate(t *testing.T) {
 	}
 	if !payload.Configured || payload.Name != "Home Immich" || payload.URL != "http://immich.local:2283" || !payload.HasAccessToken {
 		t.Fatalf("datasource payload = %#v", payload)
+	}
+}
+
+func TestPrimaryDatasourceCheckReturnsDatasourceStatus(t *testing.T) {
+	t.Parallel()
+
+	datasourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/search/metadata" {
+			t.Fatalf("unexpected datasource path %s", r.URL.Path)
+		}
+		if r.Header.Get("x-api-key") != "immich-api-key" {
+			t.Fatalf("x-api-key = %q, want configured key", r.Header.Get("x-api-key"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"assets":{"items":[],"total":0,"nextPage":null}}`))
+	}))
+	defer datasourceServer.Close()
+
+	runtime := newTestRuntimeWithConfig(t, 5, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.Datasources = []config.DatasourceConfig{{
+			Name:        "Home Immich",
+			Kind:        "immich",
+			URL:         datasourceServer.URL,
+			AccessToken: "immich-api-key",
+		}}
+	})
+	recorder := httptest.NewRecorder()
+	NewMux(runtime).ServeHTTP(
+		recorder,
+		authenticatedRequest(http.MethodPost, "/v1/datasource/primary/check", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var payload struct {
+		Name    string `json:"name"`
+		Status  string `json:"status"`
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
+	}
+	if payload.Name != "datasource" || payload.Status != "ok" {
+		t.Fatalf("check payload = %#v, want datasource ok", payload)
+	}
+	if !strings.Contains(payload.Summary, "metadata request") {
+		t.Fatalf("summary = %q, want metadata request detail", payload.Summary)
+	}
+}
+
+func TestPrimaryDatasourceCheckReportsProbeFailure(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestRuntimeWithConfig(t, 5, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.Datasources = []config.DatasourceConfig{{
+			Name:        "Home Immich",
+			Kind:        "immich",
+			URL:         "http://127.0.0.1:1",
+			AccessToken: "immich-api-key",
+		}}
+	})
+	recorder := httptest.NewRecorder()
+	NewMux(runtime).ServeHTTP(
+		recorder,
+		authenticatedRequest(http.MethodPost, "/v1/datasource/primary/check", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var payload struct {
+		Name        string         `json:"name"`
+		Status      string         `json:"status"`
+		Remediation string         `json:"remediation"`
+		Details     map[string]any `json:"details"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
+	}
+	if payload.Name != "datasource" || payload.Status != "failed" {
+		t.Fatalf("check payload = %#v, want datasource failed", payload)
+	}
+	if !strings.Contains(payload.Remediation, "agent runtime") {
+		t.Fatalf("remediation = %q, want agent runtime hint", payload.Remediation)
+	}
+	if payload.Details["datasourceURL"] != "http://127.0.0.1:1" {
+		t.Fatalf("details = %#v, want datasource URL", payload.Details)
 	}
 }
 

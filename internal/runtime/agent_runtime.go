@@ -755,6 +755,12 @@ func (a *AgentRuntime) CompatibilityCheck(ctx context.Context) compatibility.Rep
 	return checker.Run(ctx)
 }
 
+// DatasourceCheck verifies the active datasource from the agent runtime.
+func (a *AgentRuntime) DatasourceCheck(ctx context.Context) compatibility.Check {
+	checker := a.compatibilityChecker()
+	return checker.RunDatasourceCheck(ctx)
+}
+
 func (a *AgentRuntime) catalogService() *catalog.Service {
 	a.mu.RLock()
 	defer a.mu.RUnlock()

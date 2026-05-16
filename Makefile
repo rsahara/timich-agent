@@ -157,6 +157,7 @@ dist:
 		"      timeout: 5s" \
 		"      retries: 3" \
 		"      start_period: 5s" > "$(DIST_STAGE)/compose.yaml"
+	@cp compose.immich-network.example.yaml "$(DIST_STAGE)/compose.immich-network.example.yaml"
 	@printf '%s\n' \
 		"# Copy this file to .env before running docker compose if you want to customize defaults." \
 		"# Display name shown in the Admin UI and paired app sessions." \
@@ -188,6 +189,14 @@ dist:
 		"# Optional: edit .env to rename the agent or opt out of Remote Browsing." \
 		"docker compose -f compose.yaml up -d --build" \
 		"docker compose -f compose.yaml logs -f" \
+		"\`\`\`" \
+		"" \
+		"If Immich runs in its own Docker Compose project, start the Agent with" \
+		"the optional Immich network override and use http://immich_server:2283" \
+		"as the datasource URL in the Admin UI:" \
+		"" \
+		"\`\`\`sh" \
+		"docker compose -f compose.yaml -f compose.immich-network.example.yaml up -d --build" \
 		"\`\`\`" \
 		"" \
 		"On first run, the logs show the Admin UI URL (default URL from the host is" \
