@@ -31,9 +31,6 @@ func TestLoadDefaultsWhenConfigFileIsMissing(t *testing.T) {
 	if resolved.AppLinkBaseURL != DefaultAppLinkBaseURL {
 		t.Fatalf("app link base URL = %q, want default %q", resolved.AppLinkBaseURL, DefaultAppLinkBaseURL)
 	}
-	if resolved.AdvertisedMediaBaseURL != "" {
-		t.Fatalf("advertised media base URL = %q, want empty default", resolved.AdvertisedMediaBaseURL)
-	}
 	if resolved.Hosted.ServerURL != DefaultRemoteBrowsingServerURL {
 		t.Fatalf("remote browsing server URL = %q, want default %q", resolved.Hosted.ServerURL, DefaultRemoteBrowsingServerURL)
 	}
@@ -70,7 +67,7 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	t.Setenv("TIMICH_AGENT_NAME", "  kitchen-agent  ")
 	t.Setenv("TIMICH_AGENT_ADMIN_LISTEN_ADDR", "127.0.0.1:19081")
 	t.Setenv("TIMICH_AGENT_MEDIA_LISTEN_ADDR", "0.0.0.0:19082")
-	t.Setenv("TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL", "http://10.0.1.4:19082")
+	t.Setenv("TIMICH_AGENT_MEDIA_PUBLISHED_ADDR", "18082")
 	t.Setenv("TIMICH_AGENT_DATA_DIR", "env-state")
 	t.Setenv("TIMICH_AGENT_DEVICE_LIMIT", "9")
 	t.Setenv("TIMICH_AGENT_APP_LINK_BASE_URL", "https://link.dev.timich.runo.jp")
@@ -99,8 +96,8 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	if resolved.AppLinkBaseURL != "https://link.dev.timich.runo.jp" {
 		t.Fatalf("app link base URL = %q, want env override", resolved.AppLinkBaseURL)
 	}
-	if resolved.AdvertisedMediaBaseURL != "http://10.0.1.4:19082" {
-		t.Fatalf("advertised media base URL = %q, want env override", resolved.AdvertisedMediaBaseURL)
+	if resolved.MediaPublishedAddress != "18082" {
+		t.Fatalf("MediaPublishedAddress = %q, want media published address env override", resolved.MediaPublishedAddress)
 	}
 	if resolved.ControlPlaneServerName != "control.example" {
 		t.Fatalf("ControlPlaneServerName = %q, want env override", resolved.ControlPlaneServerName)
@@ -397,18 +394,5 @@ func TestLoadAllowsLoopbackAdminListenAddressOptOut(t *testing.T) {
 	}
 	if resolved.AdminListenAddress != "127.0.0.1:8081" {
 		t.Fatalf("AdminListenAddress = %q, want loopback opt-out", resolved.AdminListenAddress)
-	}
-}
-
-func TestLoadValidatesAdvertisedMediaBaseURL(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "agent.json")
-	raw := []byte("{\n  \"advertisedMediaBaseURL\": \"ftp://agent.local:8082\"\n}\n")
-	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
-		t.Fatalf("WriteFile() error = %v", err)
-	}
-
-	_, err := Load(configPath)
-	if err == nil || !strings.Contains(err.Error(), "advertised media base URL") {
-		t.Fatalf("Load() error = %v, want advertised media base URL validation error", err)
 	}
 }

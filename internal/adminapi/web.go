@@ -206,7 +206,7 @@ const dashboardHTML = `<!doctype html>
     th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
     th { color: var(--muted); font-weight: 500; }
     label { display: grid; gap: 6px; color: var(--muted); font-size: 13px; }
-    input { width: 100%; min-height: 38px; border: 1px solid var(--line); border-radius: 6px; padding: 0 10px; background: transparent; color: var(--fg); font: inherit; }
+    input, select { width: 100%; min-height: 38px; border: 1px solid var(--line); border-radius: 6px; padding: 0 10px; background: transparent; color: var(--fg); font: inherit; }
     button { min-height: 34px; border: 1px solid var(--line); border-radius: 6px; padding: 0 12px; background: transparent; color: var(--fg); font: inherit; cursor: pointer; }
     button.primary { border-color: var(--accent); background: var(--accent); color: #fff; font-weight: 600; }
     button.danger { color: var(--danger); }
@@ -221,8 +221,10 @@ const dashboardHTML = `<!doctype html>
     .pairing { display: grid; gap: 12px; margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
     .pairing-grid { display: grid; grid-template-columns: minmax(180px, 280px) minmax(0, 1fr); gap: 14px; align-items: start; }
     .pairing-qr { width: 100%; max-width: 280px; aspect-ratio: 1; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+    .pairing-qr-slot { width: 100%; max-width: 280px; min-height: 180px; display: grid; align-content: start; gap: 10px; }
     .pairing-link { min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; color: var(--muted); }
     .pairing-code-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+    .pairing-url-controls { display: grid; gap: 8px; }
     .code { min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 18px; overflow-wrap: anywhere; }
     .checks { display: grid; gap: 10px; }
     .check { display: grid; gap: 3px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
@@ -489,7 +491,6 @@ const dashboardHTML = `<!doctype html>
         ['Devices', String(status.pairedDeviceCount || 0) + ' / ' + String(status.deviceLimit || 0)],
         ['Pairing sessions', status.activePairingCount || 0],
         ['Media API', status.mediaListenAddress],
-        ['Advertised Media URL', status.advertisedMediaBaseURL || 'Derived from Admin UI host'],
       ]);
       remoteBrowsingList.innerHTML = rows([
         ['Enabled', status.remoteBrowsing?.enabled ? 'Yes' : 'No'],
@@ -549,29 +550,40 @@ const dashboardHTML = `<!doctype html>
       try {
         const pairing = await api('/v1/pairing-sessions', { method: 'POST' });
         const code = pairing.pairingCode || pairing.code || '';
-        const pairingURL = pairing.pairingURL || '';
-        const qrCodeDataURL = pairing.pairingQRCodeDataURL || '';
-        const agentBaseURL = pairing.pairingPayload?.agentBaseURL || '';
-        const pairingLinkWarning = pairing.pairingLinkWarning?.message || '';
-        const pairingIntro = qrCodeDataURL ? 'Scan the QR code with the device that has Timich installed, or copy the code manually.' : 'Copy the code manually to pair the device.';
+        const choices = pairing.agentBaseURLChoices || [];
+        const choiceOptions = choices.map(choice => '<option value="' + escapeHTML(choice.url) + '">' + escapeHTML(choice.label + ' / ' + choice.url) + '</option>').join('');
         pairingResult.innerHTML =
           '<div class="pairing">' +
-            '<div class="muted">' + escapeHTML(pairingIntro) + '</div>' +
+            '<div class="muted">Copy the code manually to pair the device. QR/link pairing is optional.</div>' +
             '<div class="pairing-grid">' +
-              (qrCodeDataURL ? '<img class="pairing-qr" id="pairingQRCode" alt="Timich app pairing QR code" src="' + escapeHTML(qrCodeDataURL) + '">' : '<div class="notice warn">QR code unavailable' + (pairingLinkWarning ? '<div class="muted">' + escapeHTML(pairingLinkWarning) + '</div>' : '') + '</div>') +
+              '<div class="pairing-qr-slot" id="pairingQRSlot">' +
+                '<div class="notice"><strong>QR code</strong><div class="muted">Select a phone-reachable Media API URL to show a QR code.</div></div>' +
+              '</div>' +
               '<div class="stack">' +
                 '<div class="muted">Device pairing code</div>' +
                 '<div class="pairing-code-row"><div class="code">' + escapeHTML(code) + '</div><button type="button" id="copyPairingCode">Copy code</button></div>' +
-                (pairingURL ? '<div class="muted">Timich app link</div><div class="pairing-code-row"><div class="pairing-link">' + escapeHTML(pairingURL) + '</div><button type="button" id="copyPairingLink">Copy link</button></div>' : '') +
-                (agentBaseURL ? '<div class="muted">Agent URL ' + escapeHTML(agentBaseURL) + '</div>' : '') +
                 '<div class="muted">Expires ' + escapeHTML(date(pairing.expiresAt)) + '</div>' +
+                '<div class="pairing-url-controls">' +
+                  (choices.length ? '<label>Media API URL<select id="pairingAgentBaseURLSelect"><option value="">Select or enter URL</option>' + choiceOptions + '<option value="">Enter custom URL</option></select></label>' : '') +
+                  '<label>' + (choices.length ? 'Selected or custom URL' : 'Media API URL') +
+                    '<input id="pairingAgentBaseURL" inputmode="url" autocomplete="off" placeholder="http://AGENT_LAN_HOST:8082">' +
+                  '</label>' +
+                  '<div class="actions"><button type="button" id="showPairingQR">Show QR code</button><span class="muted" id="pairingQRStatus"></span></div>' +
+                '</div>' +
+                '<div id="pairingLinkResult"></div>' +
                 '<div class="muted" id="copyPairingStatus"></div>' +
               '</div>' +
             '</div>' +
           '</div>';
         const copyButton = pairingResult.querySelector('#copyPairingCode');
-        const copyLinkButton = pairingResult.querySelector('#copyPairingLink');
         const copyStatus = pairingResult.querySelector('#copyPairingStatus');
+        const qrSlot = pairingResult.querySelector('#pairingQRSlot');
+        const qrStatus = pairingResult.querySelector('#pairingQRStatus');
+        const linkResult = pairingResult.querySelector('#pairingLinkResult');
+        const agentBaseURLInput = pairingResult.querySelector('#pairingAgentBaseURL');
+        const agentBaseURLSelect = pairingResult.querySelector('#pairingAgentBaseURLSelect');
+        const showQRButton = pairingResult.querySelector('#showPairingQR');
+        let latestPairingURL = '';
         copyButton.addEventListener('click', async () => {
           copyButton.disabled = true;
           try {
@@ -585,21 +597,65 @@ const dashboardHTML = `<!doctype html>
             copyButton.disabled = false;
           }
         });
-        if (copyLinkButton) {
-          copyLinkButton.addEventListener('click', async () => {
-            copyLinkButton.disabled = true;
-            try {
-              await copyText(pairingURL);
-              copyStatus.textContent = 'Link copied';
-              copyStatus.className = 'status-ok';
-            } catch (_) {
-              copyStatus.textContent = 'Copy failed';
-              copyStatus.className = 'status-failed';
-            } finally {
-              copyLinkButton.disabled = false;
+        async function showPairingLink() {
+          const agentBaseURL = agentBaseURLInput.value.trim();
+          if (!agentBaseURL) {
+            qrStatus.textContent = 'Enter a Media API URL';
+            qrStatus.className = 'status-warn';
+            return;
+          }
+          showQRButton.disabled = true;
+          qrStatus.textContent = 'Creating QR...';
+          qrStatus.className = 'muted';
+          try {
+            const link = await api('/v1/pairing-links', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                agentBaseURL,
+                pairingCode: code,
+              }),
+            });
+            latestPairingURL = link.pairingURL || '';
+            qrSlot.innerHTML = '<img class="pairing-qr" id="pairingQRCode" alt="Timich app pairing QR code" src="' + escapeHTML(link.pairingQRCodeDataURL || '') + '">';
+            linkResult.innerHTML =
+              '<div class="muted">Timich app link</div>' +
+              '<div class="pairing-code-row"><div class="pairing-link">' + escapeHTML(latestPairingURL) + '</div><button type="button" id="copyPairingLink">Copy link</button></div>' +
+              '<div class="muted">Agent URL ' + escapeHTML(link.pairingPayload?.agentBaseURL || agentBaseURL) + '</div>';
+            const copyLinkButton = pairingResult.querySelector('#copyPairingLink');
+            copyLinkButton.addEventListener('click', async () => {
+              copyLinkButton.disabled = true;
+              try {
+                await copyText(latestPairingURL);
+                copyStatus.textContent = 'Link copied';
+                copyStatus.className = 'status-ok';
+              } catch (_) {
+                copyStatus.textContent = 'Copy failed';
+                copyStatus.className = 'status-failed';
+              } finally {
+                copyLinkButton.disabled = false;
+              }
+            });
+            qrStatus.textContent = 'QR ready';
+            qrStatus.className = 'status-ok';
+          } catch (error) {
+            qrStatus.textContent = error.message;
+            qrStatus.className = 'status-failed';
+          } finally {
+            showQRButton.disabled = false;
+          }
+        }
+        if (agentBaseURLSelect) {
+          agentBaseURLSelect.addEventListener('change', () => {
+            agentBaseURLInput.value = agentBaseURLSelect.value;
+            if (agentBaseURLSelect.value) {
+              void showPairingLink();
             }
           });
         }
+        showQRButton.addEventListener('click', () => {
+          void showPairingLink();
+        });
         await loadStatus();
       } catch (error) {
         pairingResult.innerHTML = '<div class="pairing status-failed">' + escapeHTML(error.message) + '</div>';

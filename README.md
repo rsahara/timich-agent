@@ -48,7 +48,7 @@ flowchart LR
   end
 
   subgraph Away["Away from home"]
-    RemoteApp["Client app<br/>(mobile network / remote Wi-Fi)"]
+    RemoteApp["Client app<br/>(e.g. Timich iOS)<br/>mobile network / remote Wi-Fi"]
     Relay["Relay service<br/>(e.g. Timich Reach)"]
   end
 
@@ -108,11 +108,9 @@ http://AGENT_LAN_HOST:8081/
 ```
 
 Use `http://127.0.0.1:8081/` when you are on the agent host itself for setup
-and manual code entry. QR pairing needs a phone-reachable media API URL, so
-open the Admin UI with the agent LAN host/IP or set
-`TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL`. When QR/link pairing cannot be
-prepared from the Admin UI URL, the Admin UI still creates a manual pairing
-code and shows a warning beside the missing QR code.
+and manual code entry. Pairing code entry is the primary path. After creating a
+code, the Admin UI can optionally show a QR code when you select or enter a
+Media API URL that the phone or tablet can reach on the trusted LAN.
 
 First-run setup in the Admin UI:
 
@@ -143,10 +141,10 @@ Common `.env` settings:
 TIMICH_AGENT_NAME=Timich Agent
 TIMICH_AGENT_DEVICE_LIMIT=32
 TIMICH_AGENT_APP_LINK_BASE_URL=https://link.timich.runo.jp
-TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL=http://AGENT_LAN_HOST:8082
 TIMICH_AGENT_REMOTE_BROWSING_ENABLED=true
 TIMICH_AGENT_ADMIN_PORT=8081
 TIMICH_AGENT_MEDIA_PORT=8082
+# TIMICH_AGENT_MEDIA_PUBLISHED_ADDR=10.0.111.128:18082
 ```
 
 For Docker Compose installs, keep the agent's in-container listen addresses at
@@ -156,12 +154,16 @@ and `TIMICH_AGENT_MEDIA_PORT=127.0.0.1:8082` to publish both APIs only on the
 agent host. In a custom Compose file, the equivalent `ports` entries are
 `127.0.0.1:8081:8081` and `127.0.0.1:8082:8082`.
 
-Set `TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL` when QR/link pairing should be
-available from a host-local Admin UI URL such as `http://127.0.0.1:8081/`, or
-when a reverse proxy means the Admin UI host is not the same phone-reachable
-host as the media API. Use the URL the iPhone or iPad can reach on the trusted
-LAN, for example `http://192.168.1.20:8082`. Manual pairing-code creation does
-not require this setting.
+QR/link pairing does not require a startup setting. Create a pairing code first,
+then use the Admin UI URL selector to choose or enter the phone-reachable Media
+API URL, for example `http://192.168.1.20:8082`. Compose passes
+`TIMICH_AGENT_MEDIA_PUBLISHED_ADDR` into the agent as a QR candidate hint when
+set, and otherwise falls back to `TIMICH_AGENT_MEDIA_PORT`. Changing the
+host-side media port to `18082` makes the Admin UI offer
+`http://AGENT_LAN_HOST:18082`. Loopback-only host publishing does not create a
+QR candidate. Set `TIMICH_AGENT_MEDIA_PUBLISHED_ADDR` when the automatic port
+hint is not the URL phones should use, for example a host-side port such as
+`18082` or a LAN address such as `10.0.111.128:18082`.
 
 Set `TIMICH_AGENT_REMOTE_BROWSING_ENABLED=false` before starting compose if you
 want the agent to stay local-only.
@@ -254,6 +256,7 @@ Admin API:
 - `GET http://AGENT_LAN_HOST:8081/v1/datasource/primary`
 - `PUT http://AGENT_LAN_HOST:8081/v1/datasource/primary`
 - `POST http://AGENT_LAN_HOST:8081/v1/pairing-sessions`
+- `POST http://AGENT_LAN_HOST:8081/v1/pairing-links`
 - `POST http://AGENT_LAN_HOST:8081/v1/compatibility-check`
 - `GET http://AGENT_LAN_HOST:8081/v1/update-check`
 - `POST http://AGENT_LAN_HOST:8081/v1/restart`
@@ -306,12 +309,13 @@ curl -s http://127.0.0.1:8081/status \
 ## Pairing Security Notes
 
 - Pairing codes are one-time 128-bit random values encoded as 32 hex characters.
-- The Admin API also returns a Timich app Universal Link and QR code for the
-  active code when it can determine a phone-reachable media API URL. Treat that
-  link like the code itself until it expires because it contains the one-time
-  code and media API URL. The agent will not silently embed `localhost` or
-  `127.0.0.1` in QR links; if a phone-reachable URL is unavailable, the API
-  still returns the manual pairing code with a QR/link warning.
+- The Admin API creates the manual pairing code first. The Admin UI or
+  `/v1/pairing-links` can then generate a Timich app Universal Link and QR code
+  from an operator-selected phone-reachable media API URL. Treat that link like
+  the code itself until it expires because it contains the one-time code and
+  media API URL. The agent will not silently embed `localhost`, `127.0.0.1`, or
+  wildcard listen addresses in QR links; code creation still succeeds when no
+  phone-reachable URL candidate is available.
 - The agent keeps only one active pairing session at a time; creating a new code
   replaces any earlier unredeemed code.
 - After five failed redemption attempts against the active pairing session, the
@@ -343,16 +347,13 @@ curl -s http://127.0.0.1:8081/status \
 
 ## Configuration Reference
 
-A starter config created by `timich-agent init` looks like this. Add
-`advertisedMediaBaseURL` when QR pairing needs an explicit phone-reachable
-media API URL:
+A starter config created by `timich-agent init` looks like this:
 
 ```json
 {
   "agentName": "your-hostname",
   "adminListenAddress": "0.0.0.0:8081",
   "mediaListenAddress": "0.0.0.0:8082",
-  "advertisedMediaBaseURL": "http://AGENT_LAN_HOST:8082",
   "dataDir": "state",
   "deviceLimit": 32,
   "appLinkBaseURL": "https://link.timich.runo.jp",
@@ -373,13 +374,9 @@ client apps need it to remain reachable on the trusted network. For Docker
 Compose, restrict the host-side port publishing instead of changing these
 in-container listen addresses to loopback.
 
-`advertisedMediaBaseURL` is optional. Leave it empty when operators open the
-Admin UI with the same LAN host/IP that app devices can use for the media API.
-Set it to a phone-reachable media API URL when QR pairing starts from
-`localhost`, a reverse proxy, or any host name that should not be embedded in
-the Timich app Universal Link payload. If it is omitted in those cases, manual
-pairing-code creation still works, but the Universal Link and QR code are
-omitted from the pairing-session response.
+QR/link pairing is generated per pairing code from the Admin UI or Admin API.
+Choose or enter the Media API URL that the app device can reach on the trusted
+LAN. Manual pairing-code creation does not depend on a selected URL.
 
 The first datasource-backed local flow proxies the first configured Immich
 datasource for asset search pages plus `preview`, `detail_preview`, and
@@ -422,10 +419,19 @@ curl -s -X POST http://127.0.0.1:8081/v1/pairing-sessions \
   -H "Authorization: Bearer $TIMICH_AGENT_ADMIN_TOKEN"
 ```
 
-From a host-local Admin UI/API URL, the response may contain only
-`pairingCode`, `expiresAt`, and `pairingLinkWarning`. Set
-`TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL` or call the Admin API through the
-agent LAN host/IP when the smoke test needs the Universal Link and QR fields.
+The response contains `pairingCode`, `expiresAt`, and optional
+`agentBaseURLChoices` for QR/link generation. Choices are limited to the current
+Admin UI host or an explicitly configured media host; Docker/container interface
+addresses are not listed, and Docker host-side media port mappings are reflected
+when Compose passes the published port or LAN address hint. To create a
+Universal Link and QR code from a selected Media API URL:
+
+```bash
+curl -s -X POST http://127.0.0.1:8081/v1/pairing-links \
+  -H "Authorization: Bearer $TIMICH_AGENT_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"agentBaseURL":"http://AGENT_LAN_HOST:8082","pairingCode":"PAIRING_CODE"}'
+```
 
 Redeem that code from the LAN-facing media API:
 

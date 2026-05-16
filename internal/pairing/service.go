@@ -86,6 +86,24 @@ func (s *Service) CreatePairingSession() (PairingSessionResponse, error) {
 	}, nil
 }
 
+// ActivePairingSession returns the current unredeemed, unexpired pairing session for a code.
+func (s *Service) ActivePairingSession(code string) (PairingSessionResponse, error) {
+	normalizedCode := strings.TrimSpace(code)
+	if normalizedCode == "" {
+		return PairingSessionResponse{}, store.ErrPairingSessionNotFound
+	}
+	snapshot := s.registry.Snapshot()
+	for _, session := range snapshot.PairingSessions {
+		if session.Code == normalizedCode {
+			return PairingSessionResponse{
+				PairingCode: session.Code,
+				ExpiresAt:   session.ExpiresAt,
+			}, nil
+		}
+	}
+	return PairingSessionResponse{}, store.ErrPairingSessionNotFound
+}
+
 // RedeemPairing exchanges a one-time code for an agent-owned app session.
 func (s *Service) RedeemPairing(code string, deviceName string, baseURL string) (SessionBundle, error) {
 	now := time.Now().UTC()

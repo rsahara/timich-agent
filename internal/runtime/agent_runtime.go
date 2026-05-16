@@ -95,47 +95,47 @@ type SetupTask struct {
 
 // StatusResponse summarizes the runtime state for diagnostics.
 type StatusResponse struct {
-	Service                string                `json:"service"`
-	Version                string                `json:"version"`
-	Commit                 string                `json:"commit,omitempty"`
-	BuiltAt                string                `json:"builtAt,omitempty"`
-	Mode                   string                `json:"mode"`
-	AgentID                string                `json:"agentId"`
-	AgentName              string                `json:"agentName"`
-	StartedAt              time.Time             `json:"startedAt"`
-	UptimeSeconds          int64                 `json:"uptimeSeconds"`
-	ConfigSource           string                `json:"configSource"`
-	ConfigPath             string                `json:"configPath"`
-	DataDir                string                `json:"dataDir"`
-	StatePath              string                `json:"statePath"`
-	AdminListenAddress     string                `json:"adminListenAddress"`
-	MediaListenAddress     string                `json:"mediaListenAddress"`
-	AdvertisedMediaBaseURL string                `json:"advertisedMediaBaseURL,omitempty"`
-	DeviceLimit            int                   `json:"deviceLimit"`
-	PairedDeviceCount      int                   `json:"pairedDeviceCount"`
-	ActivePairingCount     int                   `json:"activePairingCount"`
-	SessionKeyReady        bool                  `json:"sessionKeyReady"`
-	AdminAuthReady         bool                  `json:"adminAuthReady"`
-	RemoteBrowsing         RemoteBrowsingSummary `json:"remoteBrowsing"`
-	Datasources            []DatasourceSummary   `json:"datasources"`
-	SetupTasks             []SetupTask           `json:"setupTasks"`
+	Service               string                `json:"service"`
+	Version               string                `json:"version"`
+	Commit                string                `json:"commit,omitempty"`
+	BuiltAt               string                `json:"builtAt,omitempty"`
+	Mode                  string                `json:"mode"`
+	AgentID               string                `json:"agentId"`
+	AgentName             string                `json:"agentName"`
+	StartedAt             time.Time             `json:"startedAt"`
+	UptimeSeconds         int64                 `json:"uptimeSeconds"`
+	ConfigSource          string                `json:"configSource"`
+	ConfigPath            string                `json:"configPath"`
+	DataDir               string                `json:"dataDir"`
+	StatePath             string                `json:"statePath"`
+	AdminListenAddress    string                `json:"adminListenAddress"`
+	MediaListenAddress    string                `json:"mediaListenAddress"`
+	MediaPublishedAddress string                `json:"mediaPublishedAddress,omitempty"`
+	DeviceLimit           int                   `json:"deviceLimit"`
+	PairedDeviceCount     int                   `json:"pairedDeviceCount"`
+	ActivePairingCount    int                   `json:"activePairingCount"`
+	SessionKeyReady       bool                  `json:"sessionKeyReady"`
+	AdminAuthReady        bool                  `json:"adminAuthReady"`
+	RemoteBrowsing        RemoteBrowsingSummary `json:"remoteBrowsing"`
+	Datasources           []DatasourceSummary   `json:"datasources"`
+	SetupTasks            []SetupTask           `json:"setupTasks"`
 }
 
 // ConfigResponse exposes the current redacted config plus state location.
 type ConfigResponse struct {
-	AgentName              string                `json:"agentName"`
-	ConfigSource           string                `json:"configSource"`
-	ConfigPath             string                `json:"configPath"`
-	DataDir                string                `json:"dataDir"`
-	StatePath              string                `json:"statePath"`
-	AdminListenAddress     string                `json:"adminListenAddress"`
-	MediaListenAddress     string                `json:"mediaListenAddress"`
-	AdvertisedMediaBaseURL string                `json:"advertisedMediaBaseURL,omitempty"`
-	DeviceLimit            int                   `json:"deviceLimit"`
-	AppLinkBaseURL         string                `json:"appLinkBaseURL"`
-	AdminAuthReady         bool                  `json:"adminAuthReady"`
-	RemoteBrowsing         RemoteBrowsingSummary `json:"remoteBrowsing"`
-	Datasources            []DatasourceSummary   `json:"datasources"`
+	AgentName             string                `json:"agentName"`
+	ConfigSource          string                `json:"configSource"`
+	ConfigPath            string                `json:"configPath"`
+	DataDir               string                `json:"dataDir"`
+	StatePath             string                `json:"statePath"`
+	AdminListenAddress    string                `json:"adminListenAddress"`
+	MediaListenAddress    string                `json:"mediaListenAddress"`
+	MediaPublishedAddress string                `json:"mediaPublishedAddress,omitempty"`
+	DeviceLimit           int                   `json:"deviceLimit"`
+	AppLinkBaseURL        string                `json:"appLinkBaseURL"`
+	AdminAuthReady        bool                  `json:"adminAuthReady"`
+	RemoteBrowsing        RemoteBrowsingSummary `json:"remoteBrowsing"`
+	Datasources           []DatasourceSummary   `json:"datasources"`
 }
 
 // InfoResponse is the public LAN-facing metadata summary for the media API.
@@ -224,30 +224,30 @@ func (a *AgentRuntime) StatusResponse() StatusResponse {
 
 	snapshot := a.registry.Snapshot()
 	return StatusResponse{
-		Service:                "timich-agent",
-		Version:                a.build.Version,
-		Commit:                 emptyIfUnknown(a.build.Commit),
-		BuiltAt:                emptyIfUnknown(a.build.BuiltAt),
-		Mode:                   a.modeLocked(),
-		AgentID:                a.state.State.AgentID,
-		AgentName:              a.config.AgentName,
-		StartedAt:              a.startedAt,
-		UptimeSeconds:          int64(time.Since(a.startedAt).Seconds()),
-		ConfigSource:           a.config.ConfigSource,
-		ConfigPath:             a.config.ConfigPath,
-		DataDir:                a.config.DataDir,
-		StatePath:              a.state.Path,
-		AdminListenAddress:     a.config.AdminListenAddress,
-		MediaListenAddress:     a.config.MediaListenAddress,
-		AdvertisedMediaBaseURL: a.config.AdvertisedMediaBaseURL,
-		DeviceLimit:            a.config.DeviceLimit,
-		PairedDeviceCount:      len(snapshot.Devices),
-		ActivePairingCount:     len(snapshot.PairingSessions),
-		SessionKeyReady:        a.state.State.SessionSigningKey != "",
-		AdminAuthReady:         a.adminAuthReadyLocked(),
-		RemoteBrowsing:         a.remoteBrowsingSummaryLocked(),
-		Datasources:            a.datasourceSummariesLocked(),
-		SetupTasks:             a.setupTasksLocked(snapshot),
+		Service:               "timich-agent",
+		Version:               a.build.Version,
+		Commit:                emptyIfUnknown(a.build.Commit),
+		BuiltAt:               emptyIfUnknown(a.build.BuiltAt),
+		Mode:                  a.modeLocked(),
+		AgentID:               a.state.State.AgentID,
+		AgentName:             a.config.AgentName,
+		StartedAt:             a.startedAt,
+		UptimeSeconds:         int64(time.Since(a.startedAt).Seconds()),
+		ConfigSource:          a.config.ConfigSource,
+		ConfigPath:            a.config.ConfigPath,
+		DataDir:               a.config.DataDir,
+		StatePath:             a.state.Path,
+		AdminListenAddress:    a.config.AdminListenAddress,
+		MediaListenAddress:    a.config.MediaListenAddress,
+		MediaPublishedAddress: a.config.MediaPublishedAddress,
+		DeviceLimit:           a.config.DeviceLimit,
+		PairedDeviceCount:     len(snapshot.Devices),
+		ActivePairingCount:    len(snapshot.PairingSessions),
+		SessionKeyReady:       a.state.State.SessionSigningKey != "",
+		AdminAuthReady:        a.adminAuthReadyLocked(),
+		RemoteBrowsing:        a.remoteBrowsingSummaryLocked(),
+		Datasources:           a.datasourceSummariesLocked(),
+		SetupTasks:            a.setupTasksLocked(snapshot),
 	}
 }
 
@@ -257,19 +257,19 @@ func (a *AgentRuntime) ConfigResponse() ConfigResponse {
 	defer a.mu.RUnlock()
 
 	return ConfigResponse{
-		AgentName:              a.config.AgentName,
-		ConfigSource:           a.config.ConfigSource,
-		ConfigPath:             a.config.ConfigPath,
-		DataDir:                a.config.DataDir,
-		StatePath:              a.state.Path,
-		AdminListenAddress:     a.config.AdminListenAddress,
-		MediaListenAddress:     a.config.MediaListenAddress,
-		AdvertisedMediaBaseURL: a.config.AdvertisedMediaBaseURL,
-		DeviceLimit:            a.config.DeviceLimit,
-		AppLinkBaseURL:         a.config.AppLinkBaseURL,
-		AdminAuthReady:         a.adminAuthReadyLocked(),
-		RemoteBrowsing:         a.remoteBrowsingSummaryLocked(),
-		Datasources:            a.datasourceSummariesLocked(),
+		AgentName:             a.config.AgentName,
+		ConfigSource:          a.config.ConfigSource,
+		ConfigPath:            a.config.ConfigPath,
+		DataDir:               a.config.DataDir,
+		StatePath:             a.state.Path,
+		AdminListenAddress:    a.config.AdminListenAddress,
+		MediaListenAddress:    a.config.MediaListenAddress,
+		MediaPublishedAddress: a.config.MediaPublishedAddress,
+		DeviceLimit:           a.config.DeviceLimit,
+		AppLinkBaseURL:        a.config.AppLinkBaseURL,
+		AdminAuthReady:        a.adminAuthReadyLocked(),
+		RemoteBrowsing:        a.remoteBrowsingSummaryLocked(),
+		Datasources:           a.datasourceSummariesLocked(),
 	}
 }
 
@@ -610,6 +610,11 @@ func (a *AgentRuntime) UpdatePrimaryDatasource(input config.DatasourceConfig) (P
 // CreatePairingSession issues a local one-time pairing session on the admin surface.
 func (a *AgentRuntime) CreatePairingSession() (pairing.PairingSessionResponse, error) {
 	return a.pairing.CreatePairingSession()
+}
+
+// ActivePairingSession returns the current active pairing session for a code.
+func (a *AgentRuntime) ActivePairingSession(code string) (pairing.PairingSessionResponse, error) {
+	return a.pairing.ActivePairingSession(code)
 }
 
 // RedeemPairing redeems a one-time pairing code on the LAN-facing media surface.

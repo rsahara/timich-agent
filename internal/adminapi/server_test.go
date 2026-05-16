@@ -20,6 +20,11 @@ import (
 	"github.com/rsahara/timich-agent/internal/store"
 )
 
+type agentBaseURLChoicePayload struct {
+	Label string `json:"label"`
+	URL   string `json:"url"`
+}
+
 func TestMuxDiagnosticsRoutes(t *testing.T) {
 	t.Parallel()
 
@@ -173,6 +178,7 @@ func TestAdminRoutesRequireAuthentication(t *testing.T) {
 		{method: http.MethodGet, path: "/v1/datasource/primary"},
 		{method: http.MethodPut, path: "/v1/datasource/primary"},
 		{method: http.MethodPost, path: "/v1/pairing-sessions"},
+		{method: http.MethodPost, path: "/v1/pairing-links"},
 		{method: http.MethodPost, path: "/v1/compatibility-check"},
 		{method: http.MethodGet, path: "/v1/update-check"},
 		{method: http.MethodPost, path: "/v1/restart"},
@@ -508,15 +514,11 @@ func TestPairingSessionsCreatesSession(t *testing.T) {
 		t.Fatalf("status = %d, want 201 body=%s", recorder.Code, recorder.Body.String())
 	}
 	var payload struct {
-		PairingCode          string `json:"pairingCode"`
-		PairingURL           string `json:"pairingURL"`
-		PairingQRCodeDataURL string `json:"pairingQRCodeDataURL"`
-		PairingPayload       struct {
-			Version      int    `json:"version"`
-			Kind         string `json:"kind"`
-			AgentBaseURL string `json:"agentBaseURL"`
-			PairingCode  string `json:"pairingCode"`
-		} `json:"pairingPayload"`
+		PairingCode         string                      `json:"pairingCode"`
+		ExpiresAt           string                      `json:"expiresAt"`
+		PairingURL          string                      `json:"pairingURL"`
+		PairingPayload      any                         `json:"pairingPayload"`
+		AgentBaseURLChoices []agentBaseURLChoicePayload `json:"agentBaseURLChoices"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
@@ -524,17 +526,182 @@ func TestPairingSessionsCreatesSession(t *testing.T) {
 	if payload.PairingCode == "" {
 		t.Fatalf("pairingCode is empty payload=%v", payload)
 	}
-	if payload.PairingPayload.Version != 1 {
-		t.Fatalf("pairing payload version = %d, want 1", payload.PairingPayload.Version)
+	if payload.ExpiresAt == "" {
+		t.Fatalf("expiresAt is empty payload=%v", payload)
 	}
-	if payload.PairingPayload.Kind != "timich.agent.pairing" {
-		t.Fatalf("pairing payload kind = %q", payload.PairingPayload.Kind)
+	if payload.PairingURL != "" || payload.PairingPayload != nil {
+		t.Fatalf("pairing session should be code-first without generated link fields payload=%#v", payload)
 	}
-	if payload.PairingPayload.PairingCode != payload.PairingCode {
-		t.Fatalf("payload pairing code = %q, want %q", payload.PairingPayload.PairingCode, payload.PairingCode)
+	if !hasAgentBaseURLChoice(payload.AgentBaseURLChoices, "http://agent.local:8082") {
+		t.Fatalf("agentBaseURLChoices = %#v, want current Admin UI host candidate", payload.AgentBaseURLChoices)
 	}
-	if payload.PairingPayload.AgentBaseURL != "http://agent.local:8082" {
-		t.Fatalf("agent base URL = %q, want media URL derived from admin host", payload.PairingPayload.AgentBaseURL)
+}
+
+func TestPairingSessionsUsesPublishedMediaPortForAdminHostCandidate(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	runtime := newTestRuntimeWithConfig(t, 5, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.MediaPublishedAddress = "18082"
+	})
+	NewMux(runtime).ServeHTTP(recorder, authenticatedRequest(http.MethodPost, "http://agent.local:8081/v1/pairing-sessions", nil))
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		AgentBaseURLChoices []agentBaseURLChoicePayload `json:"agentBaseURLChoices"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
+	}
+	if !hasAgentBaseURLChoice(payload.AgentBaseURLChoices, "http://agent.local:18082") {
+		t.Fatalf("agentBaseURLChoices = %#v, want published media port candidate", payload.AgentBaseURLChoices)
+	}
+	if hasAgentBaseURLChoice(payload.AgentBaseURLChoices, "http://agent.local:8082") {
+		t.Fatalf("agentBaseURLChoices = %#v, should not use container media port when published port is configured", payload.AgentBaseURLChoices)
+	}
+}
+
+func TestPairingSessionsSkipsAdminHostCandidateForLoopbackPublishedMedia(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	runtime := newTestRuntimeWithConfig(t, 5, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.MediaPublishedAddress = "127.0.0.1:18082"
+	})
+	NewMux(runtime).ServeHTTP(recorder, authenticatedRequest(http.MethodPost, "http://agent.local:8081/v1/pairing-sessions", nil))
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		AgentBaseURLChoices []agentBaseURLChoicePayload `json:"agentBaseURLChoices"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
+	}
+	if len(payload.AgentBaseURLChoices) != 0 {
+		t.Fatalf("agentBaseURLChoices = %#v, want no phone-reachable candidate for loopback host media publishing", payload.AgentBaseURLChoices)
+	}
+}
+
+func TestPairingSessionsUsesPublishedMediaHostCandidate(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	runtime := newTestRuntimeWithConfig(t, 5, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.MediaPublishedAddress = "10.0.111.128:18082"
+	})
+	NewMux(runtime).ServeHTTP(recorder, authenticatedRequest(http.MethodPost, "http://127.0.0.1:8081/v1/pairing-sessions", nil))
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		AgentBaseURLChoices []agentBaseURLChoicePayload `json:"agentBaseURLChoices"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
+	}
+	if !hasAgentBaseURLChoice(payload.AgentBaseURLChoices, "http://10.0.111.128:18082") {
+		t.Fatalf("agentBaseURLChoices = %#v, want published media host candidate", payload.AgentBaseURLChoices)
+	}
+}
+
+func TestPairingSessionsCreatesCodeFirstResponseForLoopbackAdminHost(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	NewMux(newTestRuntime(t, 5)).ServeHTTP(recorder, authenticatedRequest(http.MethodPost, "http://127.0.0.1:8081/v1/pairing-sessions", nil))
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		PairingCode          string                      `json:"pairingCode"`
+		PairingURL           string                      `json:"pairingURL"`
+		PairingQRCodeDataURL string                      `json:"pairingQRCodeDataURL"`
+		PairingPayload       any                         `json:"pairingPayload"`
+		AgentBaseURLChoices  []agentBaseURLChoicePayload `json:"agentBaseURLChoices"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
+	}
+	if payload.PairingCode == "" {
+		t.Fatalf("pairingCode is empty payload=%v", payload)
+	}
+	if payload.PairingPayload != nil || payload.PairingURL != "" || payload.PairingQRCodeDataURL != "" {
+		t.Fatalf("link fields should be omitted for code-only pairing payload=%#v", payload)
+	}
+	if len(payload.AgentBaseURLChoices) != 0 {
+		t.Fatalf("agentBaseURLChoices = %#v, want no Docker/internal interface candidates from loopback Admin UI", payload.AgentBaseURLChoices)
+	}
+}
+
+func TestPairingSessionsSkipsAdminHostChoiceForProxiedRequests(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	request := authenticatedRequest(http.MethodPost, "http://agent.local:8081/v1/pairing-sessions", nil)
+	request.Header.Set("X-Forwarded-Host", "admin.example")
+	NewMux(newTestRuntime(t, 5)).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		PairingCode         string                      `json:"pairingCode"`
+		AgentBaseURLChoices []agentBaseURLChoicePayload `json:"agentBaseURLChoices"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
+	}
+	if payload.PairingCode == "" {
+		t.Fatal("pairingCode is empty")
+	}
+	if len(payload.AgentBaseURLChoices) != 0 {
+		t.Fatalf("agentBaseURLChoices = %#v, should not trust proxied Admin UI host or detected interfaces", payload.AgentBaseURLChoices)
+	}
+}
+
+func TestPairingLinksCreatesQRCodeForSelectedAgentBaseURL(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestRuntime(t, 5)
+	pairingSession, err := runtime.CreatePairingSession()
+	if err != nil {
+		t.Fatalf("CreatePairingSession() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	body := bytes.NewReader([]byte(`{"agentBaseURL":"http://10.0.1.4:8082/","pairingCode":"` + pairingSession.PairingCode + `"}`))
+	NewMux(runtime).ServeHTTP(recorder, authenticatedRequest(http.MethodPost, "/v1/pairing-links", body))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		PairingPayload struct {
+			Version      int    `json:"version"`
+			Kind         string `json:"kind"`
+			AgentBaseURL string `json:"agentBaseURL"`
+			PairingCode  string `json:"pairingCode"`
+		} `json:"pairingPayload"`
+		PairingURL           string `json:"pairingURL"`
+		PairingQRCodeDataURL string `json:"pairingQRCodeDataURL"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
+	}
+	if payload.PairingPayload.AgentBaseURL != "http://10.0.1.4:8082" {
+		t.Fatalf("agent base URL = %q, want selected media URL", payload.PairingPayload.AgentBaseURL)
+	}
+	if payload.PairingPayload.Version != 1 || payload.PairingPayload.Kind != "timich.agent.pairing" {
+		t.Fatalf("pairing payload = %#v, want Timich pairing payload", payload.PairingPayload)
+	}
+	if payload.PairingPayload.PairingCode != pairingSession.PairingCode {
+		t.Fatalf("pairing code = %q, want active pairing code", payload.PairingPayload.PairingCode)
 	}
 	if !strings.HasPrefix(payload.PairingURL, "https://link.timich.runo.jp/pair?payload=") {
 		t.Fatalf("pairing URL = %q, want production Universal Link", payload.PairingURL)
@@ -562,96 +729,67 @@ func TestPairingSessionsCreatesSession(t *testing.T) {
 	if err := json.Unmarshal(decodedPayload, &linkPayload); err != nil {
 		t.Fatalf("pairing URL payload is not JSON: %v payload=%s", err, string(decodedPayload))
 	}
-	if linkPayload.AgentBaseURL != payload.PairingPayload.AgentBaseURL || linkPayload.PairingCode != payload.PairingCode {
+	if linkPayload.AgentBaseURL != payload.PairingPayload.AgentBaseURL || linkPayload.PairingCode != payload.PairingPayload.PairingCode {
 		t.Fatalf("link payload = %#v, want response payload", linkPayload)
 	}
 }
 
-func TestPairingSessionsCreatesCodeOnlyResponseForLoopbackAdminHostWithoutAdvertisedMediaBaseURL(t *testing.T) {
+func TestPairingLinksRejectsUnreachableAgentBaseURL(t *testing.T) {
 	t.Parallel()
 
-	recorder := httptest.NewRecorder()
-	NewMux(newTestRuntime(t, 5)).ServeHTTP(recorder, authenticatedRequest(http.MethodPost, "http://127.0.0.1:8081/v1/pairing-sessions", nil))
+	tests := []string{
+		"http://localhost:8082",
+		"http://127.0.0.1:8082",
+		"http://0.0.0.0:8082",
+		"http://[::]:8082",
+		"http://[::1]:8082",
+	}
+	for _, agentBaseURL := range tests {
+		t.Run(agentBaseURL, func(t *testing.T) {
+			t.Parallel()
 
-	if recorder.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201 body=%s", recorder.Code, recorder.Body.String())
-	}
-	var payload struct {
-		PairingCode          string `json:"pairingCode"`
-		PairingURL           string `json:"pairingURL"`
-		PairingQRCodeDataURL string `json:"pairingQRCodeDataURL"`
-		PairingPayload       *struct {
-			AgentBaseURL string `json:"agentBaseURL"`
-		} `json:"pairingPayload"`
-		PairingLinkWarning *struct {
-			Code string `json:"code"`
-		} `json:"pairingLinkWarning"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
-	}
-	if payload.PairingCode == "" {
-		t.Fatalf("pairingCode is empty payload=%v", payload)
-	}
-	if payload.PairingPayload != nil || payload.PairingURL != "" || payload.PairingQRCodeDataURL != "" {
-		t.Fatalf("link fields should be omitted for code-only pairing payload=%#v", payload)
-	}
-	if payload.PairingLinkWarning == nil || payload.PairingLinkWarning.Code != "pairing_agent_base_url_unavailable" {
-		t.Fatalf("pairingLinkWarning = %#v, want unavailable warning", payload.PairingLinkWarning)
+			runtime := newTestRuntime(t, 5)
+			pairingSession, err := runtime.CreatePairingSession()
+			if err != nil {
+				t.Fatalf("CreatePairingSession() error = %v", err)
+			}
+
+			recorder := httptest.NewRecorder()
+			body := bytes.NewReader([]byte(`{"agentBaseURL":"` + agentBaseURL + `","pairingCode":"` + pairingSession.PairingCode + `"}`))
+			NewMux(runtime).ServeHTTP(recorder, authenticatedRequest(http.MethodPost, "/v1/pairing-links", body))
+
+			assertErrorPayload(t, recorder, http.StatusBadRequest, "agent_base_url_invalid")
+		})
 	}
 }
 
-func TestPairingSessionsCreatesCodeOnlyResponseForProxiedAdminHostWithoutAdvertisedMediaBaseURL(t *testing.T) {
+func TestPairingLinksRejectsInactivePairingCode(t *testing.T) {
 	t.Parallel()
 
 	recorder := httptest.NewRecorder()
-	request := authenticatedRequest(http.MethodPost, "http://agent.local:8081/v1/pairing-sessions", nil)
-	request.Header.Set("X-Forwarded-Host", "admin.example")
-	NewMux(newTestRuntime(t, 5)).ServeHTTP(recorder, request)
+	body := bytes.NewReader([]byte(`{"agentBaseURL":"http://10.0.1.4:8082","pairingCode":"PAIRING-CODE"}`))
+	NewMux(newTestRuntime(t, 5)).ServeHTTP(recorder, authenticatedRequest(http.MethodPost, "/v1/pairing-links", body))
 
-	if recorder.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201 body=%s", recorder.Code, recorder.Body.String())
-	}
-	var payload struct {
-		PairingCode        string `json:"pairingCode"`
-		PairingLinkWarning *struct {
-			Code string `json:"code"`
-		} `json:"pairingLinkWarning"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
-	}
-	if payload.PairingCode == "" {
-		t.Fatal("pairingCode is empty")
-	}
-	if payload.PairingLinkWarning == nil || payload.PairingLinkWarning.Code != "pairing_agent_base_url_unavailable" {
-		t.Fatalf("pairingLinkWarning = %#v, want unavailable warning", payload.PairingLinkWarning)
-	}
+	assertErrorPayload(t, recorder, http.StatusBadRequest, "pairing_session_invalid")
 }
 
-func TestPairingSessionsUsesAdvertisedMediaBaseURLForLoopbackAdminHost(t *testing.T) {
+func TestPairingLinksRejectsReplacedPairingCode(t *testing.T) {
 	t.Parallel()
 
-	recorder := httptest.NewRecorder()
-	runtime := newTestRuntimeWithConfig(t, 5, "test-admin-token", func(cfg *config.ResolvedConfig) {
-		cfg.AdvertisedMediaBaseURL = "http://10.0.1.4:8082/"
-	})
-	NewMux(runtime).ServeHTTP(recorder, authenticatedRequest(http.MethodPost, "http://localhost:8081/v1/pairing-sessions", nil))
+	runtime := newTestRuntime(t, 5)
+	firstSession, err := runtime.CreatePairingSession()
+	if err != nil {
+		t.Fatalf("CreatePairingSession() first error = %v", err)
+	}
+	if _, err := runtime.CreatePairingSession(); err != nil {
+		t.Fatalf("CreatePairingSession() second error = %v", err)
+	}
 
-	if recorder.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201 body=%s", recorder.Code, recorder.Body.String())
-	}
-	var payload struct {
-		PairingPayload struct {
-			AgentBaseURL string `json:"agentBaseURL"`
-		} `json:"pairingPayload"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
-	}
-	if payload.PairingPayload.AgentBaseURL != "http://10.0.1.4:8082" {
-		t.Fatalf("agent base URL = %q, want advertised media URL", payload.PairingPayload.AgentBaseURL)
-	}
+	recorder := httptest.NewRecorder()
+	body := bytes.NewReader([]byte(`{"agentBaseURL":"http://10.0.1.4:8082","pairingCode":"` + firstSession.PairingCode + `"}`))
+	NewMux(runtime).ServeHTTP(recorder, authenticatedRequest(http.MethodPost, "/v1/pairing-links", body))
+
+	assertErrorPayload(t, recorder, http.StatusBadRequest, "pairing_session_invalid")
 }
 
 func TestPairingSessionsMapsDeviceLimitError(t *testing.T) {
@@ -733,6 +871,15 @@ func assertErrorPayload(t *testing.T, recorder *httptest.ResponseRecorder, wantS
 	if payload["error"] != wantCode {
 		t.Fatalf("error = %q, want %q payload=%v", payload["error"], wantCode, payload)
 	}
+}
+
+func hasAgentBaseURLChoice(choices []agentBaseURLChoicePayload, target string) bool {
+	for _, choice := range choices {
+		if choice.URL == target {
+			return true
+		}
+	}
+	return false
 }
 
 func newTestRuntime(t *testing.T, deviceLimit int) *runtimestate.AgentRuntime {

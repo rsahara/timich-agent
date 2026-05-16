@@ -51,6 +51,7 @@ func NewMuxWithOptions(runtime *runtimestate.AgentRuntime, options Options) http
 	mux.HandleFunc("/config", api.requireAdmin(api.config))
 	mux.HandleFunc("/v1/datasource/primary", api.requireAdmin(api.primaryDatasource))
 	mux.HandleFunc("/v1/pairing-sessions", api.requireAdmin(api.pairingSessions))
+	mux.HandleFunc("/v1/pairing-links", api.requireAdmin(api.pairingLinks))
 	mux.HandleFunc("/v1/compatibility-check", api.requireAdmin(api.compatibilityCheck))
 	mux.HandleFunc("/v1/update-check", api.requireAdmin(api.updateCheck))
 	mux.HandleFunc("/v1/restart", api.requireAdmin(api.restart))
@@ -304,12 +305,37 @@ func (s *server) pairingSessions(w http.ResponseWriter, r *http.Request) {
 		writePairingError(w, err)
 		return
 	}
-	response, err := s.buildPairingSessionAPIResponse(r, pairingSession)
-	if err != nil {
-		writePairingLinkError(w, err)
+	response := s.buildPairingSessionAPIResponse(r, pairingSession)
+	writeJSON(w, http.StatusCreated, response)
+}
+
+func (s *server) pairingLinks(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to create a pairing link.") {
 		return
 	}
-	writeJSON(w, http.StatusCreated, response)
+
+	var request pairingLinkAPIRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the pairing link request.")
+		return
+	}
+	if strings.TrimSpace(request.PairingCode) == "" {
+		writeError(w, http.StatusBadRequest, "pairing_code_required", "Pairing code is required.")
+		return
+	}
+	activeSession, err := s.runtime.ActivePairingSession(request.PairingCode)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "pairing_session_invalid", "Create a fresh pairing code before generating a QR code.")
+		return
+	}
+	request.PairingCode = activeSession.PairingCode
+	request.ExpiresAt = activeSession.ExpiresAt
+	response, err := s.buildPairingLinkAPIResponse(request)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "agent_base_url_invalid", "Use an http or https Media API URL that the app device can reach.")
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *server) compatibilityCheck(w http.ResponseWriter, r *http.Request) {
@@ -436,10 +462,6 @@ func writePairingError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusInternalServerError, "pairing_session_create_failed", "Could not create a pairing session.")
-}
-
-func writePairingLinkError(w http.ResponseWriter, err error) {
-	writeError(w, http.StatusInternalServerError, "pairing_link_create_failed", "Could not create a pairing link.")
 }
 
 func writeDatasourceError(w http.ResponseWriter, err error) {
