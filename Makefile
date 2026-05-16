@@ -144,7 +144,7 @@ dist:
 		"    environment:" \
 		'      TIMICH_AGENT_NAME: "$${TIMICH_AGENT_NAME:-Timich Agent}"' \
 		'      TIMICH_AGENT_DEVICE_LIMIT: "$${TIMICH_AGENT_DEVICE_LIMIT:-32}"' \
-		'      TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL: "$${TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL:-}"' \
+		'      TIMICH_AGENT_MEDIA_PUBLISHED_ADDR: "$${TIMICH_AGENT_MEDIA_PUBLISHED_ADDR:-$${TIMICH_AGENT_MEDIA_PORT:-8082}}"' \
 		'      TIMICH_AGENT_REMOTE_BROWSING_ENABLED: "$${TIMICH_AGENT_REMOTE_BROWSING_ENABLED:-true}"' \
 		"    ports:" \
 		'      - "$${TIMICH_AGENT_ADMIN_PORT:-8081}:8081"' \
@@ -165,17 +165,16 @@ dist:
 		"# Maximum number of paired app devices allowed by this agent." \
 		"TIMICH_AGENT_DEVICE_LIMIT=32" \
 		"" \
-		"# Optional: set to a phone-reachable Media API URL when creating QR codes from localhost." \
-		"# Example: TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL=http://192.168.1.20:8082" \
-		"TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL=" \
-		"" \
 		"# Remote Browsing starts automatically after admin setup, datasource setup, and app pairing." \
 		"# Set this to false to keep the agent local-only." \
 		"TIMICH_AGENT_REMOTE_BROWSING_ENABLED=true" \
 		"" \
 		"# Change these only if the default host ports are already in use." \
 		"TIMICH_AGENT_ADMIN_PORT=8081" \
-		"TIMICH_AGENT_MEDIA_PORT=8082" > "$(DIST_STAGE)/.env.example"
+		"TIMICH_AGENT_MEDIA_PORT=8082" \
+		"" \
+		"# Optional phone-reachable Media API hint for QR/link candidates." \
+		"# TIMICH_AGENT_MEDIA_PUBLISHED_ADDR=10.0.111.128:18082" > "$(DIST_STAGE)/.env.example"
 	@printf '%s\n' \
 		"# Timich Agent Bundle" \
 		"" \

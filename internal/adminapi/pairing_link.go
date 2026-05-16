@@ -3,11 +3,11 @@ package adminapi
 import (
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,20 +21,28 @@ const (
 	pairingQRCodeSize         = 280
 )
 
-var errPairingAgentBaseURLUnavailable = errors.New("pairing agent media API base URL unavailable")
-
 type pairingSessionAPIResponse struct {
-	PairingCode          string              `json:"pairingCode"`
-	ExpiresAt            time.Time           `json:"expiresAt"`
-	PairingPayload       *pairingLinkPayload `json:"pairingPayload,omitempty"`
-	PairingURL           string              `json:"pairingURL,omitempty"`
-	PairingQRCodeDataURL string              `json:"pairingQRCodeDataURL,omitempty"`
-	PairingLinkWarning   *pairingLinkWarning `json:"pairingLinkWarning,omitempty"`
+	PairingCode         string                    `json:"pairingCode"`
+	ExpiresAt           time.Time                 `json:"expiresAt"`
+	AgentBaseURLChoices []pairingAgentBaseURLItem `json:"agentBaseURLChoices,omitempty"`
 }
 
-type pairingLinkWarning struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+type pairingLinkAPIRequest struct {
+	AgentBaseURL string    `json:"agentBaseURL"`
+	PairingCode  string    `json:"pairingCode"`
+	ExpiresAt    time.Time `json:"expiresAt"`
+}
+
+type pairingLinkAPIResponse struct {
+	PairingPayload       pairingLinkPayload `json:"pairingPayload"`
+	PairingURL           string             `json:"pairingURL"`
+	PairingQRCodeDataURL string             `json:"pairingQRCodeDataURL"`
+}
+
+type pairingAgentBaseURLItem struct {
+	Label       string `json:"label"`
+	URL         string `json:"url"`
+	Description string `json:"description,omitempty"`
 }
 
 type pairingLinkPayload struct {
@@ -48,44 +56,42 @@ type pairingLinkPayload struct {
 func (s *server) buildPairingSessionAPIResponse(
 	r *http.Request,
 	session pairing.PairingSessionResponse,
-) (pairingSessionAPIResponse, error) {
-	response := pairingSessionAPIResponse{
-		PairingCode: session.PairingCode,
-		ExpiresAt:   session.ExpiresAt,
-	}
-
+) pairingSessionAPIResponse {
 	cfg := s.runtime.ConfigResponse()
-	agentBaseURL, err := pairingAgentBaseURL(r, cfg.AdvertisedMediaBaseURL, cfg.MediaListenAddress)
+	return pairingSessionAPIResponse{
+		PairingCode:         session.PairingCode,
+		ExpiresAt:           session.ExpiresAt,
+		AgentBaseURLChoices: pairingAgentBaseURLChoices(r, cfg.MediaListenAddress, cfg.MediaPublishedAddress),
+	}
+}
+
+func (s *server) buildPairingLinkAPIResponse(request pairingLinkAPIRequest) (pairingLinkAPIResponse, error) {
+	cfg := s.runtime.ConfigResponse()
+	agentBaseURL, err := normalizePairingAgentBaseURL(request.AgentBaseURL)
 	if err != nil {
-		if errors.Is(err, errPairingAgentBaseURLUnavailable) {
-			response.PairingLinkWarning = &pairingLinkWarning{
-				Code:    "pairing_agent_base_url_unavailable",
-				Message: "QR/link pairing is unavailable because the Media API URL is not reachable from the app device. Use the manual code, open the Admin UI with the agent LAN hostname/IP, or set advertisedMediaBaseURL.",
-			}
-			return response, nil
-		}
-		return pairingSessionAPIResponse{}, err
+		return pairingLinkAPIResponse{}, err
 	}
 	payload := pairingLinkPayload{
 		Version:      pairingLinkPayloadVersion,
 		Kind:         pairingLinkPayloadKind,
 		AgentBaseURL: agentBaseURL,
-		PairingCode:  session.PairingCode,
-		ExpiresAt:    session.ExpiresAt,
+		PairingCode:  strings.TrimSpace(request.PairingCode),
+		ExpiresAt:    request.ExpiresAt,
 	}
 	pairingURL, err := buildPairingURL(cfg.AppLinkBaseURL, payload)
 	if err != nil {
-		return pairingSessionAPIResponse{}, err
+		return pairingLinkAPIResponse{}, err
 	}
 	qrCodeDataURL, err := pairingQRCodeDataURL(pairingURL)
 	if err != nil {
-		return pairingSessionAPIResponse{}, err
+		return pairingLinkAPIResponse{}, err
 	}
 
-	response.PairingPayload = &payload
-	response.PairingURL = pairingURL
-	response.PairingQRCodeDataURL = qrCodeDataURL
-	return response, nil
+	return pairingLinkAPIResponse{
+		PairingPayload:       payload,
+		PairingURL:           pairingURL,
+		PairingQRCodeDataURL: qrCodeDataURL,
+	}, nil
 }
 
 func buildPairingURL(appLinkBaseURL string, payload pairingLinkPayload) (string, error) {
@@ -130,43 +136,88 @@ func pairingQRCodeDataURL(content string) (string, error) {
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(png), nil
 }
 
-func pairingAgentBaseURL(r *http.Request, advertisedMediaBaseURL string, mediaListenAddress string) (string, error) {
-	if strings.TrimSpace(advertisedMediaBaseURL) != "" {
-		return normalizeAdvertisedMediaBaseURL(advertisedMediaBaseURL)
-	}
-
+func pairingAgentBaseURLChoices(r *http.Request, mediaListenAddress string, mediaPublishedAddress string) []pairingAgentBaseURLItem {
 	mediaHost, mediaPort, _ := net.SplitHostPort(mediaListenAddress)
 	if mediaPort == "" {
-		return "", fmt.Errorf("%w: media listen address is missing a port", errPairingAgentBaseURLUnavailable)
+		return nil
 	}
 	mediaHost = strings.Trim(mediaHost, "[]")
+	publishedHost, publishedPort, publishedReachable := pairingPublishedMediaEndpoint(mediaPublishedAddress, mediaPort)
 
-	host := ""
-	if isPairingReachableHost(mediaHost) {
-		host = mediaHost
-	} else if isWildcardHost(mediaHost) && !requestLooksProxied(r) {
+	choices := []pairingAgentBaseURLItem{}
+	seen := map[string]struct{}{}
+	add := func(label string, host string, port string, description string) {
+		if !isPairingReachableHost(host) {
+			return
+		}
+		candidate := (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, port)}).String()
+		if _, ok := seen[candidate]; ok {
+			return
+		}
+		seen[candidate] = struct{}{}
+		choices = append(choices, pairingAgentBaseURLItem{
+			Label:       label,
+			URL:         candidate,
+			Description: description,
+		})
+	}
+
+	if isWildcardHost(mediaHost) && !requestLooksProxied(r) {
 		requestHost := hostNameOnly(r.Host)
-		if isPairingReachableHost(requestHost) {
-			host = requestHost
+		if publishedReachable {
+			add("Current Admin UI host", requestHost, publishedPort, "Use when the phone or tablet can reach this Admin UI host on the local network.")
 		}
 	}
-	if host == "" {
-		return "", fmt.Errorf("%w: open the Admin UI with the agent LAN hostname/IP or set advertisedMediaBaseURL", errPairingAgentBaseURLUnavailable)
+	if isPairingReachableHost(mediaHost) && publishedReachable {
+		add("Configured media API host", mediaHost, publishedPort, "Use when this media listen host is reachable from the phone or tablet.")
+	}
+	if publishedHost != "" && publishedReachable {
+		add("Published media API host", publishedHost, publishedPort, "Use when this published media address is reachable from the phone or tablet.")
 	}
 
-	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, mediaPort)}).String(), nil
+	return choices
 }
 
-func normalizeAdvertisedMediaBaseURL(raw string) (string, error) {
+func pairingPublishedMediaEndpoint(raw string, fallbackPort string) (string, string, bool) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", fallbackPort, true
+	}
+	if validPort(value) {
+		return "", value, true
+	}
+	host, port, err := net.SplitHostPort(value)
+	if err != nil || !validPort(port) {
+		return "", "", false
+	}
+	host = strings.Trim(host, "[]")
+	if isWildcardHost(host) {
+		return "", port, true
+	}
+	if !isPairingReachableHost(host) {
+		return "", "", false
+	}
+	return host, port, true
+}
+
+func validPort(value string) bool {
+	port, err := strconv.Atoi(strings.TrimSpace(value))
+	return err == nil && port > 0 && port <= 65535
+}
+
+func normalizePairingAgentBaseURL(raw string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return "", err
 	}
 	if parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("invalid advertised media base URL %q", raw)
+		return "", fmt.Errorf("invalid agent base URL %q", raw)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("advertised media base URL must use http or https URL %q", raw)
+		return "", fmt.Errorf("agent base URL must use http or https URL %q", raw)
+	}
+	if !isPairingReachableHost(hostNameOnly(parsed.Host)) {
+		return "", fmt.Errorf("agent base URL host is not reachable from app devices %q", raw)
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
 	parsed.RawQuery = ""

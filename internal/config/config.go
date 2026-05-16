@@ -53,7 +53,7 @@ type Config struct {
 	AgentName              string               `json:"agentName"`
 	AdminListenAddress     string               `json:"adminListenAddress"`
 	MediaListenAddress     string               `json:"mediaListenAddress"`
-	AdvertisedMediaBaseURL string               `json:"advertisedMediaBaseURL,omitempty"`
+	MediaPublishedAddress  string               `json:"mediaPublishedAddress,omitempty"`
 	DataDir                string               `json:"dataDir"`
 	DeviceLimit            int                  `json:"deviceLimit"`
 	AppLinkBaseURL         string               `json:"appLinkBaseURL"`
@@ -67,7 +67,7 @@ type configJSON struct {
 	AgentName              string               `json:"agentName"`
 	AdminListenAddress     string               `json:"adminListenAddress"`
 	MediaListenAddress     string               `json:"mediaListenAddress"`
-	AdvertisedMediaBaseURL string               `json:"advertisedMediaBaseURL,omitempty"`
+	MediaPublishedAddress  string               `json:"mediaPublishedAddress,omitempty"`
 	DataDir                string               `json:"dataDir"`
 	DeviceLimit            int                  `json:"deviceLimit"`
 	AppLinkBaseURL         string               `json:"appLinkBaseURL"`
@@ -81,7 +81,7 @@ type configOverrideJSON struct {
 	AgentName              *string             `json:"agentName"`
 	AdminListenAddress     *string             `json:"adminListenAddress"`
 	MediaListenAddress     *string             `json:"mediaListenAddress"`
-	AdvertisedMediaBaseURL *string             `json:"advertisedMediaBaseURL"`
+	MediaPublishedAddress  *string             `json:"mediaPublishedAddress"`
 	DataDir                *string             `json:"dataDir"`
 	DeviceLimit            *int                `json:"deviceLimit"`
 	AppLinkBaseURL         *string             `json:"appLinkBaseURL"`
@@ -105,7 +105,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		AgentName:              c.AgentName,
 		AdminListenAddress:     c.AdminListenAddress,
 		MediaListenAddress:     c.MediaListenAddress,
-		AdvertisedMediaBaseURL: c.AdvertisedMediaBaseURL,
+		MediaPublishedAddress:  c.MediaPublishedAddress,
 		DataDir:                c.DataDir,
 		DeviceLimit:            c.DeviceLimit,
 		AppLinkBaseURL:         c.AppLinkBaseURL,
@@ -130,8 +130,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	if payload.MediaListenAddress != nil {
 		c.MediaListenAddress = *payload.MediaListenAddress
 	}
-	if payload.AdvertisedMediaBaseURL != nil {
-		c.AdvertisedMediaBaseURL = *payload.AdvertisedMediaBaseURL
+	if payload.MediaPublishedAddress != nil {
+		c.MediaPublishedAddress = *payload.MediaPublishedAddress
 	}
 	if payload.DataDir != nil {
 		c.DataDir = *payload.DataDir
@@ -386,7 +386,7 @@ func applyEnvOverrides(cfg *Config) {
 	applyStringEnv("TIMICH_AGENT_NAME", &cfg.AgentName)
 	applyStringEnv("TIMICH_AGENT_ADMIN_LISTEN_ADDR", &cfg.AdminListenAddress)
 	applyStringEnv("TIMICH_AGENT_MEDIA_LISTEN_ADDR", &cfg.MediaListenAddress)
-	applyStringEnv("TIMICH_AGENT_ADVERTISED_MEDIA_BASE_URL", &cfg.AdvertisedMediaBaseURL)
+	applyStringEnv("TIMICH_AGENT_MEDIA_PUBLISHED_ADDR", &cfg.MediaPublishedAddress)
 	applyStringEnv("TIMICH_AGENT_DATA_DIR", &cfg.DataDir)
 	applyIntEnv("TIMICH_AGENT_DEVICE_LIMIT", &cfg.DeviceLimit)
 	applyStringEnv("TIMICH_AGENT_APP_LINK_BASE_URL", &cfg.AppLinkBaseURL)
@@ -451,11 +451,6 @@ func validate(cfg Config) error {
 	}
 	if strings.TrimSpace(cfg.MediaListenAddress) == "" {
 		return errors.New("media listen address must not be empty")
-	}
-	if strings.TrimSpace(cfg.AdvertisedMediaBaseURL) != "" {
-		if _, err := parseHTTPURL(cfg.AdvertisedMediaBaseURL); err != nil {
-			return fmt.Errorf("advertised media base URL: %w", err)
-		}
 	}
 	if strings.TrimSpace(cfg.DataDir) == "" {
 		return errors.New("data directory must not be empty")
@@ -657,17 +652,6 @@ func parseHTTPSURL(raw string) (*url.URL, error) {
 	}
 	if parsed.Scheme != "https" {
 		return nil, fmt.Errorf("must use https URL %q", raw)
-	}
-	return parsed, nil
-}
-
-func parseHTTPURL(raw string) (*url.URL, error) {
-	parsed, err := parseURL(raw)
-	if err != nil {
-		return nil, err
-	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("must use http or https URL %q", raw)
 	}
 	return parsed, nil
 }
