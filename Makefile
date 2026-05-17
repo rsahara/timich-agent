@@ -186,18 +186,17 @@ dist:
 		"" \
 		"\`\`\`sh" \
 		"cp .env.example .env" \
-		"# Optional: edit .env to rename the agent or opt out of Remote Browsing." \
-		"docker compose -f compose.yaml up -d --build" \
-		"docker compose -f compose.yaml logs -f" \
+		"# Optional: edit .env to rename the agent, change host ports, or opt out of Remote Browsing." \
+		"cp compose.immich-network.example.yaml compose.immich-network.yaml" \
+		"# Optional: edit compose.immich-network.yaml if your Immich Compose network is not immich_default." \
+		"docker compose -f compose.yaml -f compose.immich-network.yaml up -d --build" \
+		"docker compose -f compose.yaml -f compose.immich-network.yaml logs -f" \
 		"\`\`\`" \
 		"" \
-		"If Immich runs in its own Docker Compose project, start the Agent with" \
-		"the optional Immich network override and use http://immich_server:2283" \
-		"as the datasource URL in the Admin UI:" \
-		"" \
-		"\`\`\`sh" \
-		"docker compose -f compose.yaml -f compose.immich-network.example.yaml up -d --build" \
-		"\`\`\`" \
+		"Most Immich Docker installs need the copied Immich network override." \
+		"Use http://immich_server:2283 as the datasource URL in the Admin UI." \
+		"If Immich runs directly on the host instead of Docker, omit" \
+		"compose.immich-network.yaml from the compose commands." \
 		"" \
 		"On first run, the logs show the Admin UI URL (default URL from the host is" \
 		"http://127.0.0.1:8081/). Open it from a trusted LAN and create the admin" \
@@ -270,9 +269,9 @@ update-manifest:
 			'  },' \
 			'  "updateGuide": {' \
 			'    "dockerCompose": [' \
-			'      "Keep the existing .local directory; it contains agent settings, admin token, and paired devices.",' \
+			'      "Keep the existing .env, compose.immich-network.yaml, and .local directory; .local contains agent settings, admin token, and paired devices.",' \
 			'      "Download and extract the new Timich Agent bundle next to that .local directory.",' \
-			'      "Run docker compose down, then docker compose up -d --build from the new bundle directory.",' \
+			'      "Run docker compose down, then start the new bundle with the same compose files you normally use; most Immich Docker installs use docker compose -f compose.yaml -f compose.immich-network.yaml up -d --build.",' \
 			'      "Open the Admin UI again and confirm the new version is running."' \
 			'    ],' \
 			'    "manualBinary": [' \

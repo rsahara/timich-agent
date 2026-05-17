@@ -2,7 +2,8 @@
 # Compose project with the default network name `immich_default`.
 #
 # Use with:
-#   docker compose -f compose.yaml -f compose.immich-network.example.yaml up -d
+#   cp compose.immich-network.example.yaml compose.immich-network.yaml
+#   docker compose -f compose.yaml -f compose.immich-network.yaml up -d
 #
 # Then configure the Agent datasource URL as:
 #   http://immich_server:2283

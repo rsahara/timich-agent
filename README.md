@@ -92,8 +92,10 @@ Docker Compose is the recommended way to run the release bundle:
 ```bash
 cp .env.example .env
 # Optional: edit .env to rename the agent, change host ports, or opt out of Remote Browsing.
-docker compose -f compose.yaml up -d --build
-docker compose -f compose.yaml logs -f
+cp compose.immich-network.example.yaml compose.immich-network.yaml
+# Optional: edit compose.immich-network.yaml if your Immich Compose network is not immich_default.
+docker compose -f compose.yaml -f compose.immich-network.yaml up -d --build
+docker compose -f compose.yaml -f compose.immich-network.yaml logs -f
 ```
 
 On first start, the container creates `.local/agent.json` and
@@ -166,32 +168,33 @@ QR candidate. Set `TIMICH_AGENT_MEDIA_PUBLISHED_ADDR` when the automatic port
 hint is not the URL phones should use, for example a host-side port such as
 `18082` or a LAN address such as `10.0.111.128:18082`.
 
-If Immich runs in its own Docker Compose project, add the bundled optional
-override so the Agent can resolve Immich's container name:
-
-```bash
-docker compose -f compose.yaml -f compose.immich-network.example.yaml up -d --build
-```
-
-Then use this datasource URL in the Admin UI:
+The first-run commands copy the bundled Immich network override because most
+Docker Compose installs run Immich in its own Compose project. The default
+override joins the Agent to Immich's standard `immich_default` network so this
+datasource URL works in the Admin UI:
 
 ```text
 http://immich_server:2283
 ```
 
+If your Immich Compose project uses a different external network name, edit
+`compose.immich-network.yaml` after copying it. If Immich runs directly on the
+host instead of Docker, omit the `compose.immich-network.yaml` file from compose
+commands and use a host or LAN URL that the Agent container can reach.
+
 Do not use `localhost` or `127.0.0.1` for a Docker-hosted Immich datasource
 unless Immich is running inside the same container. Inside Docker, those names
-refer to the Agent container itself. If Immich runs directly on the host instead
-of Docker, use a host or LAN URL that the Agent container can reach.
+refer to the Agent container itself.
 
 Set `TIMICH_AGENT_REMOTE_BROWSING_ENABLED=false` before starting compose if you
 want the agent to stay local-only.
 
-Stop and start the service with:
+Stop and start the service with the same compose file list you used at first
+run. For the common Immich Docker path:
 
 ```bash
-docker compose -f compose.yaml down
-docker compose -f compose.yaml up -d --build
+docker compose -f compose.yaml -f compose.immich-network.yaml down
+docker compose -f compose.yaml -f compose.immich-network.yaml up -d --build
 ```
 
 ### Direct Binary
@@ -217,18 +220,20 @@ downloadable archives and checksums. The Admin UI uses the authenticated
 `/v1/update-check` endpoint to show whether a newer stable agent release is
 available.
 
-For Docker Compose installs:
+For Docker Compose installs, use the same compose file list you used before.
+For the common Immich Docker path:
 
 ```bash
 # From the existing installation directory.
-docker compose -f compose.yaml down
+docker compose -f compose.yaml -f compose.immich-network.yaml down
 
 # Download the new archive, then extract it over the existing bundle files.
-# Keep .local. It contains settings, the admin token, and paired devices.
+# Keep .env, compose.immich-network.yaml, and .local.
+# .local contains settings, the admin token, and paired devices.
 tar -xzf ../timich-agent_NEWVERSION_linux_ARCH.tar.gz --strip-components=1
 
-docker compose -f compose.yaml up -d --build
-docker compose -f compose.yaml logs -f
+docker compose -f compose.yaml -f compose.immich-network.yaml up -d --build
+docker compose -f compose.yaml -f compose.immich-network.yaml logs -f
 ```
 
 After the service is back online, open the Admin UI and confirm the displayed
