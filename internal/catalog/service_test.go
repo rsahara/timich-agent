@@ -132,7 +132,7 @@ func TestCatalogPageUsesStatisticsTotal(t *testing.T) {
 	}
 }
 
-func TestTimelineSearchWithFiltersUsesSearchTotal(t *testing.T) {
+func TestTimelineSearchWithFiltersUsesStatisticsTotal(t *testing.T) {
 	t.Parallel()
 
 	from := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
@@ -166,7 +166,7 @@ func TestTimelineSearchWithFiltersUsesSearchTotal(t *testing.T) {
 				}
 				body = `{
 					"assets": {
-						"total": 6,
+						"total": 1,
 						"items": [
 							{
 								"id": "video-123",
@@ -180,8 +180,21 @@ func TestTimelineSearchWithFiltersUsesSearchTotal(t *testing.T) {
 				}`
 			case "/api/search/statistics":
 				statisticsRequests++
+				var requestBody map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+					t.Fatalf("decode statistics request body: %v", err)
+				}
+				if requestBody["type"] != "VIDEO" {
+					t.Fatalf("statistics request type = %v, want VIDEO", requestBody["type"])
+				}
+				if requestBody["takenAfter"] != from.Format(time.RFC3339Nano) {
+					t.Fatalf("statistics request takenAfter = %v, want %s", requestBody["takenAfter"], from.Format(time.RFC3339Nano))
+				}
+				if requestBody["takenBefore"] != to.Format(time.RFC3339Nano) {
+					t.Fatalf("statistics request takenBefore = %v, want %s", requestBody["takenBefore"], to.Format(time.RFC3339Nano))
+				}
 				body = `{
-					"images": 124,
+					"images": 0,
 					"videos": 6
 				}`
 			default:
@@ -223,7 +236,7 @@ func TestTimelineSearchWithFiltersUsesSearchTotal(t *testing.T) {
 	}
 
 	if page.Total != 6 {
-		t.Fatalf("filtered timeline total = %d, want search response total 6", page.Total)
+		t.Fatalf("filtered timeline total = %d, want statistics total 6", page.Total)
 	}
 	if page.TotalAccuracy != TotalAccuracyExact {
 		t.Fatalf("filtered timeline total accuracy = %q, want %q", page.TotalAccuracy, TotalAccuracyExact)
@@ -231,8 +244,8 @@ func TestTimelineSearchWithFiltersUsesSearchTotal(t *testing.T) {
 	if metadataRequests != 1 {
 		t.Fatalf("metadata requests = %d, want 1", metadataRequests)
 	}
-	if statisticsRequests != 0 {
-		t.Fatalf("statistics requests = %d, want no statistics request for filtered timeline", statisticsRequests)
+	if statisticsRequests != 1 {
+		t.Fatalf("statistics requests = %d, want 1", statisticsRequests)
 	}
 	if len(page.Items) != 1 || page.Items[0].Type != "video" {
 		t.Fatalf("items = %#v, want one video item", page.Items)
