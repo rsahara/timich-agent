@@ -379,6 +379,11 @@ func (s *Service) searchImmichAssets(normalized normalizedAssetSearch) (AssetSea
 			total = max(total, statisticsTotal)
 			totalAccuracy = TotalAccuracyExact
 		}
+	} else if shouldUseFilteredTimelineStatisticsTotal(normalized) {
+		if statisticsTotal, err := s.fetchTimelineStatisticsTotal(normalized.Request.Collection.Filters); err == nil {
+			total = max(total, statisticsTotal)
+			totalAccuracy = TotalAccuracyExact
+		}
 	}
 	if total == 0 && len(items) > 0 {
 		total = normalized.Request.Page.Index*normalized.Request.Page.Size + len(items)
@@ -403,6 +408,13 @@ func shouldUseTimelineStatisticsTotal(normalized normalizedAssetSearch) bool {
 		return false
 	}
 	return !hasAssetSearchFilters(normalized.Request.Collection.Filters)
+}
+
+func shouldUseFilteredTimelineStatisticsTotal(normalized normalizedAssetSearch) bool {
+	if normalized.Resolved.CollectionKind != CollectionKindTimeline || normalized.Resolved.QueryMode != QueryModeNone {
+		return false
+	}
+	return hasAssetSearchFilters(normalized.Request.Collection.Filters)
 }
 
 func hasAssetSearchFilters(filters AssetSearchFilters) bool {
@@ -436,18 +448,7 @@ func immichSearchRequest(normalized normalizedAssetSearch) ([]byte, string, stri
 		"page": normalized.Request.Page.Index + 1,
 		"size": normalized.Request.Page.Size,
 	}
-	filters := normalized.Request.Collection.Filters
-	if len(filters.MediaTypes) == 1 {
-		body["type"] = immichAssetType(filters.MediaTypes[0])
-	}
-	if filters.CapturedAt != nil {
-		if filters.CapturedAt.From != nil {
-			body["takenAfter"] = filters.CapturedAt.From.UTC().Format(time.RFC3339Nano)
-		}
-		if filters.CapturedAt.To != nil {
-			body["takenBefore"] = filters.CapturedAt.To.UTC().Format(time.RFC3339Nano)
-		}
-	}
+	applyImmichSearchFilters(body, normalized.Request.Collection.Filters)
 
 	switch normalized.Resolved.QueryMode {
 	case QueryModeSemantic:
@@ -475,6 +476,21 @@ func immichSearchRequest(normalized normalizedAssetSearch) ([]byte, string, stri
 		return raw, "/api/search/metadata", TotalAccuracyExact, nil
 	default:
 		return nil, "", "", ErrUnsupportedSearch
+	}
+}
+
+func applyImmichSearchFilters(body map[string]any, filters AssetSearchFilters) {
+	if len(filters.MediaTypes) == 1 {
+		body["type"] = immichAssetType(filters.MediaTypes[0])
+	}
+	if filters.CapturedAt == nil {
+		return
+	}
+	if filters.CapturedAt.From != nil {
+		body["takenAfter"] = filters.CapturedAt.From.UTC().Format(time.RFC3339Nano)
+	}
+	if filters.CapturedAt.To != nil {
+		body["takenBefore"] = filters.CapturedAt.To.UTC().Format(time.RFC3339Nano)
 	}
 }
 
@@ -706,10 +722,21 @@ func (s *Service) timelineAssetTotal() (int, error) {
 }
 
 func (s *Service) fetchTimelineAssetTotal() (int, error) {
+	return s.fetchTimelineStatisticsTotal(AssetSearchFilters{})
+}
+
+func (s *Service) fetchTimelineStatisticsTotal(filters AssetSearchFilters) (int, error) {
+	body := map[string]any{}
+	applyImmichSearchFilters(body, filters)
+	rawBody, err := json.Marshal(body)
+	if err != nil {
+		return 0, fmt.Errorf("marshal statistics request: %w", err)
+	}
+
 	request, err := s.newRequest(
 		http.MethodPost,
 		"/api/search/statistics",
-		strings.NewReader(`{}`),
+		bytes.NewReader(rawBody),
 	)
 	if err != nil {
 		return 0, err

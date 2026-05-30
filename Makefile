@@ -2,7 +2,7 @@
 
 -include ../../versions.mk
 
-TIMICH_AGENT_VERSION ?= 0.1.0
+TIMICH_AGENT_VERSION ?= 0.2.0
 TIMICH_AGENT_DIST_REPO ?= rsahara/timich-agent
 TIMICH_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 TIMICH_BUILT_AT ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
