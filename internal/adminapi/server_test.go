@@ -170,6 +170,67 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 	if !bytes.Contains(body, []byte("/v1/datasource/primary/check")) {
 		t.Fatalf("dashboard body is missing datasource check API call: %s", recorder.Body.String())
 	}
+	if !bytes.Contains(body, []byte("Checking datasource reachability from this Agent")) {
+		t.Fatalf("dashboard body is missing datasource reachability loading state: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("Datasource is configured and reachable from this Agent")) {
+		t.Fatalf("dashboard body is missing datasource reachable setup summary: %s", recorder.Body.String())
+	}
+}
+
+func TestDashboardDatasourceSaveFailureRestoresStatusBeforeError(t *testing.T) {
+	t.Parallel()
+
+	restoreSnippet := dashboardSnippet(t,
+		"async function restoreDatasourceSaveFailureState(attemptedDatasource)",
+		"async function loadDevices()",
+	)
+	assertSnippetOrder(t, restoreSnippet,
+		"await loadStatus();",
+		"datasourceName.value = attemptedDatasource.name;",
+		"datasourceURL.value = attemptedDatasource.url;",
+		"datasourceAccessToken.value = attemptedDatasource.accessToken;",
+	)
+
+	submitFailureSnippet := dashboardSnippet(t,
+		"datasourceForm.addEventListener('submit'",
+		"async function checkDatasource",
+	)
+	assertSnippetOrder(t, submitFailureSnippet,
+		"const attemptedDatasource = {",
+		"await api('/v1/datasource/primary', {",
+		"} catch (error) {",
+		"await restoreDatasourceSaveFailureState(attemptedDatasource);",
+		"datasourceMessage.textContent = error.message;",
+		"datasourceMessage.className = 'status-failed';",
+	)
+}
+
+func dashboardSnippet(t *testing.T, startMarker, endMarker string) string {
+	t.Helper()
+
+	start := strings.Index(dashboardHTML, startMarker)
+	if start < 0 {
+		t.Fatalf("dashboard HTML is missing start marker %q", startMarker)
+	}
+	end := strings.Index(dashboardHTML[start:], endMarker)
+	if end < 0 {
+		t.Fatalf("dashboard HTML is missing end marker %q after %q", endMarker, startMarker)
+	}
+	return dashboardHTML[start : start+end]
+}
+
+func assertSnippetOrder(t *testing.T, snippet string, orderedMarkers ...string) {
+	t.Helper()
+
+	offset := 0
+	for _, marker := range orderedMarkers {
+		index := strings.Index(snippet[offset:], marker)
+		if index < 0 {
+			t.Fatalf("snippet is missing marker %q after offset %d:\n%s", marker, offset, snippet)
+		}
+		offset += index + len(marker)
+	}
 }
 
 func TestAdminRoutesRequireAuthentication(t *testing.T) {
@@ -471,13 +532,13 @@ func TestUpdateCheckReportsAvailableRelease(t *testing.T) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schemaVersion":           1,
 			"product":                 "timich-agent",
-			"version":                 "0.2.0",
+			"version":                 "0.2.1",
 			"minimumSupportedVersion": "0.1.0",
-			"notesUrl":                "https://example.test/releases/v0.2.0",
+			"notesUrl":                "https://example.test/releases/v0.2.1",
 			"artifacts": map[string]any{
 				runtimePlatform(): map[string]string{
-					"filename": "timich-agent_0.2.0_test.tar.gz",
-					"url":      "https://example.test/timich-agent_0.2.0_test.tar.gz",
+					"filename": "timich-agent_0.2.1_test.tar.gz",
+					"url":      "https://example.test/timich-agent_0.2.1_test.tar.gz",
 					"sha256":   strings.Repeat("a", 64),
 				},
 			},
@@ -508,8 +569,8 @@ func TestUpdateCheckReportsAvailableRelease(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
 	}
-	if payload.CurrentVersion != "0.1.0" || payload.LatestVersion != "0.2.0" || payload.Status != "update_available" {
-		t.Fatalf("payload = %+v, want update_available from 0.1.0 to 0.2.0", payload)
+	if payload.CurrentVersion != "0.1.0" || payload.LatestVersion != "0.2.1" || payload.Status != "update_available" {
+		t.Fatalf("payload = %+v, want update_available from 0.1.0 to 0.2.1", payload)
 	}
 	if payload.Artifact == nil || payload.Artifact.Filename == "" {
 		t.Fatalf("Artifact = %+v, want platform artifact", payload.Artifact)
@@ -526,12 +587,12 @@ func TestUpdateCheckRejectsUnsafeManifestURL(t *testing.T) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schemaVersion": 1,
 			"product":       "timich-agent",
-			"version":       "0.2.0",
+			"version":       "0.2.1",
 			"notesUrl":      "javascript:alert(1)",
 			"artifacts": map[string]any{
 				runtimePlatform(): map[string]string{
-					"filename": "timich-agent_0.2.0_test.tar.gz",
-					"url":      "https://example.test/timich-agent_0.2.0_test.tar.gz",
+					"filename": "timich-agent_0.2.1_test.tar.gz",
+					"url":      "https://example.test/timich-agent_0.2.1_test.tar.gz",
 					"sha256":   strings.Repeat("a", 64),
 				},
 			},

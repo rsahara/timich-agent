@@ -334,6 +334,10 @@ const dashboardHTML = `<!doctype html>
     const compatSummary = document.querySelector('#compatSummary');
     const compatChecks = document.querySelector('#compatChecks');
     const restartMessage = document.querySelector('#restartMessage');
+    let latestSetupTasks = [];
+    let activeDatasourceURL = '';
+    let latestDatasourceCheck = null;
+    let datasourceCheckGeneration = 0;
 
     async function api(path, options = {}) {
       const response = await fetch(path, { credentials: 'same-origin', ...options });
@@ -450,10 +454,64 @@ const dashboardHTML = `<!doctype html>
     }
 
     function renderSetupTasks(tasks) {
-      setupTasks.innerHTML = (tasks || []).map(task => {
+      latestSetupTasks = (tasks || []).map(task => ({ ...task }));
+      if (latestDatasourceCheck && latestDatasourceCheck.datasourceURL === activeDatasourceURL) {
+        latestSetupTasks = latestSetupTasks.map(task => task.id === 'datasource' ? { ...task, ...datasourceTaskPatch(latestDatasourceCheck.check) } : task);
+      }
+      setupTasks.innerHTML = latestSetupTasks.map(task => {
         const status = task.status || 'pending';
         return '<div class="task"><strong><span>' + escapeHTML(task.label || task.id) + '</span><span class="' + taskStatusClass(status) + '">' + escapeHTML(status) + '</span></strong><span class="muted">' + escapeHTML(task.summary || '') + '</span></div>';
       }).join('');
+    }
+
+    function updateSetupTask(id, patch) {
+      renderSetupTasks(latestSetupTasks.map(task => task.id === id ? { ...task, ...patch } : task));
+    }
+
+    function datasourceSetupStatus(check) {
+      if (check.status === 'ok') return 'complete';
+      if (check.status === 'warning') return 'pending';
+      return 'failed';
+    }
+
+    function datasourceCheckSummary(check) {
+      if (check.status === 'ok') return 'Datasource is configured and reachable from this Agent.';
+      const parts = [check.summary || 'Datasource check failed.'];
+      if (check.remediation) {
+        parts.push(check.remediation);
+      }
+      return parts.join(' ');
+    }
+
+    function datasourceTaskPatch(check) {
+      return {
+        status: datasourceSetupStatus(check),
+        summary: datasourceCheckSummary(check)
+      };
+    }
+
+    function invalidateDatasourceCheckRequests() {
+      datasourceCheckGeneration += 1;
+    }
+
+    function clearDatasourceCheck() {
+      latestDatasourceCheck = null;
+    }
+
+    function canApplyDatasourceCheck(generation, datasourceURLSnapshot) {
+      return generation === datasourceCheckGeneration && datasourceURLSnapshot === activeDatasourceURL;
+    }
+
+    function applyDatasourceCheck(check, datasourceURLSnapshot, saved) {
+      latestDatasourceCheck = { check, datasourceURL: datasourceURLSnapshot };
+      updateSetupTask('datasource', datasourceTaskPatch(check));
+      if (check.status === 'ok') {
+        datasourceMessage.textContent = saved ? 'Saved. Datasource reachable from Agent.' : 'Datasource reachable from Agent.';
+        datasourceMessage.className = 'status-ok';
+        return;
+      }
+      datasourceMessage.textContent = datasourceCheckSummary(check);
+      datasourceMessage.className = check.status === 'warning' ? 'status-warn' : 'status-failed';
     }
 
     async function copyText(value) {
@@ -479,7 +537,7 @@ const dashboardHTML = `<!doctype html>
       }
     }
 
-    async function loadStatus() {
+    async function loadStatus({ checkDatasourceReachability = false } = {}) {
       const status = await api('/status');
       document.querySelector('#agentName').textContent = status.agentName || 'Timich Agent';
       document.querySelector('#agentSubline').textContent = (status.mode || 'agent') + ' / ' + (status.version || 'dev') + ' / ' + (status.agentId || '');
@@ -500,8 +558,12 @@ const dashboardHTML = `<!doctype html>
         ['Waiting for', (status.remoteBrowsing?.registrationBlockedBy || []).join(', ')],
         ['Datasources', (status.datasources || []).map(item => (item.name || item.kind) + ' (' + item.kind + ')').join(', ')],
       ]);
-      renderSetupTasks(status.setupTasks || []);
       const primaryDatasource = (status.datasources || [])[0];
+      activeDatasourceURL = primaryDatasource?.url || '';
+      if (!primaryDatasource || (latestDatasourceCheck && latestDatasourceCheck.datasourceURL !== activeDatasourceURL)) {
+        clearDatasourceCheck();
+      }
+      renderSetupTasks(status.setupTasks || []);
       datasourceName.value = primaryDatasource?.name || 'Immich';
       datasourceURL.value = primaryDatasource?.url || '';
       datasourceAccessToken.placeholder = primaryDatasource?.hasAccessToken ? 'Leave blank to keep existing key' : 'Required';
@@ -512,6 +574,28 @@ const dashboardHTML = `<!doctype html>
         datasourceMessage.textContent = '';
         datasourceMessage.className = 'muted';
       }
+      if (primaryDatasource && checkDatasourceReachability) {
+        updateSetupTask('datasource', {
+          status: 'checking',
+          summary: 'Checking datasource reachability from this Agent...'
+        });
+        if (!datasourceMessage.textContent) {
+          datasourceMessage.textContent = 'Checking datasource...';
+          datasourceMessage.className = 'muted';
+        }
+        void checkDatasource();
+      }
+    }
+
+    async function restoreDatasourceSaveFailureState(attemptedDatasource) {
+      try {
+        await loadStatus();
+      } catch (_) {
+        // Keep the original save error visible even if status refresh fails.
+      }
+      datasourceName.value = attemptedDatasource.name;
+      datasourceURL.value = attemptedDatasource.url;
+      datasourceAccessToken.value = attemptedDatasource.accessToken;
     }
 
     async function loadDevices() {
@@ -700,18 +784,26 @@ const dashboardHTML = `<!doctype html>
       if (datasourceAccessToken.value.trim() !== '') {
         payload.accessToken = datasourceAccessToken.value;
       }
+      const attemptedDatasource = {
+        name: datasourceName.value,
+        url: datasourceURL.value,
+        accessToken: datasourceAccessToken.value
+      };
+      invalidateDatasourceCheckRequests();
       try {
         await api('/v1/datasource/primary', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
+        clearDatasourceCheck();
         datasourceAccessToken.value = '';
         datasourceMessage.textContent = 'Saved. Checking datasource...';
         datasourceMessage.className = 'muted';
         await loadStatus();
-        await checkDatasource();
+        await checkDatasource({ saved: true });
       } catch (error) {
+        await restoreDatasourceSaveFailureState(attemptedDatasource);
         datasourceMessage.textContent = error.message;
         datasourceMessage.className = 'status-failed';
       } finally {
@@ -719,16 +811,25 @@ const dashboardHTML = `<!doctype html>
       }
     });
 
-    async function checkDatasource() {
-      const check = await api('/v1/datasource/primary/check', { method: 'POST' });
-      if (check.status === 'ok') {
-        datasourceMessage.textContent = 'Saved. Datasource reachable from Agent.';
-        datasourceMessage.className = 'status-ok';
-        return;
+    async function checkDatasource({ saved = false } = {}) {
+      const generation = datasourceCheckGeneration + 1;
+      datasourceCheckGeneration = generation;
+      const datasourceURLSnapshot = activeDatasourceURL;
+      try {
+        const check = await api('/v1/datasource/primary/check', { method: 'POST' });
+        if (!canApplyDatasourceCheck(generation, datasourceURLSnapshot)) {
+          return;
+        }
+        applyDatasourceCheck(check, datasourceURLSnapshot, saved);
+      } catch (error) {
+        if (!canApplyDatasourceCheck(generation, datasourceURLSnapshot)) {
+          return;
+        }
+        applyDatasourceCheck({
+          status: 'failed',
+          summary: 'Datasource check failed. ' + error.message
+        }, datasourceURLSnapshot, saved);
       }
-      const detail = check.remediation ? ' ' + check.remediation : '';
-      datasourceMessage.textContent = (check.summary || 'Datasource check failed.') + detail;
-      datasourceMessage.className = check.status === 'warning' ? 'status-warn' : 'status-failed';
     }
 
     document.querySelector('#restartAgent').addEventListener('click', async event => {
@@ -761,7 +862,7 @@ const dashboardHTML = `<!doctype html>
       throw new Error('Restart requested, but the agent did not become ready in time.');
     }
 
-    Promise.all([loadStatus(), loadDevices(), loadUpdateCheck()]).catch(error => {
+    Promise.all([loadStatus({ checkDatasourceReachability: true }), loadDevices(), loadUpdateCheck()]).catch(error => {
       document.querySelector('#agentSubline').textContent = error.message;
     });
   </script>
