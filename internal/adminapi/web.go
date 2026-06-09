@@ -207,6 +207,7 @@ const dashboardHTML = `<!doctype html>
     th { color: var(--muted); font-weight: 500; }
     label { display: grid; gap: 6px; color: var(--muted); font-size: 13px; }
     input, select { width: 100%; min-height: 38px; border: 1px solid var(--line); border-radius: 6px; padding: 0 10px; background: transparent; color: var(--fg); font: inherit; }
+    input[type="checkbox"] { width: 16px; height: 16px; min-height: 16px; padding: 0; margin: 0; accent-color: var(--accent); }
     button { min-height: 34px; border: 1px solid var(--line); border-radius: 6px; padding: 0 12px; background: transparent; color: var(--fg); font: inherit; cursor: pointer; }
     button.primary { border-color: var(--accent); background: var(--accent); color: #fff; font-weight: 600; }
     button.danger { color: var(--danger); }
@@ -237,8 +238,25 @@ const dashboardHTML = `<!doctype html>
     .tasks { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
     .task { display: grid; gap: 4px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
     .task strong { display: flex; justify-content: space-between; gap: 8px; }
+    .device-list { display: grid; gap: 12px; }
+    .device-card { display: grid; gap: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; }
+    .device-summary { display: grid; grid-template-columns: minmax(260px, 1.2fr) minmax(200px, .8fr) auto; gap: 12px; align-items: start; }
+    .device-summary-item { min-width: 0; display: grid; gap: 3px; }
+    .device-summary-label, .device-subsection-title, .device-meta-label { color: var(--muted); font-size: 12px; font-weight: 600; }
+    .device-summary-value { min-width: 0; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+    .device-name-form { display: grid; grid-template-columns: minmax(180px, 320px) auto minmax(120px, 1fr); gap: 8px; align-items: end; }
+    .device-meta { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 8px 12px; text-align: right; }
+    .device-meta-text { display: grid; gap: 2px; }
+    .device-subsection { display: grid; gap: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
+    .device-upload-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; align-items: flex-start; }
+    .device-upload-status { display: grid; gap: 2px; justify-items: end; text-align: right; }
+    .checkbox-label { min-height: 38px; display: flex; align-items: center; gap: 8px; color: var(--fg); font-size: 14px; }
+    .device-upload-form { display: grid; grid-template-columns: minmax(120px, .45fr) minmax(170px, .9fr) minmax(240px, 1.2fr) minmax(210px, .9fr) auto; gap: 10px; align-items: end; }
+    .device-reset-section { display: grid; gap: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+    .device-reset-title { color: var(--muted); font-size: 13px; font-weight: 600; }
+    .device-reset-form { display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)) auto; gap: 10px; align-items: end; }
     form { margin: 0; }
-    @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } section { grid-column: 1; } .tasks { grid-template-columns: 1fr; } .pairing-grid { grid-template-columns: 1fr; } .bar { align-items: flex-start; flex-direction: column; padding: 14px 0; } dl { grid-template-columns: 1fr; } th:nth-child(3), td:nth-child(3) { display: none; } }
+    @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } section { grid-column: 1; } .tasks { grid-template-columns: 1fr; } .pairing-grid { grid-template-columns: 1fr; } .bar { align-items: flex-start; flex-direction: column; padding: 14px 0; } dl { grid-template-columns: 1fr; } th:nth-child(3), td:nth-child(3) { display: none; } .device-summary, .device-upload-head { grid-template-columns: 1fr; } .device-name-form { grid-template-columns: 1fr; } .device-meta { justify-content: flex-start; text-align: left; } .device-upload-status { justify-items: start; text-align: left; } .device-upload-form, .device-reset-form { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -298,8 +316,13 @@ const dashboardHTML = `<!doctype html>
         <div id="pairingResult"></div>
       </section>
       <section class="wide">
-        <h2>Paired Devices</h2>
+        <h2>Device List</h2>
         <div id="devices"></div>
+      </section>
+      <section class="wide">
+        <h2>Device Uploads</h2>
+        <p class="section-note">Upload destinations are configured by the administrator. The app can only choose its local upload mode.</p>
+        <div class="stack" id="uploadRoots"></div>
       </section>
       <section class="wide">
         <h2>Remote Browsing Readiness</h2>
@@ -330,6 +353,7 @@ const dashboardHTML = `<!doctype html>
     const datasourceAccessToken = document.querySelector('#datasourceAccessToken');
     const datasourceMessage = document.querySelector('#datasourceMessage');
     const devicesNode = document.querySelector('#devices');
+    const uploadRootsNode = document.querySelector('#uploadRoots');
     const pairingResult = document.querySelector('#pairingResult');
     const compatSummary = document.querySelector('#compatSummary');
     const compatChecks = document.querySelector('#compatChecks');
@@ -338,6 +362,7 @@ const dashboardHTML = `<!doctype html>
     let activeDatasourceURL = '';
     let latestDatasourceCheck = null;
     let datasourceCheckGeneration = 0;
+    let latestUploadRoots = [];
 
     async function api(path, options = {}) {
       const response = await fetch(path, { credentials: 'same-origin', ...options });
@@ -462,6 +487,77 @@ const dashboardHTML = `<!doctype html>
         const status = task.status || 'pending';
         return '<div class="task"><strong><span>' + escapeHTML(task.label || task.id) + '</span><span class="' + taskStatusClass(status) + '">' + escapeHTML(status) + '</span></strong><span class="muted">' + escapeHTML(task.summary || '') + '</span></div>';
       }).join('');
+    }
+
+    function uploadRootStatusClass(status) {
+      return status === 'ready' ? 'status-ok' : 'status-failed';
+    }
+
+    function renderUploadRoots(roots) {
+      latestUploadRoots = roots || [];
+      if (!latestUploadRoots.length) {
+        uploadRootsNode.innerHTML = '<div class="notice warn"><strong>No upload roots configured</strong><div class="muted">Add uploadRoots to the Agent config before enabling device uploads.</div></div>';
+        return;
+      }
+      uploadRootsNode.innerHTML = '<table><thead><tr><th>Key</th><th>Path</th><th>Temp path</th><th>Status</th></tr></thead><tbody>' + latestUploadRoots.map(root =>
+        '<tr>' +
+          '<td>' + escapeHTML(root.key) + '</td>' +
+          '<td>' + escapeHTML(root.path) + '</td>' +
+          '<td>' + escapeHTML(root.tempPath || '') + '</td>' +
+          '<td><span class="' + uploadRootStatusClass(root.status) + '">' + escapeHTML(root.status || '') + '</span><div class="muted">' + escapeHTML(root.message || '') + '</div></td>' +
+        '</tr>'
+      ).join('') + '</tbody></table>';
+    }
+
+    async function loadUploadRoots() {
+      const payload = await api('/v1/uploads/roots');
+      renderUploadRoots(payload.roots || []);
+      return latestUploadRoots;
+    }
+
+    function rootOptions(selected) {
+      const options = ['<option value="">Select root</option>'];
+      latestUploadRoots.forEach(root => {
+        options.push('<option value="' + escapeHTML(root.key) + '"' + (root.key === selected ? ' selected' : '') + '>' + escapeHTML(root.key + ' / ' + (root.status || '')) + '</option>');
+      });
+      return options.join('');
+    }
+
+    function effectiveDeviceUploadStatus(policy, rootsByKey) {
+      const upload = policy.upload || {};
+      const status = policy.status || {};
+      if (!upload.enabled || !upload.rootKey) {
+        return status;
+      }
+      const root = rootsByKey.get(upload.rootKey);
+      if (root && root.status && root.status !== 'ready') {
+        return {
+          state: 'blocked',
+          reason: root.message || 'Upload root is blocked.',
+          root
+        };
+      }
+      return status;
+    }
+
+    function deviceUploadStatusClass(status) {
+      if (status.state === 'ready') return 'status-ok';
+      if (status.state === 'disabled') return 'muted';
+      return 'status-warn';
+    }
+
+    function datetimeLocalValue(value) {
+      if (!value) return '';
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) return '';
+      const local = new Date(parsed.getTime() - parsed.getTimezoneOffset() * 60000);
+      return local.toISOString().slice(0, 16);
+    }
+
+    function datetimeLocalToISOString(value) {
+      if (!value) return null;
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
     }
 
     function updateSetupTask(id, patch) {
@@ -598,21 +694,177 @@ const dashboardHTML = `<!doctype html>
       datasourceAccessToken.value = attemptedDatasource.accessToken;
     }
 
+    function renderDeviceSummary(device) {
+      const lastRefreshedAt = date(device.lastRefreshedAt) || 'Unknown';
+      return '<div class="device-summary">' +
+        '<div class="device-summary-item"><span class="device-summary-label">ID</span><span class="device-summary-value">' + escapeHTML(device.deviceId) + '</span></div>' +
+        '<div class="device-summary-item"><span class="device-summary-label">Device name (display)</span><span class="device-summary-value" data-device-display-name>' + escapeHTML(device.deviceName || 'Unnamed device') + '</span></div>' +
+        '<div class="device-meta"><div class="device-meta-text"><span class="device-meta-label">Last refreshed</span><span>' + escapeHTML(lastRefreshedAt) + '</span></div><button class="danger" type="button" data-revoke="' + escapeHTML(device.deviceId) + '">Revoke</button></div>' +
+      '</div>';
+    }
+
+    function renderDeviceNameSettings(device) {
+      return '<div class="device-subsection device-name-section">' +
+        '<div class="device-subsection-title">Device name settings</div>' +
+        '<form class="device-name-form" data-device-rename="' + escapeHTML(device.deviceId) + '">' +
+          '<label>Device name<input name="deviceName" value="' + escapeHTML(device.deviceName || '') + '" autocomplete="off" required></label>' +
+          '<button type="submit">Save device name</button><span class="muted" data-device-message="' + escapeHTML(device.deviceId) + '"></span>' +
+        '</form>' +
+      '</div>';
+    }
+
+    function renderDeviceUploadSettings(device, upload, status, roots) {
+      const disabled = roots.length ? '' : ' disabled';
+      const rootKey = upload.rootKey || '';
+      const statusReason = status.reason || '';
+      return '<div class="device-subsection device-upload-section">' +
+        '<div class="device-upload-head">' +
+          '<div class="device-subsection-title">Upload settings</div>' +
+          '<div class="device-upload-status"><span class="' + deviceUploadStatusClass(status) + '">' + escapeHTML(status.state || 'unknown') + '</span><div class="muted">' + escapeHTML(statusReason) + '</div></div>' +
+        '</div>' +
+        '<form class="device-upload-form" data-upload-policy="' + escapeHTML(device.deviceId) + '">' +
+          '<label>Mode<span class="checkbox-label"><input type="checkbox" name="enabled"' + (upload.enabled ? ' checked' : '') + '> Enabled</span></label>' +
+          '<label>Root<select name="rootKey"' + disabled + '>' + rootOptions(rootKey) + '</select></label>' +
+          '<label>Path pattern<input name="pathPattern" value="' + escapeHTML(upload.pathPattern || '{deviceName}/{yyyy}-{MM}-{dd}/{filename}') + '" autocomplete="off"></label>' +
+          '<label>Captured after<input name="capturedAfter" type="datetime-local" value="' + escapeHTML(datetimeLocalValue(upload.capturedAfter)) + '"></label>' +
+          '<div class="actions"><button class="primary" type="submit">Save upload policy</button><span class="muted" data-upload-message="' + escapeHTML(device.deviceId) + '"></span></div>' +
+        '</form>' +
+        '<div class="device-reset-section">' +
+          '<div class="device-reset-title">Upload state reset</div>' +
+          '<form class="device-reset-form" data-upload-reset="' + escapeHTML(device.deviceId) + '">' +
+            '<label>Reset from<input name="capturedAfter" type="datetime-local" required></label>' +
+            '<label>Reset before<input name="capturedBefore" type="datetime-local" required></label>' +
+            '<div class="actions"><button class="danger" type="submit">Reset upload state</button><span class="muted" data-reset-message="' + escapeHTML(device.deviceId) + '"></span></div>' +
+          '</form>' +
+        '</div>' +
+      '</div>';
+    }
+
     async function loadDevices() {
+      const roots = await loadUploadRoots();
       const payload = await api('/v1/devices');
       const devices = payload.devices || [];
       if (devices.length === 0) {
         devicesNode.innerHTML = '<div class="muted">No paired devices</div>';
         return;
       }
-      devicesNode.innerHTML = '<table><thead><tr><th>Name</th><th>Device ID</th><th>Last refreshed</th><th></th></tr></thead><tbody>' + devices.map(device =>
-        '<tr>' +
-          '<td>' + escapeHTML(device.deviceName || 'Unnamed device') + '</td>' +
-          '<td>' + escapeHTML(device.deviceId) + '</td>' +
-          '<td>' + escapeHTML(date(device.lastRefreshedAt)) + '</td>' +
-          '<td><button class="danger" data-revoke="' + escapeHTML(device.deviceId) + '">Revoke</button></td>' +
-        '</tr>'
-      ).join('') + '</tbody></table>';
+      const policies = await Promise.all(devices.map(device => api('/v1/devices/' + encodeURIComponent(device.deviceId) + '/upload-policy').catch(error => ({ error: error.message, deviceId: device.deviceId }))));
+      const policyByDevice = new Map(policies.map(policy => [policy.deviceId, policy]));
+      const rootsByKey = new Map((roots || []).map(root => [root.key, root]));
+      devicesNode.innerHTML = '<div class="device-list">' + devices.map(device => {
+        const policy = policyByDevice.get(device.deviceId) || {};
+        const upload = policy.upload || {};
+        const status = effectiveDeviceUploadStatus(policy, rootsByKey);
+        return '<div class="device-card" data-device-card="' + escapeHTML(device.deviceId) + '">' +
+          renderDeviceSummary(device) +
+          renderDeviceNameSettings(device) +
+          renderDeviceUploadSettings(device, upload, status, roots) +
+        '</div>';
+      }).join('') + '</div>';
+      devicesNode.querySelectorAll('[data-device-rename]').forEach(form => {
+        form.addEventListener('submit', async event => {
+          event.preventDefault();
+          const deviceID = form.dataset.deviceRename;
+          const message = form.querySelector('[data-device-message]');
+          const button = form.querySelector('button[type="submit"]');
+          const nextName = form.elements.deviceName.value.trim();
+          if (!nextName) {
+            message.textContent = 'Device name is required';
+            message.className = 'status-failed';
+            return;
+          }
+          button.disabled = true;
+          message.textContent = 'Renaming...';
+          message.className = 'muted';
+          try {
+            const device = await api('/v1/devices/' + encodeURIComponent(deviceID), {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ deviceName: nextName })
+            });
+            form.elements.deviceName.value = device.deviceName || nextName;
+            const card = form.closest('[data-device-card]');
+            const displayName = card ? card.querySelector('[data-device-display-name]') : null;
+            if (displayName) {
+              displayName.textContent = device.deviceName || nextName;
+            }
+            message.textContent = 'Renamed';
+            message.className = 'status-ok';
+          } catch (error) {
+            message.textContent = error.message;
+            message.className = 'status-failed';
+          } finally {
+            button.disabled = false;
+          }
+        });
+      });
+      devicesNode.querySelectorAll('[data-upload-policy]').forEach(form => {
+        form.addEventListener('submit', async event => {
+          event.preventDefault();
+          const deviceID = form.dataset.uploadPolicy;
+          const message = form.querySelector('[data-upload-message]');
+          const button = form.querySelector('button[type="submit"]');
+          button.disabled = true;
+          message.textContent = 'Saving...';
+          message.className = 'muted';
+          try {
+            await api('/v1/devices/' + encodeURIComponent(deviceID) + '/upload-policy', {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                enabled: form.elements.enabled.checked,
+                rootKey: form.elements.rootKey.value,
+                pathPattern: form.elements.pathPattern.value,
+                capturedAfter: datetimeLocalToISOString(form.elements.capturedAfter.value)
+              })
+            });
+            message.textContent = 'Saved';
+            message.className = 'status-ok';
+            await loadDevices();
+          } catch (error) {
+            message.textContent = error.message;
+            message.className = 'status-failed';
+          } finally {
+            button.disabled = false;
+          }
+        });
+      });
+      devicesNode.querySelectorAll('[data-upload-reset]').forEach(form => {
+        form.addEventListener('submit', async event => {
+          event.preventDefault();
+          const deviceID = form.dataset.uploadReset;
+          const message = form.querySelector('[data-reset-message]');
+          const button = form.querySelector('button[type="submit"]');
+          button.disabled = true;
+          message.textContent = 'Resetting...';
+          message.className = 'muted';
+          try {
+            const result = await api('/v1/devices/' + encodeURIComponent(deviceID) + '/upload-reset', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                capturedAfter: datetimeLocalToISOString(form.elements.capturedAfter.value),
+                capturedBefore: datetimeLocalToISOString(form.elements.capturedBefore.value),
+                reason: 'admin reset'
+              })
+            });
+            const cleanupErrors = result.tempCleanupErrors || [];
+            const summary = 'Removed ' + (result.removedUploadedAssets || 0) + ' uploaded rows, ' + (result.removedSessions || 0) + ' sessions, and ' + (result.removedTempFiles || 0) + ' temp files';
+            if (cleanupErrors.length) {
+              message.textContent = summary + '; temp cleanup warning: ' + cleanupErrors[0] + (cleanupErrors.length > 1 ? ' +' + (cleanupErrors.length - 1) + ' more' : '');
+              message.className = 'status-warn';
+            } else {
+              message.textContent = summary;
+              message.className = 'status-ok';
+            }
+          } catch (error) {
+            message.textContent = error.message;
+            message.className = 'status-failed';
+          } finally {
+            button.disabled = false;
+          }
+        });
+      });
       devicesNode.querySelectorAll('[data-revoke]').forEach(button => {
         button.addEventListener('click', async () => {
           button.disabled = true;

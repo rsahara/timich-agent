@@ -145,6 +145,8 @@ TIMICH_AGENT_NAME=Timich Agent
 TIMICH_AGENT_DEVICE_LIMIT=32
 TIMICH_AGENT_APP_LINK_BASE_URL=https://link.timich.runo.jp
 TIMICH_AGENT_REMOTE_BROWSING_ENABLED=true
+# Optional IANA timezone for agent-local dates; empty uses container/process time.
+# TIMICH_AGENT_TIMEZONE=Asia/Tokyo
 TIMICH_AGENT_ADMIN_PORT=8081
 TIMICH_AGENT_MEDIA_PORT=8082
 # TIMICH_AGENT_MEDIA_PUBLISHED_ADDR=10.0.111.128:18082
@@ -256,6 +258,8 @@ The Admin UI currently covers:
 - primary Immich datasource editing and reachability checks
 - pairing-code creation
 - paired-device listing and revoke
+- configured upload root status
+- per-device upload policy editing and date-range upload-state reset
 - remote browsing checks
 - agent restart
 
@@ -285,8 +289,12 @@ Admin API:
 - `POST http://AGENT_LAN_HOST:8081/v1/compatibility-check`
 - `GET http://AGENT_LAN_HOST:8081/v1/update-check`
 - `POST http://AGENT_LAN_HOST:8081/v1/restart`
+- `GET http://AGENT_LAN_HOST:8081/v1/uploads/roots`
 - `GET http://AGENT_LAN_HOST:8081/v1/devices`
 - `DELETE http://AGENT_LAN_HOST:8081/v1/devices/{deviceID}`
+- `GET http://AGENT_LAN_HOST:8081/v1/devices/{deviceID}/upload-policy`
+- `PUT http://AGENT_LAN_HOST:8081/v1/devices/{deviceID}/upload-policy`
+- `POST http://AGENT_LAN_HOST:8081/v1/devices/{deviceID}/upload-reset`
 
 Media API:
 
@@ -297,6 +305,12 @@ Media API:
 - `POST http://AGENT_LAN_HOST:8082/v1/session/refresh`
 - `POST http://AGENT_LAN_HOST:8082/v1/assets/search`
 - `GET http://AGENT_LAN_HOST:8082/v1/assets/search/capabilities`
+- `GET http://AGENT_LAN_HOST:8082/v1/uploads/me`
+- `POST http://AGENT_LAN_HOST:8082/v1/uploads/sessions`
+- `GET http://AGENT_LAN_HOST:8082/v1/uploads/sessions/{uploadID}`
+- `PUT http://AGENT_LAN_HOST:8082/v1/uploads/sessions/{uploadID}/chunk`
+- `POST http://AGENT_LAN_HOST:8082/v1/uploads/sessions/{uploadID}/complete`
+- `POST http://AGENT_LAN_HOST:8082/v1/uploads/sessions/{uploadID}/abort`
 - `GET http://AGENT_LAN_HOST:8082/v1/assets/{assetID}/preview`
 - `GET http://AGENT_LAN_HOST:8082/v1/assets/{assetID}/detail_preview`
 - `GET http://AGENT_LAN_HOST:8082/v1/assets/{assetID}/original`
@@ -390,6 +404,33 @@ A starter config created by `timich-agent init` looks like this:
   "datasources": []
 }
 ```
+
+Optional device-upload storage settings can be added when device uploads are
+enabled:
+
+```json
+{
+  "timezone": "Asia/Tokyo",
+  "uploadRoots": [
+    {
+      "key": "nas-photos",
+      "path": "/mnt/timich-upload",
+      "tempPath": "working/.timich-upload-tmp"
+    }
+  ]
+}
+```
+
+`timezone` uses an IANA timezone name and controls agent-local dates such as
+future upload path date tokens. `uploadRoots[].path` is the path inside the
+agent runtime or container; mount the matching host/NAS directory with Docker
+Compose before selecting that root for a device. `uploadRoots[].tempPath` is
+optional, relative to the upload root, and defaults to `.timich-upload-tmp`.
+Use a nested value such as `working/.timich-upload-tmp` when temporary part
+files should live under an explicit working directory inside the same root.
+The Agent keeps uploaded-asset ledger rows so media is not re-uploaded after
+destination files are deleted, but it runs daily maintenance to prune old upload
+sessions, audit rows, stale temporary files, and the SQLite WAL.
 
 For direct binary runs, set `adminListenAddress` to `127.0.0.1:8081` if you
 want to opt out of LAN admin access and use only the local browser,

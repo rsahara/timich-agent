@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/rsahara/timich-agent/internal/catalog"
@@ -32,6 +33,12 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 				"/v1/info",
 				"/v1/assets/search",
 				"/v1/assets/search/capabilities",
+				"/v1/uploads/me",
+				"/v1/uploads/sessions",
+				"/v1/uploads/sessions/{uploadId}",
+				"/v1/uploads/sessions/{uploadId}/chunk",
+				"/v1/uploads/sessions/{uploadId}/complete",
+				"/v1/uploads/sessions/{uploadId}/abort",
 				"/v1/pairing/redeem",
 				"/v1/session/refresh",
 				"/v1/assets/{assetID}/preview",
@@ -160,6 +167,128 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, page)
+	})
+	mux.HandleFunc("/v1/uploads/me", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, "Use GET to read upload policy and status.")
+			return
+		}
+		claims, ok := authenticateRequest(w, runtime, r)
+		if !ok {
+			return
+		}
+		response, err := runtime.AppUploadState(claims.AppDeviceID)
+		if err != nil {
+			writeUploadError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, response)
+	})
+	mux.HandleFunc("/v1/uploads/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeMethodNotAllowed(w, "Use POST to create or resume an upload session.")
+			return
+		}
+		claims, ok := authenticateRequest(w, runtime, r)
+		if !ok {
+			return
+		}
+		var request runtimestate.UploadSessionStartInput
+		if err := decodeJSONRequest(w, r, &request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_request",
+				"message": "Could not parse the upload session request.",
+			})
+			return
+		}
+		response, err := runtime.StartUploadSession(claims.AppDeviceID, request)
+		if err != nil {
+			writeUploadError(w, err)
+			return
+		}
+		status := http.StatusOK
+		if response.State == "accepted" {
+			status = http.StatusCreated
+		}
+		writeJSON(w, status, response)
+	})
+	mux.HandleFunc("/v1/uploads/sessions/", func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := authenticateRequest(w, runtime, r)
+		if !ok {
+			return
+		}
+		uploadID, action, ok := parseUploadSessionRequest(r.URL.Path)
+		if !ok {
+			writeRouteNotFound(w, "Unknown upload session route.")
+			return
+		}
+		switch action {
+		case "":
+			if r.Method != http.MethodGet {
+				writeMethodNotAllowed(w, "Use GET to read an upload session.")
+				return
+			}
+			response, err := runtime.UploadSession(claims.AppDeviceID, uploadID)
+			if err != nil {
+				writeUploadError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, response)
+		case "chunk":
+			if r.Method != http.MethodPut {
+				writeMethodNotAllowed(w, "Use PUT to append an upload chunk.")
+				return
+			}
+			offset, err := parseRequiredInt64Header(r, "X-Timich-Offset")
+			if err != nil {
+				writeUploadError(w, runtimestate.ErrUploadRequestInvalid)
+				return
+			}
+			response, err := runtime.AppendUploadChunk(claims.AppDeviceID, uploadID, runtimestate.UploadChunkInput{
+				Offset:             offset,
+				ChunkSHA1Hex:       r.Header.Get("X-Timich-Chunk-SHA1"),
+				Body:               r.Body,
+				ContentLengthBytes: r.ContentLength,
+			})
+			if err != nil {
+				writeUploadError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, response)
+		case "complete":
+			if r.Method != http.MethodPost {
+				writeMethodNotAllowed(w, "Use POST to complete an upload session.")
+				return
+			}
+			var request runtimestate.UploadSessionCompleteInput
+			if err := decodeJSONRequest(w, r, &request); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error":   "invalid_request",
+					"message": "Could not parse the upload completion request.",
+				})
+				return
+			}
+			response, err := runtime.CompleteUploadSession(claims.AppDeviceID, uploadID, request)
+			if err != nil {
+				writeUploadError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, response)
+		case "abort":
+			if r.Method != http.MethodPost {
+				writeMethodNotAllowed(w, "Use POST to abort an upload session.")
+				return
+			}
+			response, err := runtime.AbortUploadSession(claims.AppDeviceID, uploadID)
+			if err != nil {
+				writeUploadError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, response)
+		default:
+			writeRouteNotFound(w, "Unknown upload session route.")
+			return
+		}
 	})
 	mux.HandleFunc("/v1/webrtc/offer", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -298,6 +427,36 @@ func parseAssetRequest(path string) (assetID string, variant string, ok bool) {
 	return parts[0], parts[1], true
 }
 
+func parseUploadSessionRequest(path string) (uploadID string, action string, ok bool) {
+	trimmedPath := strings.Trim(strings.TrimPrefix(path, "/v1/uploads/sessions/"), "/")
+	if trimmedPath == "" {
+		return "", "", false
+	}
+	parts := strings.Split(trimmedPath, "/")
+	if len(parts) == 1 && parts[0] != "" {
+		return parts[0], "", true
+	}
+	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+		return parts[0], parts[1], true
+	}
+	return "", "", false
+}
+
+func parseRequiredInt64Header(r *http.Request, name string) (int64, error) {
+	rawValue := strings.TrimSpace(r.Header.Get(name))
+	if rawValue == "" {
+		return 0, runtimestate.ErrUploadRequestInvalid
+	}
+	value, err := strconv.ParseInt(rawValue, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if value < 0 {
+		return 0, runtimestate.ErrUploadRequestInvalid
+	}
+	return value, nil
+}
+
 func requestBaseURL(r *http.Request) string {
 	if scheme := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); scheme != "" {
 		host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
@@ -409,6 +568,50 @@ func writeCatalogError(w http.ResponseWriter, err error) {
 		status = http.StatusRequestEntityTooLarge
 		errorCode = "media_too_large"
 		message = "The requested media response is too large for remote browsing relay."
+	}
+	writeJSON(w, status, map[string]string{
+		"error":   errorCode,
+		"message": message,
+	})
+}
+
+func writeUploadError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	errorCode := "upload_request_failed"
+	message := "Could not process the upload request."
+	switch {
+	case errors.Is(err, runtimestate.ErrUploadRequestInvalid):
+		status = http.StatusBadRequest
+		errorCode = "upload_request_invalid"
+		message = "The upload request is invalid."
+	case errors.Is(err, runtimestate.ErrUploadChecksumMismatch):
+		status = http.StatusBadRequest
+		errorCode = "upload_checksum_mismatch"
+		message = "The upload checksum did not match the received bytes."
+	case errors.Is(err, store.ErrUploadSessionOffsetConflict):
+		status = http.StatusConflict
+		errorCode = "upload_offset_conflict"
+		message = "The upload chunk offset does not match the current session offset."
+	case errors.Is(err, store.ErrUploadedAssetExists):
+		status = http.StatusConflict
+		errorCode = "uploaded_asset_exists"
+		message = "The source asset version is already reserved by another upload."
+	case errors.Is(err, runtimestate.ErrUploadFinalPathConflict):
+		status = http.StatusConflict
+		errorCode = "upload_final_path_conflict"
+		message = "The upload destination path could not be reserved."
+	case errors.Is(err, runtimestate.ErrUploadPolicyInvalid):
+		status = http.StatusConflict
+		errorCode = "upload_policy_blocked"
+		message = "The upload policy no longer allows this session to continue."
+	case errors.Is(err, store.ErrUploadSessionNotFound):
+		status = http.StatusNotFound
+		errorCode = "upload_session_not_found"
+		message = "The upload session was not found."
+	case errors.Is(err, store.ErrDeviceNotFound):
+		status = http.StatusNotFound
+		errorCode = "device_not_found"
+		message = "The paired device was not found."
 	}
 	writeJSON(w, status, map[string]string{
 		"error":   errorCode,

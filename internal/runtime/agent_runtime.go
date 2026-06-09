@@ -5,6 +5,8 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -26,20 +28,30 @@ var (
 	ErrAdminTokenTooShort          = errors.New("admin token too short")
 	ErrPrimaryDatasourceRequired   = errors.New("primary datasource is required")
 	ErrDatasourceAccessTokenNeeded = errors.New("datasource access token is required")
+	ErrUploadPolicyInvalid         = errors.New("upload policy invalid")
+	ErrUploadRootNotFound          = errors.New("upload root not found")
+	ErrUploadResetRangeRequired    = errors.New("upload reset range required")
+	ErrUploadResetInvalid          = errors.New("upload reset invalid")
 )
 
 // AgentRuntime exposes redacted runtime state to the local admin and media APIs.
 type AgentRuntime struct {
-	mu         sync.RWMutex
-	build      BuildInfo
-	config     config.ResolvedConfig
-	state      store.LoadedState
-	assetIDKey []byte
-	startedAt  time.Time
-	registry   *store.DeviceRegistryStore
-	pairing    *pairing.Service
-	catalog    *catalog.Service
-	webrtc     *webrtcmedia.Manager
+	mu                sync.RWMutex
+	build             BuildInfo
+	config            config.ResolvedConfig
+	state             store.LoadedState
+	assetIDKey        []byte
+	startedAt         time.Time
+	registry          *store.DeviceRegistryStore
+	profiles          *store.DeviceProfileStore
+	uploads           *store.UploadStore
+	uploadMu          sync.Mutex
+	maintenanceMu     sync.Mutex
+	maintenanceCancel context.CancelFunc
+	maintenanceWG     sync.WaitGroup
+	pairing           *pairing.Service
+	catalog           *catalog.Service
+	webrtc            *webrtcmedia.Manager
 }
 
 type BuildInfo struct {
@@ -76,6 +88,74 @@ type PrimaryDatasourceResponse struct {
 	AdditionalCount int    `json:"additionalCount"`
 }
 
+// UploadRootSummary exposes administrator-configured upload roots.
+type UploadRootSummary struct {
+	Key      string `json:"key"`
+	Path     string `json:"path"`
+	TempPath string `json:"tempPath,omitempty"`
+	Status   string `json:"status,omitempty"`
+	Writable bool   `json:"writable,omitempty"`
+	Message  string `json:"message,omitempty"`
+}
+
+// DeviceUploadPolicy exposes one paired device upload policy.
+type DeviceUploadPolicy struct {
+	Enabled       bool       `json:"enabled"`
+	RootKey       string     `json:"rootKey,omitempty"`
+	PathPattern   string     `json:"pathPattern"`
+	CapturedAfter *time.Time `json:"capturedAfter,omitempty"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
+}
+
+// DeviceUploadPolicyStatus summarizes whether a device upload policy can run.
+type DeviceUploadPolicyStatus struct {
+	State  string             `json:"state"`
+	Reason string             `json:"reason,omitempty"`
+	Root   *UploadRootSummary `json:"root,omitempty"`
+}
+
+// DeviceUploadPolicyResponse is the admin view of one device upload policy.
+type DeviceUploadPolicyResponse struct {
+	DeviceID   string                   `json:"deviceId"`
+	DeviceName string                   `json:"deviceName"`
+	Upload     DeviceUploadPolicy       `json:"upload"`
+	Status     DeviceUploadPolicyStatus `json:"status"`
+}
+
+// DeviceUploadPolicyUpdate is an administrator-owned policy update.
+type DeviceUploadPolicyUpdate struct {
+	Enabled       bool       `json:"enabled"`
+	RootKey       string     `json:"rootKey"`
+	PathPattern   string     `json:"pathPattern"`
+	CapturedAfter *time.Time `json:"capturedAfter,omitempty"`
+}
+
+// DeviceUpdate is administrator-owned paired-device metadata.
+type DeviceUpdate struct {
+	DeviceName string `json:"deviceName"`
+}
+
+// UploadResetInput describes an administrator reset request for a device/range.
+type UploadResetInput struct {
+	DeviceID         string     `json:"deviceId"`
+	CapturedAfter    *time.Time `json:"capturedAfter,omitempty"`
+	CapturedBefore   *time.Time `json:"capturedBefore,omitempty"`
+	Reason           string     `json:"reason,omitempty"`
+	RequireDateRange bool       `json:"-"`
+}
+
+// UploadResetResponse reports the local state removed by an upload reset.
+type UploadResetResponse struct {
+	DeviceID              string     `json:"deviceId"`
+	CapturedAfter         *time.Time `json:"capturedAfter,omitempty"`
+	CapturedBefore        *time.Time `json:"capturedBefore,omitempty"`
+	ResetAt               time.Time  `json:"resetAt"`
+	RemovedUploadedAssets int64      `json:"removedUploadedAssets"`
+	RemovedSessions       int64      `json:"removedSessions"`
+	RemovedTempFiles      int64      `json:"removedTempFiles"`
+	TempCleanupErrors     []string   `json:"tempCleanupErrors,omitempty"`
+}
+
 // DeviceSummary is the admin-safe view of a paired app device.
 type DeviceSummary struct {
 	DeviceID              string    `json:"deviceId"`
@@ -108,6 +188,7 @@ type StatusResponse struct {
 	ConfigPath            string                `json:"configPath"`
 	DataDir               string                `json:"dataDir"`
 	StatePath             string                `json:"statePath"`
+	Timezone              string                `json:"timezone,omitempty"`
 	AdminListenAddress    string                `json:"adminListenAddress"`
 	MediaListenAddress    string                `json:"mediaListenAddress"`
 	MediaPublishedAddress string                `json:"mediaPublishedAddress,omitempty"`
@@ -118,6 +199,7 @@ type StatusResponse struct {
 	AdminAuthReady        bool                  `json:"adminAuthReady"`
 	RemoteBrowsing        RemoteBrowsingSummary `json:"remoteBrowsing"`
 	Datasources           []DatasourceSummary   `json:"datasources"`
+	UploadRoots           []UploadRootSummary   `json:"uploadRoots"`
 	SetupTasks            []SetupTask           `json:"setupTasks"`
 }
 
@@ -128,6 +210,7 @@ type ConfigResponse struct {
 	ConfigPath            string                `json:"configPath"`
 	DataDir               string                `json:"dataDir"`
 	StatePath             string                `json:"statePath"`
+	Timezone              string                `json:"timezone,omitempty"`
 	AdminListenAddress    string                `json:"adminListenAddress"`
 	MediaListenAddress    string                `json:"mediaListenAddress"`
 	MediaPublishedAddress string                `json:"mediaPublishedAddress,omitempty"`
@@ -136,6 +219,7 @@ type ConfigResponse struct {
 	AdminAuthReady        bool                  `json:"adminAuthReady"`
 	RemoteBrowsing        RemoteBrowsingSummary `json:"remoteBrowsing"`
 	Datasources           []DatasourceSummary   `json:"datasources"`
+	UploadRoots           []UploadRootSummary   `json:"uploadRoots"`
 }
 
 // InfoResponse is the public LAN-facing metadata summary for the media API.
@@ -170,6 +254,14 @@ func NewAgentRuntime(build BuildInfo, cfg config.ResolvedConfig, state store.Loa
 	if err != nil {
 		return nil, err
 	}
+	profiles, err := store.LoadOrCreateDeviceProfileStore(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	uploads, err := store.LoadOrCreateUploadStore(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	pairingService, err := pairing.NewService(
 		state.State.AgentID,
 		cfg.AgentName,
@@ -177,6 +269,7 @@ func NewAgentRuntime(build BuildInfo, cfg config.ResolvedConfig, state store.Loa
 		registry,
 	)
 	if err != nil {
+		_ = uploads.Close()
 		return nil, err
 	}
 	catalogService := catalog.NewService(cfg.Datasources)
@@ -187,11 +280,23 @@ func NewAgentRuntime(build BuildInfo, cfg config.ResolvedConfig, state store.Loa
 		assetIDKey: assetIDKey,
 		startedAt:  startedAt.UTC(),
 		registry:   registry,
+		profiles:   profiles,
+		uploads:    uploads,
 		pairing:    pairingService,
 		catalog:    catalogService,
 	}
 	runtime.webrtc = webrtcmedia.NewManager(runtime.Original)
 	return runtime, nil
+}
+
+// Close releases runtime-owned local resources. Long-running agent processes
+// normally close via process shutdown; tests use this to release SQLite handles.
+func (a *AgentRuntime) Close() error {
+	if a == nil || a.uploads == nil {
+		return nil
+	}
+	a.stopUploadMaintenance()
+	return a.uploads.Close()
 }
 
 func newCompatibilityService(
@@ -237,6 +342,7 @@ func (a *AgentRuntime) StatusResponse() StatusResponse {
 		ConfigPath:            a.config.ConfigPath,
 		DataDir:               a.config.DataDir,
 		StatePath:             a.state.Path,
+		Timezone:              a.config.Timezone,
 		AdminListenAddress:    a.config.AdminListenAddress,
 		MediaListenAddress:    a.config.MediaListenAddress,
 		MediaPublishedAddress: a.config.MediaPublishedAddress,
@@ -247,6 +353,7 @@ func (a *AgentRuntime) StatusResponse() StatusResponse {
 		AdminAuthReady:        a.adminAuthReadyLocked(),
 		RemoteBrowsing:        a.remoteBrowsingSummaryLocked(),
 		Datasources:           a.datasourceSummariesLocked(),
+		UploadRoots:           a.uploadRootSummariesLocked(),
 		SetupTasks:            a.setupTasksLocked(snapshot),
 	}
 }
@@ -262,6 +369,7 @@ func (a *AgentRuntime) ConfigResponse() ConfigResponse {
 		ConfigPath:            a.config.ConfigPath,
 		DataDir:               a.config.DataDir,
 		StatePath:             a.state.Path,
+		Timezone:              a.config.Timezone,
 		AdminListenAddress:    a.config.AdminListenAddress,
 		MediaListenAddress:    a.config.MediaListenAddress,
 		MediaPublishedAddress: a.config.MediaPublishedAddress,
@@ -270,6 +378,7 @@ func (a *AgentRuntime) ConfigResponse() ConfigResponse {
 		AdminAuthReady:        a.adminAuthReadyLocked(),
 		RemoteBrowsing:        a.remoteBrowsingSummaryLocked(),
 		Datasources:           a.datasourceSummariesLocked(),
+		UploadRoots:           a.uploadRootSummariesLocked(),
 	}
 }
 
@@ -465,6 +574,100 @@ func (a *AgentRuntime) datasourceSummariesLocked() []DatasourceSummary {
 	return summaries
 }
 
+func (a *AgentRuntime) uploadRootSummariesLocked() []UploadRootSummary {
+	if len(a.config.UploadRoots) == 0 {
+		return []UploadRootSummary{}
+	}
+	summaries := make([]UploadRootSummary, 0, len(a.config.UploadRoots))
+	for _, root := range a.config.UploadRoots {
+		root = normalizedUploadRootConfig(root)
+		summaries = append(summaries, UploadRootSummary{
+			Key:      root.Key,
+			Path:     root.Path,
+			TempPath: root.TempPath,
+		})
+	}
+	return summaries
+}
+
+// UploadRootStatuses checks administrator-configured upload roots.
+func (a *AgentRuntime) UploadRootStatuses() []UploadRootSummary {
+	a.mu.RLock()
+	roots := append([]config.UploadRootConfig(nil), a.config.UploadRoots...)
+	a.mu.RUnlock()
+
+	return uploadRootStatusSummaries(roots)
+}
+
+func uploadRootStatusSummaries(roots []config.UploadRootConfig) []UploadRootSummary {
+	if len(roots) == 0 {
+		return []UploadRootSummary{}
+	}
+	summaries := make([]UploadRootSummary, 0, len(roots))
+	for _, root := range roots {
+		summaries = append(summaries, uploadRootStatus(root))
+	}
+	return summaries
+}
+
+func uploadRootStatus(root config.UploadRootConfig) UploadRootSummary {
+	root = normalizedUploadRootConfig(root)
+	summary := UploadRootSummary{
+		Key:      root.Key,
+		Path:     root.Path,
+		TempPath: root.TempPath,
+		Status:   "blocked",
+	}
+	info, err := os.Stat(root.Path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			summary.Message = "Upload root path does not exist."
+			return summary
+		}
+		summary.Message = "Upload root path could not be inspected."
+		return summary
+	}
+	if !info.IsDir() {
+		summary.Message = "Upload root path is not a directory."
+		return summary
+	}
+	if err := probeWritableDirectory(root.Path, ".timich-upload-root-check-*"); err != nil {
+		summary.Message = "Upload root path is not writable."
+		return summary
+	}
+	if err := ensureUploadTempDir(root); err != nil {
+		summary.Message = "Upload temp path could not be prepared."
+		return summary
+	}
+	tempDir, err := uploadTempAbsoluteDir(root)
+	if err != nil {
+		summary.Message = "Upload temp path is invalid."
+		return summary
+	}
+	if err := probeWritableDirectory(tempDir, ".timich-upload-temp-check-*"); err != nil {
+		summary.Message = "Upload temp path is not writable."
+		return summary
+	}
+	summary.Status = "ready"
+	summary.Writable = true
+	summary.Message = "Upload root is writable."
+	return summary
+}
+
+func probeWritableDirectory(dir string, pattern string) error {
+	probe, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return err
+	}
+	probePath := probe.Name()
+	closeErr := probe.Close()
+	removeErr := os.Remove(probePath)
+	if closeErr != nil {
+		return closeErr
+	}
+	return removeErr
+}
+
 func (a *AgentRuntime) primaryDatasourceLocked() PrimaryDatasourceResponse {
 	if len(a.config.Datasources) == 0 {
 		return PrimaryDatasourceResponse{}
@@ -619,12 +822,30 @@ func (a *AgentRuntime) ActivePairingSession(code string) (pairing.PairingSession
 
 // RedeemPairing redeems a one-time pairing code on the LAN-facing media surface.
 func (a *AgentRuntime) RedeemPairing(code string, deviceName string, baseURL string) (pairing.SessionBundle, error) {
-	return a.pairing.RedeemPairing(code, deviceName, baseURL)
+	bundle, err := a.pairing.RedeemPairing(code, deviceName, baseURL)
+	if err != nil {
+		return pairing.SessionBundle{}, err
+	}
+	if err := a.ensureDeviceProfile(bundle.DeviceID); err != nil {
+		_ = a.registry.RevokeDevice(bundle.DeviceID)
+		_ = a.profiles.DeleteProfile(bundle.DeviceID)
+		return pairing.SessionBundle{}, err
+	}
+	return bundle, nil
 }
 
 // CreateHostedSession provisions a remote app session for relay-backed browsing.
 func (a *AgentRuntime) CreateHostedSession(deviceName string, baseURL string) (pairing.SessionBundle, error) {
-	return a.pairing.CreateHostedSession(deviceName, baseURL)
+	bundle, err := a.pairing.CreateHostedSession(deviceName, baseURL)
+	if err != nil {
+		return pairing.SessionBundle{}, err
+	}
+	if err := a.ensureDeviceProfile(bundle.DeviceID); err != nil {
+		_ = a.registry.RevokeDevice(bundle.DeviceID)
+		_ = a.profiles.DeleteProfile(bundle.DeviceID)
+		return pairing.SessionBundle{}, err
+	}
+	return bundle, nil
 }
 
 // RefreshAppSession rotates an app-device refresh token family and returns a new session bundle.
@@ -670,20 +891,334 @@ func (a *AgentRuntime) DeviceSummaries() []DeviceSummary {
 	snapshot := a.registry.Snapshot()
 	devices := make([]DeviceSummary, 0, len(snapshot.Devices))
 	for _, device := range snapshot.Devices {
-		devices = append(devices, DeviceSummary{
-			DeviceID:              device.DeviceID,
-			DeviceName:            device.DeviceName,
-			CreatedAt:             device.CreatedAt,
-			LastRefreshedAt:       device.LastRefreshedAt,
-			RefreshTokenExpiresAt: device.RefreshTokenExpiresAt,
-		})
+		devices = append(devices, deviceSummary(device))
 	}
 	return devices
 }
 
+// UpdateDevice updates administrator-visible paired-device metadata.
+func (a *AgentRuntime) UpdateDevice(deviceID string, input DeviceUpdate) (DeviceSummary, error) {
+	device, err := a.registry.RenameDevice(deviceID, input.DeviceName)
+	if err != nil {
+		return DeviceSummary{}, err
+	}
+	if _, err := a.profiles.EnsureProfile(device, time.Now().UTC()); err != nil {
+		return DeviceSummary{}, err
+	}
+	return deviceSummary(device), nil
+}
+
+// DeviceUploadPolicy returns the admin upload policy for a paired device.
+func (a *AgentRuntime) DeviceUploadPolicy(deviceID string) (DeviceUploadPolicyResponse, error) {
+	device, err := a.deviceRecord(deviceID)
+	if err != nil {
+		return DeviceUploadPolicyResponse{}, err
+	}
+	profile, err := a.profiles.EnsureProfile(device, time.Now().UTC())
+	if err != nil {
+		return DeviceUploadPolicyResponse{}, err
+	}
+	return a.deviceUploadPolicyResponse(device, profile), nil
+}
+
+// UpdateDeviceUploadPolicy updates administrator-owned upload policy for one paired device.
+func (a *AgentRuntime) UpdateDeviceUploadPolicy(deviceID string, input DeviceUploadPolicyUpdate) (DeviceUploadPolicyResponse, error) {
+	device, err := a.deviceRecord(deviceID)
+	if err != nil {
+		return DeviceUploadPolicyResponse{}, err
+	}
+	upload, err := a.normalizedDeviceUploadPolicy(input)
+	if err != nil {
+		return DeviceUploadPolicyResponse{}, err
+	}
+	now := time.Now().UTC()
+	if _, err := a.profiles.EnsureProfile(device, now); err != nil {
+		return DeviceUploadPolicyResponse{}, err
+	}
+	profile, err := a.profiles.UpdateUploadProfile(device.DeviceID, upload, now)
+	if err != nil {
+		return DeviceUploadPolicyResponse{}, err
+	}
+	return a.deviceUploadPolicyResponse(device, profile), nil
+}
+
+func (a *AgentRuntime) normalizedDeviceUploadPolicy(input DeviceUploadPolicyUpdate) (store.DeviceUploadProfile, error) {
+	rootKey := strings.TrimSpace(input.RootKey)
+	pathPattern := strings.TrimSpace(input.PathPattern)
+	if pathPattern == "" {
+		pathPattern = store.DefaultUploadPathPattern()
+	}
+	if err := validateUploadPathPattern(pathPattern); err != nil {
+		return store.DeviceUploadProfile{}, err
+	}
+	if input.Enabled {
+		if rootKey == "" {
+			return store.DeviceUploadProfile{}, ErrUploadRootNotFound
+		}
+		if !a.uploadRootConfigured(rootKey) {
+			return store.DeviceUploadProfile{}, ErrUploadRootNotFound
+		}
+	} else if rootKey != "" && !a.uploadRootConfigured(rootKey) {
+		return store.DeviceUploadProfile{}, ErrUploadRootNotFound
+	}
+	if input.CapturedAfter != nil {
+		capturedAfter := input.CapturedAfter.UTC()
+		input.CapturedAfter = &capturedAfter
+	}
+	return store.DeviceUploadProfile{
+		Enabled:       input.Enabled,
+		RootKey:       rootKey,
+		PathPattern:   pathPattern,
+		CapturedAfter: input.CapturedAfter,
+	}, nil
+}
+
+func validateUploadPathPattern(pattern string) error {
+	if strings.TrimSpace(pattern) == "" {
+		return ErrUploadPolicyInvalid
+	}
+	if path.IsAbs(pattern) {
+		return ErrUploadPolicyInvalid
+	}
+	for _, segment := range strings.Split(pattern, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return ErrUploadPolicyInvalid
+		}
+	}
+	if strings.Contains(pattern, "\\") {
+		return ErrUploadPolicyInvalid
+	}
+	return nil
+}
+
+func (a *AgentRuntime) uploadRootConfigured(rootKey string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	for _, root := range a.config.UploadRoots {
+		if root.Key == rootKey {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *AgentRuntime) deviceUploadPolicyResponse(device store.DeviceRecord, profile store.DeviceProfile) DeviceUploadPolicyResponse {
+	return DeviceUploadPolicyResponse{
+		DeviceID:   device.DeviceID,
+		DeviceName: device.DeviceName,
+		Upload: DeviceUploadPolicy{
+			Enabled:       profile.Upload.Enabled,
+			RootKey:       profile.Upload.RootKey,
+			PathPattern:   profile.Upload.PathPattern,
+			CapturedAfter: profile.Upload.CapturedAfter,
+			UpdatedAt:     profile.Upload.UpdatedAt,
+		},
+		Status: a.deviceUploadPolicyStatus(profile.Upload),
+	}
+}
+
+func deviceSummary(device store.DeviceRecord) DeviceSummary {
+	return DeviceSummary{
+		DeviceID:              device.DeviceID,
+		DeviceName:            device.DeviceName,
+		CreatedAt:             device.CreatedAt,
+		LastRefreshedAt:       device.LastRefreshedAt,
+		RefreshTokenExpiresAt: device.RefreshTokenExpiresAt,
+	}
+}
+
+func (a *AgentRuntime) deviceUploadPolicyStatus(upload store.DeviceUploadProfile) DeviceUploadPolicyStatus {
+	if !upload.Enabled {
+		return DeviceUploadPolicyStatus{
+			State:  "disabled",
+			Reason: "Upload is disabled for this device.",
+		}
+	}
+	if strings.TrimSpace(upload.RootKey) == "" {
+		return DeviceUploadPolicyStatus{
+			State:  "blocked",
+			Reason: "Upload root is not selected.",
+		}
+	}
+	root, ok := a.uploadRootConfig(upload.RootKey)
+	if !ok {
+		return DeviceUploadPolicyStatus{
+			State:  "blocked",
+			Reason: "Upload root is not configured.",
+		}
+	}
+	rootStatus := uploadRootStatus(root)
+	if !rootStatus.Writable {
+		return DeviceUploadPolicyStatus{
+			State:  "blocked",
+			Reason: rootStatus.Message,
+			Root:   &rootStatus,
+		}
+	}
+	return DeviceUploadPolicyStatus{
+		State: "ready",
+		Root:  &rootStatus,
+	}
+}
+
 // RevokeDevice removes a paired app device from the local registry.
 func (a *AgentRuntime) RevokeDevice(deviceID string) error {
-	return a.registry.RevokeDevice(deviceID)
+	registryErr := a.registry.RevokeDevice(deviceID)
+	if registryErr != nil && !errors.Is(registryErr, store.ErrDeviceNotFound) {
+		return registryErr
+	}
+	if _, err := a.resetDeviceUploadState(UploadResetInput{DeviceID: deviceID}); err != nil && !errors.Is(err, store.ErrDeviceNotFound) {
+		return err
+	}
+	if err := a.profiles.DeleteProfile(deviceID); err != nil {
+		return err
+	}
+	return registryErr
+}
+
+// ResetDeviceUploadState removes local upload state for a paired device/date range.
+func (a *AgentRuntime) ResetDeviceUploadState(input UploadResetInput) (UploadResetResponse, error) {
+	input.DeviceID = strings.TrimSpace(input.DeviceID)
+	if input.DeviceID == "" {
+		return UploadResetResponse{}, store.ErrDeviceNotFound
+	}
+	if _, err := a.deviceRecord(input.DeviceID); err != nil {
+		return UploadResetResponse{}, err
+	}
+	input.RequireDateRange = true
+	return a.resetDeviceUploadState(input)
+}
+
+func (a *AgentRuntime) resetDeviceUploadState(input UploadResetInput) (UploadResetResponse, error) {
+	a.uploadMu.Lock()
+	defer a.uploadMu.Unlock()
+
+	if input.RequireDateRange && (input.CapturedAfter == nil || input.CapturedBefore == nil) {
+		return UploadResetResponse{}, ErrUploadResetRangeRequired
+	}
+	if input.CapturedAfter != nil && input.CapturedBefore != nil && !input.CapturedAfter.Before(*input.CapturedBefore) {
+		return UploadResetResponse{}, ErrUploadResetInvalid
+	}
+	result, err := a.uploads.ResetDeviceUploadState(store.UploadResetInput{
+		DeviceID:       input.DeviceID,
+		CapturedAfter:  input.CapturedAfter,
+		CapturedBefore: input.CapturedBefore,
+		Reason:         input.Reason,
+		Now:            time.Now().UTC(),
+	})
+	if err != nil {
+		return UploadResetResponse{}, err
+	}
+	removed, cleanupErrors := a.removeUploadTempFiles(result.TempFiles)
+	return UploadResetResponse{
+		DeviceID:              result.DeviceID,
+		CapturedAfter:         result.CapturedAfter,
+		CapturedBefore:        result.CapturedBefore,
+		ResetAt:               result.ResetAt,
+		RemovedUploadedAssets: result.RemovedUploadedAssets,
+		RemovedSessions:       result.RemovedSessions,
+		RemovedTempFiles:      removed,
+		TempCleanupErrors:     cleanupErrors,
+	}, nil
+}
+
+func (a *AgentRuntime) removeUploadTempFiles(files []store.UploadTempFile) (int64, []string) {
+	if len(files) == 0 {
+		return 0, nil
+	}
+	a.mu.RLock()
+	roots := make(map[string]config.UploadRootConfig, len(a.config.UploadRoots))
+	for _, root := range a.config.UploadRoots {
+		root = normalizedUploadRootConfig(root)
+		roots[root.Key] = root
+	}
+	a.mu.RUnlock()
+	var removed int64
+	var cleanupErrors []string
+	for _, file := range files {
+		root, ok := roots[file.RootKey]
+		if !ok {
+			cleanupErrors = append(cleanupErrors, "upload root is not configured for temp cleanup")
+			continue
+		}
+		didRemove, err := removeUploadTempFile(root, file.RelativePath)
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, err.Error())
+			continue
+		}
+		if didRemove {
+			removed++
+		}
+	}
+	return removed, cleanupErrors
+}
+
+func normalizedUploadRootConfig(root config.UploadRootConfig) config.UploadRootConfig {
+	if tempPath, err := config.ValidateUploadRootTempPath(root.TempPath); err == nil {
+		root.TempPath = tempPath
+	}
+	return root
+}
+
+func removeUploadTempFile(root config.UploadRootConfig, relativePath string) (bool, error) {
+	cleanRelative := path.Clean(strings.TrimSpace(relativePath))
+	cleanTempDir, err := uploadTempRelativeDir(root)
+	if err != nil {
+		return false, err
+	}
+	if cleanRelative == "." || path.IsAbs(cleanRelative) || path.Dir(cleanRelative) != cleanTempDir {
+		return false, ErrUploadPolicyInvalid
+	}
+	tempDirExists, err := uploadTempDirExists(root)
+	if err != nil {
+		return false, err
+	}
+	if !tempDirExists {
+		return false, nil
+	}
+	fullPath := filepath.Join(root.Path, filepath.FromSlash(cleanRelative))
+	if info, err := os.Lstat(fullPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	} else if info.IsDir() {
+		return false, ErrUploadPolicyInvalid
+	}
+	if err := os.Remove(fullPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (a *AgentRuntime) deviceRecord(deviceID string) (store.DeviceRecord, error) {
+	normalizedDeviceID := strings.TrimSpace(deviceID)
+	if normalizedDeviceID == "" {
+		return store.DeviceRecord{}, store.ErrDeviceNotFound
+	}
+	snapshot := a.registry.Snapshot()
+	for _, device := range snapshot.Devices {
+		if device.DeviceID == normalizedDeviceID {
+			return device, nil
+		}
+	}
+	return store.DeviceRecord{}, store.ErrDeviceNotFound
+}
+
+func (a *AgentRuntime) ensureDeviceProfile(deviceID string) error {
+	snapshot := a.registry.Snapshot()
+	for _, device := range snapshot.Devices {
+		if device.DeviceID != deviceID {
+			continue
+		}
+		_, err := a.profiles.EnsureProfile(device, time.Now().UTC())
+		return err
+	}
+	return store.ErrDeviceNotFound
 }
 
 // SearchAssets returns one app-facing search page with Timich-owned opaque asset IDs.

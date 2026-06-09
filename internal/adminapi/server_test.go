@@ -176,6 +176,33 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 	if !bytes.Contains(body, []byte("Datasource is configured and reachable from this Agent")) {
 		t.Fatalf("dashboard body is missing datasource reachable setup summary: %s", recorder.Body.String())
 	}
+	if !bytes.Contains(body, []byte("Device Uploads")) {
+		t.Fatalf("dashboard body is missing device upload section: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("/v1/uploads/roots")) {
+		t.Fatalf("dashboard body is missing upload roots API call: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("upload-policy")) {
+		t.Fatalf("dashboard body is missing upload policy API call: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("Device List")) || !bytes.Contains(body, []byte("Device name (display)")) || !bytes.Contains(body, []byte("device-summary")) {
+		t.Fatalf("dashboard body is missing device list summary layout: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("data-device-rename")) || !bytes.Contains(body, []byte("Device name settings")) || !bytes.Contains(body, []byte("Save device name")) {
+		t.Fatalf("dashboard body is missing device name settings control: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("device-subsection device-upload-section")) || !bytes.Contains(body, []byte("Upload settings")) {
+		t.Fatalf("dashboard body is missing upload settings subsection: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte(`input[type="checkbox"]`)) || !bytes.Contains(body, []byte("checkbox-label")) {
+		t.Fatalf("dashboard body is missing compact checkbox styling: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("effectiveDeviceUploadStatus")) {
+		t.Fatalf("dashboard body is missing effective upload status helper: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("tempCleanupErrors")) {
+		t.Fatalf("dashboard body is missing temp cleanup warning handling: %s", recorder.Body.String())
+	}
 }
 
 func TestDashboardDatasourceSaveFailureRestoresStatusBeforeError(t *testing.T) {
@@ -250,7 +277,12 @@ func TestAdminRoutesRequireAuthentication(t *testing.T) {
 		{method: http.MethodPost, path: "/v1/compatibility-check"},
 		{method: http.MethodGet, path: "/v1/update-check"},
 		{method: http.MethodPost, path: "/v1/restart"},
+		{method: http.MethodGet, path: "/v1/uploads/roots"},
 		{method: http.MethodGet, path: "/v1/devices"},
+		{method: http.MethodPut, path: "/v1/devices/device-1"},
+		{method: http.MethodGet, path: "/v1/devices/device-1/upload-policy"},
+		{method: http.MethodPut, path: "/v1/devices/device-1/upload-policy"},
+		{method: http.MethodPost, path: "/v1/devices/device-1/upload-reset"},
 	}
 
 	for _, tc := range tests {
@@ -983,7 +1015,8 @@ func TestDevicesListAndRevoke(t *testing.T) {
 	}
 	var listPayload struct {
 		Devices []struct {
-			DeviceID string `json:"deviceId"`
+			DeviceID   string `json:"deviceId"`
+			DeviceName string `json:"deviceName"`
 		} `json:"devices"`
 	}
 	if err := json.Unmarshal(listRecorder.Body.Bytes(), &listPayload); err != nil {
@@ -991,6 +1024,38 @@ func TestDevicesListAndRevoke(t *testing.T) {
 	}
 	if len(listPayload.Devices) != 1 || listPayload.Devices[0].DeviceID != created.DeviceID {
 		t.Fatalf("devices = %#v, want created device", listPayload.Devices)
+	}
+
+	renameRecorder := httptest.NewRecorder()
+	renameBody := bytes.NewReader([]byte(`{"deviceName":"Alice iPhone"}`))
+	handler.ServeHTTP(renameRecorder, authenticatedRequest(http.MethodPut, "/v1/devices/"+created.DeviceID, renameBody))
+	if renameRecorder.Code != http.StatusOK {
+		t.Fatalf("rename status = %d, want 200 body=%s", renameRecorder.Code, renameRecorder.Body.String())
+	}
+	var renamePayload struct {
+		DeviceID   string `json:"deviceId"`
+		DeviceName string `json:"deviceName"`
+	}
+	if err := json.Unmarshal(renameRecorder.Body.Bytes(), &renamePayload); err != nil {
+		t.Fatalf("rename response is not JSON: %v body=%s", err, renameRecorder.Body.String())
+	}
+	if renamePayload.DeviceID != created.DeviceID || renamePayload.DeviceName != "Alice iPhone" {
+		t.Fatalf("rename payload = %+v, want renamed device", renamePayload)
+	}
+	invalidRenameRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(invalidRenameRecorder, authenticatedRequest(http.MethodPut, "/v1/devices/"+created.DeviceID, bytes.NewReader([]byte(`{"deviceName":" "}`))))
+	assertErrorPayload(t, invalidRenameRecorder, http.StatusBadRequest, "device_name_invalid")
+
+	renamedListRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(renamedListRecorder, authenticatedRequest(http.MethodGet, "/v1/devices", nil))
+	if renamedListRecorder.Code != http.StatusOK {
+		t.Fatalf("renamed list status = %d, want 200 body=%s", renamedListRecorder.Code, renamedListRecorder.Body.String())
+	}
+	if err := json.Unmarshal(renamedListRecorder.Body.Bytes(), &listPayload); err != nil {
+		t.Fatalf("renamed list response is not JSON: %v body=%s", err, renamedListRecorder.Body.String())
+	}
+	if len(listPayload.Devices) != 1 || listPayload.Devices[0].DeviceName != "Alice iPhone" {
+		t.Fatalf("renamed devices = %#v, want Alice iPhone", listPayload.Devices)
 	}
 
 	revokeRecorder := httptest.NewRecorder()
@@ -1001,6 +1066,116 @@ func TestDevicesListAndRevoke(t *testing.T) {
 	if _, err := runtime.RefreshAppSession(created.RefreshToken, "https://timich.example"); !errors.Is(err, store.ErrRefreshTokenNotFound) {
 		t.Fatalf("RefreshAppSession() error = %v, want %v", err, store.ErrRefreshTokenNotFound)
 	}
+}
+
+func TestUploadRootsAndDevicePolicyEndpoints(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	runtime := newTestRuntimeWithConfig(t, 5, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.UploadRoots = []config.UploadRootConfig{{Key: "nas-photos", Path: rootPath}}
+	})
+	created, err := runtime.CreateHostedSession("Upload iPhone", "https://timich.example")
+	if err != nil {
+		t.Fatalf("CreateHostedSession() error = %v", err)
+	}
+	profiles, err := store.LoadOrCreateDeviceProfileStore(runtime.ConfigResponse().DataDir)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceProfileStore() error = %v", err)
+	}
+	if err := profiles.DeleteProfile(created.DeviceID); err != nil {
+		t.Fatalf("DeleteProfile() error = %v", err)
+	}
+	handler := NewMux(runtime)
+
+	rootsRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(rootsRecorder, authenticatedRequest(http.MethodGet, "/v1/uploads/roots", nil))
+	if rootsRecorder.Code != http.StatusOK {
+		t.Fatalf("roots status = %d, want 200 body=%s", rootsRecorder.Code, rootsRecorder.Body.String())
+	}
+	var rootsPayload struct {
+		Roots []struct {
+			Key      string `json:"key"`
+			TempPath string `json:"tempPath"`
+			Status   string `json:"status"`
+			Writable bool   `json:"writable"`
+		} `json:"roots"`
+	}
+	if err := json.Unmarshal(rootsRecorder.Body.Bytes(), &rootsPayload); err != nil {
+		t.Fatalf("roots response is not JSON: %v body=%s", err, rootsRecorder.Body.String())
+	}
+	if len(rootsPayload.Roots) != 1 ||
+		rootsPayload.Roots[0].Key != "nas-photos" ||
+		rootsPayload.Roots[0].TempPath != config.DefaultUploadRootTempPath ||
+		rootsPayload.Roots[0].Status != "ready" ||
+		!rootsPayload.Roots[0].Writable {
+		t.Fatalf("roots payload = %+v, want writable nas-photos", rootsPayload.Roots)
+	}
+
+	updateBody := bytes.NewReader([]byte(`{"enabled":true,"rootKey":"nas-photos","pathPattern":"{deviceName}/{yyyy}-{MM}-{dd}/{filename}","capturedAfter":"2026-05-01T00:00:00Z"}`))
+	updateRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(updateRecorder, authenticatedRequest(http.MethodPut, "/v1/devices/"+created.DeviceID+"/upload-policy", updateBody))
+	if updateRecorder.Code != http.StatusOK {
+		t.Fatalf("policy update status = %d, want 200 body=%s", updateRecorder.Code, updateRecorder.Body.String())
+	}
+	var policyPayload struct {
+		DeviceID string `json:"deviceId"`
+		Upload   struct {
+			Enabled bool   `json:"enabled"`
+			RootKey string `json:"rootKey"`
+		} `json:"upload"`
+		Status struct {
+			State string `json:"state"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(updateRecorder.Body.Bytes(), &policyPayload); err != nil {
+		t.Fatalf("policy response is not JSON: %v body=%s", err, updateRecorder.Body.String())
+	}
+	if policyPayload.DeviceID != created.DeviceID || !policyPayload.Upload.Enabled || policyPayload.Upload.RootKey != "nas-photos" || policyPayload.Status.State != "ready" {
+		t.Fatalf("policy payload = %+v, want enabled ready policy", policyPayload)
+	}
+
+	resetBody := bytes.NewReader([]byte(`{"capturedAfter":"2026-05-01T00:00:00Z","capturedBefore":"2026-06-01T00:00:00Z","reason":"test"}`))
+	resetRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(resetRecorder, authenticatedRequest(http.MethodPost, "/v1/devices/"+created.DeviceID+"/upload-reset", resetBody))
+	if resetRecorder.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want 200 body=%s", resetRecorder.Code, resetRecorder.Body.String())
+	}
+	var resetPayload struct {
+		DeviceID string `json:"deviceId"`
+		ResetAt  string `json:"resetAt"`
+	}
+	if err := json.Unmarshal(resetRecorder.Body.Bytes(), &resetPayload); err != nil {
+		t.Fatalf("reset response is not JSON: %v body=%s", err, resetRecorder.Body.String())
+	}
+	if resetPayload.DeviceID != created.DeviceID || resetPayload.ResetAt == "" {
+		t.Fatalf("reset payload = %+v, want device reset response", resetPayload)
+	}
+}
+
+func TestUploadPolicyRejectsUnknownRootAndResetRequiresRange(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestRuntime(t, 5)
+	created, err := runtime.CreateHostedSession("Upload iPhone", "https://timich.example")
+	if err != nil {
+		t.Fatalf("CreateHostedSession() error = %v", err)
+	}
+	handler := NewMux(runtime)
+
+	updateRecorder := httptest.NewRecorder()
+	updateBody := bytes.NewReader([]byte(`{"enabled":true,"rootKey":"missing-root","pathPattern":"{deviceName}/{filename}"}`))
+	handler.ServeHTTP(updateRecorder, authenticatedRequest(http.MethodPut, "/v1/devices/"+created.DeviceID+"/upload-policy", updateBody))
+	assertErrorPayload(t, updateRecorder, http.StatusBadRequest, "upload_root_not_found")
+
+	resetRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(resetRecorder, authenticatedRequest(http.MethodPost, "/v1/devices/"+created.DeviceID+"/upload-reset", bytes.NewReader([]byte(`{}`))))
+	assertErrorPayload(t, resetRecorder, http.StatusBadRequest, "upload_reset_range_required")
+
+	invalidRangeRecorder := httptest.NewRecorder()
+	invalidRangeBody := bytes.NewReader([]byte(`{"capturedAfter":"2026-06-01T00:00:00Z","capturedBefore":"2026-05-01T00:00:00Z"}`))
+	handler.ServeHTTP(invalidRangeRecorder, authenticatedRequest(http.MethodPost, "/v1/devices/"+created.DeviceID+"/upload-reset", invalidRangeBody))
+	assertErrorPayload(t, invalidRangeRecorder, http.StatusBadRequest, "upload_reset_invalid")
 }
 
 func authenticatedRequest(method string, path string, body *bytes.Reader) *http.Request {

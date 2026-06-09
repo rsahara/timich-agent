@@ -100,6 +100,39 @@ func TestDeviceRegistryStoreRevokeDevice(t *testing.T) {
 	}
 }
 
+func TestDeviceRegistryStoreRenameDevice(t *testing.T) {
+	t.Parallel()
+
+	registry, err := LoadOrCreateDeviceRegistry(t.TempDir(), 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+
+	now := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	device, err := registry.CreateHostedDevice("Old iPhone", now, now.Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("CreateHostedDevice() error = %v", err)
+	}
+
+	renamed, err := registry.RenameDevice(device.DeviceID, " New iPhone ")
+	if err != nil {
+		t.Fatalf("RenameDevice() error = %v", err)
+	}
+	if renamed.DeviceID != device.DeviceID || renamed.DeviceName != "New iPhone" {
+		t.Fatalf("RenameDevice() = %+v, want same device id with new name", renamed)
+	}
+	snapshot := registry.Snapshot()
+	if len(snapshot.Devices) != 1 || snapshot.Devices[0].DeviceName != "New iPhone" {
+		t.Fatalf("Snapshot().Devices = %+v, want renamed device", snapshot.Devices)
+	}
+	if _, err := registry.RenameDevice(device.DeviceID, " "); !errors.Is(err, ErrDeviceNameInvalid) {
+		t.Fatalf("RenameDevice(empty) error = %v, want %v", err, ErrDeviceNameInvalid)
+	}
+	if _, err := registry.RenameDevice("missing", "Other"); !errors.Is(err, ErrDeviceNotFound) {
+		t.Fatalf("RenameDevice(missing) error = %v, want %v", err, ErrDeviceNotFound)
+	}
+}
+
 func TestDeviceRegistryStoreRevokeDeviceKeepsDeviceOnPersistError(t *testing.T) {
 	t.Parallel()
 

@@ -2,7 +2,7 @@
 
 -include ../../versions.mk
 
-TIMICH_AGENT_VERSION ?= 0.2.1
+TIMICH_AGENT_VERSION ?= 0.3.0
 TIMICH_AGENT_DIST_REPO ?= rsahara/timich-agent
 TIMICH_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 TIMICH_BUILT_AT ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -145,6 +145,7 @@ dist:
 		'      TIMICH_AGENT_NAME: "$${TIMICH_AGENT_NAME:-Timich Agent}"' \
 		'      TIMICH_AGENT_DEVICE_LIMIT: "$${TIMICH_AGENT_DEVICE_LIMIT:-32}"' \
 		'      TIMICH_AGENT_MEDIA_PUBLISHED_ADDR: "$${TIMICH_AGENT_MEDIA_PUBLISHED_ADDR:-$${TIMICH_AGENT_MEDIA_PORT:-8082}}"' \
+		'      TIMICH_AGENT_TIMEZONE: "$${TIMICH_AGENT_TIMEZONE:-}"' \
 		'      TIMICH_AGENT_REMOTE_BROWSING_ENABLED: "$${TIMICH_AGENT_REMOTE_BROWSING_ENABLED:-true}"' \
 		"    ports:" \
 		'      - "$${TIMICH_AGENT_ADMIN_PORT:-8081}:8081"' \
@@ -165,6 +166,10 @@ dist:
 		"" \
 		"# Maximum number of paired app devices allowed by this agent." \
 		"TIMICH_AGENT_DEVICE_LIMIT=32" \
+		"" \
+		"# Optional IANA timezone for agent-local dates, such as upload path date tokens." \
+		"# Leave empty to use the container/process timezone." \
+		"# TIMICH_AGENT_TIMEZONE=Asia/Tokyo" \
 		"" \
 		"# Remote Browsing starts automatically after admin setup, datasource setup, and app pairing." \
 		"# Set this to false to keep the agent local-only." \

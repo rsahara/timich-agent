@@ -56,6 +56,7 @@ func NewMuxWithOptions(runtime *runtimestate.AgentRuntime, options Options) http
 	mux.HandleFunc("/v1/compatibility-check", api.requireAdmin(api.compatibilityCheck))
 	mux.HandleFunc("/v1/update-check", api.requireAdmin(api.updateCheck))
 	mux.HandleFunc("/v1/restart", api.requireAdmin(api.restart))
+	mux.HandleFunc("/v1/uploads/roots", api.requireAdmin(api.uploadRoots))
 	mux.HandleFunc("/v1/devices", api.requireAdmin(api.devices))
 	mux.HandleFunc("/v1/devices/", api.requireAdmin(api.device))
 	return mux
@@ -389,18 +390,75 @@ func (s *server) devices(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *server) device(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		writeMethodNotAllowed(w, "Use DELETE to revoke a paired device.")
+func (s *server) uploadRoots(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, "Use GET to list upload roots.")
 		return
 	}
-	deviceID := strings.TrimPrefix(r.URL.Path, "/v1/devices/")
-	deviceID = strings.TrimSpace(deviceID)
-	if deviceID == "" || strings.Contains(deviceID, "/") {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"roots": s.runtime.UploadRootStatuses(),
+	})
+}
+
+func (s *server) device(w http.ResponseWriter, r *http.Request) {
+	devicePath := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/devices/"), "/")
+	segments := strings.Split(devicePath, "/")
+	if len(segments) == 0 || strings.TrimSpace(segments[0]) == "" {
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error":   "device_not_found",
 			"message": "The paired device was not found.",
 		})
+		return
+	}
+	deviceID := strings.TrimSpace(segments[0])
+	if len(segments) == 1 {
+		s.deviceMetadata(w, r, deviceID)
+		return
+	}
+	if len(segments) != 2 {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error":   "device_route_not_found",
+			"message": "The paired device route was not found.",
+		})
+		return
+	}
+	switch segments[1] {
+	case "upload-policy":
+		s.deviceUploadPolicy(w, r, deviceID)
+	case "upload-reset":
+		s.deviceUploadReset(w, r, deviceID)
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error":   "device_route_not_found",
+			"message": "The paired device route was not found.",
+		})
+	}
+}
+
+func (s *server) deviceMetadata(w http.ResponseWriter, r *http.Request, deviceID string) {
+	switch r.Method {
+	case http.MethodPut:
+		var request runtimestate.DeviceUpdate
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the device update request.")
+			return
+		}
+		device, err := s.runtime.UpdateDevice(deviceID, request)
+		if err != nil {
+			writeDeviceError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, device)
+	case http.MethodDelete:
+		s.revokeDevice(w, r, deviceID)
+	default:
+		writeMethodNotAllowed(w, "Use PUT to rename or DELETE to revoke a paired device.")
+	}
+}
+
+func (s *server) revokeDevice(w http.ResponseWriter, r *http.Request, deviceID string) {
+	if r.Method != http.MethodDelete {
+		writeMethodNotAllowed(w, "Use DELETE to revoke a paired device.")
 		return
 	}
 	if err := s.runtime.RevokeDevice(deviceID); err != nil {
@@ -418,6 +476,50 @@ func (s *server) device(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) deviceUploadPolicy(w http.ResponseWriter, r *http.Request, deviceID string) {
+	switch r.Method {
+	case http.MethodGet:
+		policy, err := s.runtime.DeviceUploadPolicy(deviceID)
+		if err != nil {
+			writeUploadError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, policy)
+	case http.MethodPut:
+		var request runtimestate.DeviceUploadPolicyUpdate
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the upload policy request.")
+			return
+		}
+		policy, err := s.runtime.UpdateDeviceUploadPolicy(deviceID, request)
+		if err != nil {
+			writeUploadError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, policy)
+	default:
+		writeMethodNotAllowed(w, "Use GET or PUT for device upload policy.")
+	}
+}
+
+func (s *server) deviceUploadReset(w http.ResponseWriter, r *http.Request, deviceID string) {
+	if !requirePost(w, r, "Use POST to reset device upload state.") {
+		return
+	}
+	var request runtimestate.UploadResetInput
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the upload reset request.")
+		return
+	}
+	request.DeviceID = deviceID
+	response, err := s.runtime.ResetDeviceUploadState(request)
+	if err != nil {
+		writeUploadError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
@@ -483,6 +585,34 @@ func writeDatasourceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "datasource_access_token_required", "Immich API key is required for the datasource.")
 	default:
 		writeError(w, http.StatusBadRequest, "datasource_invalid", "Could not save the datasource configuration.")
+	}
+}
+
+func writeDeviceError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrDeviceNotFound):
+		writeError(w, http.StatusNotFound, "device_not_found", "The paired device was not found.")
+	case errors.Is(err, store.ErrDeviceNameInvalid):
+		writeError(w, http.StatusBadRequest, "device_name_invalid", "Device name is required.")
+	default:
+		writeError(w, http.StatusInternalServerError, "device_update_failed", "Could not update the paired device.")
+	}
+}
+
+func writeUploadError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrDeviceNotFound):
+		writeError(w, http.StatusNotFound, "device_not_found", "The paired device was not found.")
+	case errors.Is(err, runtimestate.ErrUploadRootNotFound):
+		writeError(w, http.StatusBadRequest, "upload_root_not_found", "Select a configured upload root.")
+	case errors.Is(err, runtimestate.ErrUploadResetRangeRequired):
+		writeError(w, http.StatusBadRequest, "upload_reset_range_required", "Select a captured-at date range for upload reset.")
+	case errors.Is(err, runtimestate.ErrUploadResetInvalid):
+		writeError(w, http.StatusBadRequest, "upload_reset_invalid", "Select a valid captured-at date range for upload reset.")
+	case errors.Is(err, runtimestate.ErrUploadPolicyInvalid):
+		writeError(w, http.StatusBadRequest, "upload_policy_invalid", "Upload policy is invalid.")
+	default:
+		writeError(w, http.StatusInternalServerError, "upload_request_failed", "Could not update upload configuration.")
 	}
 }
 

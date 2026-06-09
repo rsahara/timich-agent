@@ -69,6 +69,7 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	t.Setenv("TIMICH_AGENT_MEDIA_LISTEN_ADDR", "0.0.0.0:19082")
 	t.Setenv("TIMICH_AGENT_MEDIA_PUBLISHED_ADDR", "18082")
 	t.Setenv("TIMICH_AGENT_DATA_DIR", "env-state")
+	t.Setenv("TIMICH_AGENT_TIMEZONE", "Asia/Tokyo")
 	t.Setenv("TIMICH_AGENT_DEVICE_LIMIT", "9")
 	t.Setenv("TIMICH_AGENT_APP_LINK_BASE_URL", "https://link.dev.timich.runo.jp")
 	t.Setenv("TIMICH_AGENT_RELAY_CONNECTION_ADDR", "https://relay-connection.example")
@@ -90,6 +91,9 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	if resolved.DataDir != filepath.Join(tempDir, "env-state") {
 		t.Fatalf("DataDir = %q, want env-state resolved from config directory", resolved.DataDir)
 	}
+	if resolved.Timezone != "Asia/Tokyo" {
+		t.Fatalf("Timezone = %q, want env override", resolved.Timezone)
+	}
 	if resolved.ControlPlaneAddress != "https://relay-connection.example" {
 		t.Fatalf("relay connection address = %q, want env override", resolved.ControlPlaneAddress)
 	}
@@ -107,6 +111,103 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	}
 	if resolved.Hosted.ServerURL != "https://relay.example" {
 		t.Fatalf("relay server URL = %q, want remote browsing env override", resolved.Hosted.ServerURL)
+	}
+}
+
+func TestLoadAcceptsUploadConfiguration(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	rootPath := filepath.Join(t.TempDir(), "uploads")
+	raw := []byte(`{
+  "timezone": " Asia/Tokyo ",
+  "uploadRoots": [
+    {"key": " nas-photos ", "path": " ` + filepath.ToSlash(rootPath) + ` "}
+  ]
+}
+`)
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.Timezone != "Asia/Tokyo" {
+		t.Fatalf("Timezone = %q, want Asia/Tokyo", resolved.Timezone)
+	}
+	if len(resolved.UploadRoots) != 1 {
+		t.Fatalf("UploadRoots length = %d, want 1", len(resolved.UploadRoots))
+	}
+	if resolved.UploadRoots[0].Key != "nas-photos" ||
+		resolved.UploadRoots[0].Path != rootPath ||
+		resolved.UploadRoots[0].TempPath != DefaultUploadRootTempPath {
+		t.Fatalf("UploadRoots[0] = %+v, want configured root with default temp path", resolved.UploadRoots[0])
+	}
+}
+
+func TestWriteFileNormalizesUploadConfiguration(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	rootPath := filepath.Join(t.TempDir(), "uploads")
+	cfg := Default()
+	cfg.DataDir = filepath.Join(t.TempDir(), "state")
+	cfg.Timezone = " Asia/Tokyo "
+	cfg.UploadRoots = []UploadRootConfig{
+		{Key: " nas-photos ", Path: " " + rootPath + " ", TempPath: " working/../working/.timich-upload-tmp "},
+	}
+
+	if err := WriteFile(configPath, cfg); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.Timezone != "Asia/Tokyo" {
+		t.Fatalf("Timezone = %q, want normalized timezone", loaded.Timezone)
+	}
+	if len(loaded.UploadRoots) != 1 {
+		t.Fatalf("UploadRoots length = %d, want 1", len(loaded.UploadRoots))
+	}
+	if loaded.UploadRoots[0].Key != "nas-photos" ||
+		loaded.UploadRoots[0].Path != rootPath ||
+		loaded.UploadRoots[0].TempPath != "working/.timich-upload-tmp" {
+		t.Fatalf("UploadRoots[0] = %+v, want normalized root", loaded.UploadRoots[0])
+	}
+}
+
+func TestLoadRejectsInvalidTimezone(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte("{\"timezone\":\"Mars/Olympus\"}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("Load() error = nil, want invalid timezone error")
+	}
+}
+
+func TestLoadRejectsInvalidUploadRoot(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{"uploadRoots":[{"key":"NAS Photos","path":"relative"}]}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("Load() error = nil, want invalid upload root error")
+	}
+}
+
+func TestLoadRejectsInvalidUploadRootTempPath(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	rootPath := filepath.Join(t.TempDir(), "uploads")
+	raw := []byte(`{"uploadRoots":[{"key":"nas-photos","path":"` + filepath.ToSlash(rootPath) + `","tempPath":"../outside"}]}` + "\n")
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("Load() error = nil, want invalid upload root temp path error")
 	}
 }
 
