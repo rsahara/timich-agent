@@ -25,6 +25,7 @@ var (
 	ErrPairingSessionUsed     = errors.New("pairing session already redeemed")
 	ErrDeviceLimitReached     = errors.New("device limit reached")
 	ErrDeviceNotFound         = errors.New("device not found")
+	ErrDeviceNameInvalid      = errors.New("device name invalid")
 	ErrRefreshTokenNotFound   = errors.New("refresh token not found")
 	ErrRefreshTokenExpired    = errors.New("refresh token expired")
 )
@@ -287,6 +288,40 @@ func (s *DeviceRegistryStore) HasDevice(deviceID string) bool {
 		}
 	}
 	return false
+}
+
+// RenameDevice updates administrator-visible paired-device metadata without
+// changing device identity, tokens, or upload state.
+func (s *DeviceRegistryStore) RenameDevice(deviceID string, deviceName string) (DeviceRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	normalizedDeviceID := strings.TrimSpace(deviceID)
+	if normalizedDeviceID == "" {
+		return DeviceRecord{}, ErrDeviceNotFound
+	}
+	normalizedDeviceName := strings.TrimSpace(deviceName)
+	if normalizedDeviceName == "" {
+		return DeviceRecord{}, ErrDeviceNameInvalid
+	}
+
+	s.cleanupExpiredLocked(time.Now().UTC())
+	for index, device := range s.registry.Devices {
+		if device.DeviceID != normalizedDeviceID {
+			continue
+		}
+		if device.DeviceName == normalizedDeviceName {
+			return device, nil
+		}
+		updated := cloneRegistry(s.registry)
+		updated.Devices[index].DeviceName = normalizedDeviceName
+		if err := writeDeviceRegistryFile(s.path, updated); err != nil {
+			return DeviceRecord{}, err
+		}
+		s.registry = updated
+		return s.registry.Devices[index], nil
+	}
+	return DeviceRecord{}, ErrDeviceNotFound
 }
 
 // RevokeDevice removes a paired app device and invalidates its refresh-token family.

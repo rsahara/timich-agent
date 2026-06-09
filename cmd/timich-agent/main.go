@@ -113,6 +113,12 @@ func serve(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err := runtime.Close(); err != nil {
+			log.Printf("timich-agent runtime close failed: %v", err)
+		}
+	}()
+	runtime.StartUploadMaintenance()
 
 	restartCh := make(chan struct{}, 1)
 	adminServer := &http.Server{

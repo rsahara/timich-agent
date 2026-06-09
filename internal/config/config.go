@@ -9,9 +9,13 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+	// Embed IANA timezone data so validation works in minimal container images.
+	_ "time/tzdata"
 
 	"github.com/rsahara/timich-agent/internal/atomicfile"
 )
@@ -42,6 +46,14 @@ type DatasourceConfig struct {
 	AccessToken string `json:"accessToken,omitempty"`
 }
 
+// UploadRootConfig describes an administrator-configured writable destination
+// root for device media uploads. Paths are runtime/container paths.
+type UploadRootConfig struct {
+	Key      string `json:"key"`
+	Path     string `json:"path"`
+	TempPath string `json:"tempPath,omitempty"`
+}
+
 // RemoteBrowsingConfig controls whether the local agent should connect to the relay service.
 type RemoteBrowsingConfig struct {
 	Enabled   bool   `json:"enabled"`
@@ -55,12 +67,14 @@ type Config struct {
 	MediaListenAddress     string               `json:"mediaListenAddress"`
 	MediaPublishedAddress  string               `json:"mediaPublishedAddress,omitempty"`
 	DataDir                string               `json:"dataDir"`
+	Timezone               string               `json:"timezone,omitempty"`
 	DeviceLimit            int                  `json:"deviceLimit"`
 	AppLinkBaseURL         string               `json:"appLinkBaseURL"`
 	ControlPlaneAddress    string               `json:"controlPlaneAddress"`
 	ControlPlaneServerName string               `json:"controlPlaneServerName,omitempty"`
 	Hosted                 RemoteBrowsingConfig `json:"-"`
 	Datasources            []DatasourceConfig   `json:"datasources"`
+	UploadRoots            []UploadRootConfig   `json:"uploadRoots,omitempty"`
 }
 
 type configJSON struct {
@@ -69,12 +83,14 @@ type configJSON struct {
 	MediaListenAddress     string               `json:"mediaListenAddress"`
 	MediaPublishedAddress  string               `json:"mediaPublishedAddress,omitempty"`
 	DataDir                string               `json:"dataDir"`
+	Timezone               string               `json:"timezone,omitempty"`
 	DeviceLimit            int                  `json:"deviceLimit"`
 	AppLinkBaseURL         string               `json:"appLinkBaseURL"`
 	RelayConnectionAddress string               `json:"relayConnectionAddress"`
 	ControlPlaneServerName string               `json:"controlPlaneServerName,omitempty"`
 	RemoteBrowsing         RemoteBrowsingConfig `json:"remoteBrowsing"`
 	Datasources            []DatasourceConfig   `json:"datasources"`
+	UploadRoots            []UploadRootConfig   `json:"uploadRoots,omitempty"`
 }
 
 type configOverrideJSON struct {
@@ -83,6 +99,7 @@ type configOverrideJSON struct {
 	MediaListenAddress     *string             `json:"mediaListenAddress"`
 	MediaPublishedAddress  *string             `json:"mediaPublishedAddress"`
 	DataDir                *string             `json:"dataDir"`
+	Timezone               *string             `json:"timezone"`
 	DeviceLimit            *int                `json:"deviceLimit"`
 	AppLinkBaseURL         *string             `json:"appLinkBaseURL"`
 	RelayConnectionAddress *string             `json:"relayConnectionAddress"`
@@ -91,6 +108,7 @@ type configOverrideJSON struct {
 	RemoteBrowsing         *hostedConfigJSON   `json:"remoteBrowsing"`
 	Hosted                 *hostedConfigJSON   `json:"hosted"`
 	Datasources            *[]DatasourceConfig `json:"datasources"`
+	UploadRoots            *[]UploadRootConfig `json:"uploadRoots"`
 }
 
 type hostedConfigJSON struct {
@@ -107,12 +125,14 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		MediaListenAddress:     c.MediaListenAddress,
 		MediaPublishedAddress:  c.MediaPublishedAddress,
 		DataDir:                c.DataDir,
+		Timezone:               c.Timezone,
 		DeviceLimit:            c.DeviceLimit,
 		AppLinkBaseURL:         c.AppLinkBaseURL,
 		RelayConnectionAddress: c.ControlPlaneAddress,
 		ControlPlaneServerName: c.ControlPlaneServerName,
 		RemoteBrowsing:         c.Hosted,
 		Datasources:            c.Datasources,
+		UploadRoots:            c.UploadRoots,
 	})
 }
 
@@ -135,6 +155,9 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	}
 	if payload.DataDir != nil {
 		c.DataDir = *payload.DataDir
+	}
+	if payload.Timezone != nil {
+		c.Timezone = *payload.Timezone
 	}
 	if payload.DeviceLimit != nil {
 		c.DeviceLimit = *payload.DeviceLimit
@@ -159,6 +182,9 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	}
 	if payload.Datasources != nil {
 		c.Datasources = *payload.Datasources
+	}
+	if payload.UploadRoots != nil {
+		c.UploadRoots = *payload.UploadRoots
 	}
 	return nil
 }
@@ -191,6 +217,7 @@ func Default() Config {
 		AdminListenAddress:     "0.0.0.0:8081",
 		MediaListenAddress:     "0.0.0.0:8082",
 		DataDir:                defaultDataDir,
+		Timezone:               "",
 		DeviceLimit:            DefaultDeviceLimit,
 		AppLinkBaseURL:         DefaultAppLinkBaseURL,
 		ControlPlaneAddress:    DefaultRelayConnectionAddress,
@@ -200,6 +227,7 @@ func Default() Config {
 			ServerURL: DefaultRemoteBrowsingServerURL,
 		},
 		Datasources: []DatasourceConfig{},
+		UploadRoots: []UploadRootConfig{},
 	}
 }
 
@@ -246,6 +274,7 @@ func Load(configPath string) (ResolvedConfig, error) {
 	applyEnvOverrides(&cfg)
 	upgradeLegacyRelayConnectionAddress(&cfg, relayConnectionEnvProvided)
 	cfg.DataDir = resolveDataDir(baseDir, cfg.DataDir)
+	normalizeConfig(&cfg)
 
 	if err := validate(cfg); err != nil {
 		return ResolvedConfig{}, err
@@ -281,6 +310,7 @@ func WriteDefaultFile(configPath string, dataDir string) (string, error) {
 	} else {
 		cfg.DataDir = "state"
 	}
+	normalizeConfig(&cfg)
 
 	if err := os.MkdirAll(filepath.Dir(resolvedPath), 0o755); err != nil {
 		return "", fmt.Errorf("create config directory: %w", err)
@@ -308,6 +338,7 @@ func WriteFile(configPath string, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("resolve config path: %w", err)
 	}
+	normalizeConfig(&cfg)
 	if _, err := EnsureDatasourceSourceKeys(&cfg); err != nil {
 		return err
 	}
@@ -388,6 +419,7 @@ func applyEnvOverrides(cfg *Config) {
 	applyStringEnv("TIMICH_AGENT_MEDIA_LISTEN_ADDR", &cfg.MediaListenAddress)
 	applyStringEnv("TIMICH_AGENT_MEDIA_PUBLISHED_ADDR", &cfg.MediaPublishedAddress)
 	applyStringEnv("TIMICH_AGENT_DATA_DIR", &cfg.DataDir)
+	applyStringEnv("TIMICH_AGENT_TIMEZONE", &cfg.Timezone)
 	applyIntEnv("TIMICH_AGENT_DEVICE_LIMIT", &cfg.DeviceLimit)
 	applyStringEnv("TIMICH_AGENT_APP_LINK_BASE_URL", &cfg.AppLinkBaseURL)
 	applyStringEnv("TIMICH_AGENT_CONTROL_PLANE_ADDR", &cfg.ControlPlaneAddress)
@@ -397,6 +429,15 @@ func applyEnvOverrides(cfg *Config) {
 	applyBoolEnv("TIMICH_AGENT_HOSTED_ENABLED", &cfg.Hosted.Enabled)
 	applyStringEnv("TIMICH_AGENT_REMOTE_BROWSING_SERVER_URL", &cfg.Hosted.ServerURL)
 	applyBoolEnv("TIMICH_AGENT_REMOTE_BROWSING_ENABLED", &cfg.Hosted.Enabled)
+}
+
+func normalizeConfig(cfg *Config) {
+	cfg.Timezone = strings.TrimSpace(cfg.Timezone)
+	for index := range cfg.UploadRoots {
+		cfg.UploadRoots[index].Key = strings.TrimSpace(cfg.UploadRoots[index].Key)
+		cfg.UploadRoots[index].Path = strings.TrimSpace(cfg.UploadRoots[index].Path)
+		cfg.UploadRoots[index].TempPath = normalizeUploadRootTempPath(cfg.UploadRoots[index].TempPath)
+	}
 }
 
 func relayConnectionAddressEnvProvided() bool {
@@ -455,6 +496,11 @@ func validate(cfg Config) error {
 	if strings.TrimSpace(cfg.DataDir) == "" {
 		return errors.New("data directory must not be empty")
 	}
+	if timezone := strings.TrimSpace(cfg.Timezone); timezone != "" {
+		if _, err := time.LoadLocation(timezone); err != nil {
+			return fmt.Errorf("timezone: %w", err)
+		}
+	}
 	if cfg.DeviceLimit < 1 {
 		return errors.New("device limit must be at least 1")
 	}
@@ -501,7 +547,60 @@ func validate(cfg Config) error {
 		}
 	}
 
+	if err := validateUploadRoots(cfg.UploadRoots); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+func validateUploadRoots(roots []UploadRootConfig) error {
+	seen := map[string]struct{}{}
+	for index, root := range roots {
+		key := strings.TrimSpace(root.Key)
+		if err := ValidateUploadRootKey(key); err != nil {
+			return fmt.Errorf("upload root %d: key: %w", index, err)
+		}
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("upload root %d: duplicate key", index)
+		}
+		seen[key] = struct{}{}
+		path := strings.TrimSpace(root.Path)
+		if path == "" {
+			return fmt.Errorf("upload root %d: path must not be empty", index)
+		}
+		if !filepath.IsAbs(path) {
+			return fmt.Errorf("upload root %d: path must be absolute", index)
+		}
+		if _, err := ValidateUploadRootTempPath(root.TempPath); err != nil {
+			return fmt.Errorf("upload root %d: tempPath: %w", index, err)
+		}
+	}
+	return nil
+}
+
+const DefaultUploadRootTempPath = ".timich-upload-tmp"
+
+func normalizeUploadRootTempPath(value string) string {
+	cleaned, err := ValidateUploadRootTempPath(value)
+	if err != nil {
+		return strings.TrimSpace(value)
+	}
+	return cleaned
+}
+
+// ValidateUploadRootTempPath verifies the root-relative temporary directory for
+// upload session part files.
+func ValidateUploadRootTempPath(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return DefaultUploadRootTempPath, nil
+	}
+	cleaned := path.Clean(trimmed)
+	if cleaned == "." || path.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", errors.New("must be a relative path inside the upload root")
+	}
+	return cleaned, nil
 }
 
 // EnsureDatasourceSourceKeys assigns stable 64-bit source keys to configured datasources.
@@ -567,6 +666,31 @@ func ValidateDatasourceSourceKey(value string) error {
 	return nil
 }
 
+// ValidateUploadRootKey verifies the stable operator-facing upload root key.
+func ValidateUploadRootKey(value string) error {
+	key := strings.TrimSpace(value)
+	if key == "" {
+		return errors.New("must not be empty")
+	}
+	if key == "." || key == ".." {
+		return errors.New("must not be a path segment")
+	}
+	if len(key) > 64 {
+		return errors.New("must be 64 characters or shorter")
+	}
+	for _, char := range key {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' ||
+			char == '_' ||
+			char == '.' {
+			continue
+		}
+		return errors.New("must use lowercase letters, digits, '.', '_', or '-'")
+	}
+	return nil
+}
+
 func validateStaticDemoURL(raw string) error {
 	value := strings.TrimSpace(raw)
 	if value == "" {
@@ -610,6 +734,7 @@ func ApplyRuntimeOverrides(
 		}
 	}
 
+	normalizeConfig(&resolved.Config)
 	if err := validate(resolved.Config); err != nil {
 		return ResolvedConfig{}, err
 	}
