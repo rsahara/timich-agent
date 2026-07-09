@@ -51,6 +51,9 @@ func NewMuxWithOptions(runtime *runtimestate.AgentRuntime, options Options) http
 	mux.HandleFunc("/config", api.requireAdmin(api.config))
 	mux.HandleFunc("/v1/datasource/primary", api.requireAdmin(api.primaryDatasource))
 	mux.HandleFunc("/v1/datasource/primary/check", api.requireAdmin(api.primaryDatasourceCheck))
+	mux.HandleFunc("/v1/nearby-links", api.requireAdmin(api.nearbyLinks))
+	mux.HandleFunc("/v1/nearby-links/approve", api.requireAdmin(api.approveNearbyLink))
+	mux.HandleFunc("/v1/nearby-links/", api.requireAdmin(api.nearbyLink))
 	mux.HandleFunc("/v1/pairing-sessions", api.requireAdmin(api.pairingSessions))
 	mux.HandleFunc("/v1/pairing-links", api.requireAdmin(api.pairingLinks))
 	mux.HandleFunc("/v1/compatibility-check", api.requireAdmin(api.compatibilityCheck))
@@ -321,6 +324,61 @@ func (s *server) pairingSessions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, response)
 }
 
+func (s *server) nearbyLinks(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/nearby-links" {
+		writeError(w, http.StatusNotFound, "route_not_found", "The Nearby Link route was not found.")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, "Use GET to list Nearby Link requests.")
+		return
+	}
+	links, err := s.runtime.NearbyLinks()
+	if err != nil {
+		writeNearbyLinkError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"nearbyLinks": links,
+	})
+}
+
+func (s *server) approveNearbyLink(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to approve a Nearby Link request.") {
+		return
+	}
+	var request struct {
+		LinkCode string `json:"linkCode"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the Nearby Link approval request.")
+		return
+	}
+	response, err := s.runtime.ApproveNearbyLink(request.LinkCode)
+	if err != nil {
+		writeNearbyLinkError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *server) nearbyLink(w http.ResponseWriter, r *http.Request) {
+	linkID, action, ok := parseNearbyLinkAdminRoute(r.URL.Path)
+	if !ok || action != "deny" {
+		writeError(w, http.StatusNotFound, "route_not_found", "The Nearby Link route was not found.")
+		return
+	}
+	if !requirePost(w, r, "Use POST to deny a Nearby Link request.") {
+		return
+	}
+	response, err := s.runtime.DenyNearbyLink(linkID)
+	if err != nil {
+		writeNearbyLinkError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 func (s *server) pairingLinks(w http.ResponseWriter, r *http.Request) {
 	if !requirePost(w, r, "Use POST to create a pairing link.") {
 		return
@@ -569,12 +627,41 @@ func parseLimitedForm(w http.ResponseWriter, r *http.Request) error {
 	return r.ParseForm()
 }
 
+func parseNearbyLinkAdminRoute(path string) (linkID string, action string, ok bool) {
+	trimmedPath := strings.Trim(strings.TrimPrefix(path, "/v1/nearby-links/"), "/")
+	if trimmedPath == "" {
+		return "", "", false
+	}
+	parts := strings.Split(trimmedPath, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
 func writePairingError(w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrDeviceLimitReached) {
 		writeError(w, http.StatusConflict, "device_limit_reached", "The local agent has reached its paired-device limit.")
 		return
 	}
 	writeError(w, http.StatusInternalServerError, "pairing_session_create_failed", "Could not create a pairing session.")
+}
+
+func writeNearbyLinkError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrNearbyLinkNotFound):
+		writeError(w, http.StatusNotFound, "nearby_link_not_found", "The Nearby Link request was not found.")
+	case errors.Is(err, store.ErrNearbyLinkDenied):
+		writeError(w, http.StatusGone, "nearby_link_denied", "The Nearby Link request was denied.")
+	case errors.Is(err, store.ErrNearbyLinkConsumed):
+		writeError(w, http.StatusGone, "nearby_link_used", "The Nearby Link request has already been used.")
+	case errors.Is(err, store.ErrNearbyLinkLimitReached):
+		writeError(w, http.StatusTooManyRequests, "nearby_link_limit_reached", "Too many Nearby Link requests are active.")
+	case errors.Is(err, store.ErrDeviceLimitReached):
+		writeError(w, http.StatusConflict, "device_limit_reached", "The local agent has reached its paired-device limit.")
+	default:
+		writeError(w, http.StatusInternalServerError, "nearby_link_failed", "Could not complete the Nearby Link request.")
+	}
 }
 
 func writeDatasourceError(w http.ResponseWriter, err error) {

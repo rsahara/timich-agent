@@ -11,6 +11,7 @@ import (
 
 const (
 	defaultPairingTTL      = 10 * time.Minute
+	defaultNearbyLinkTTL   = 5 * time.Minute
 	defaultAccessTokenTTL  = 12 * time.Hour
 	defaultRefreshTokenTTL = 30 * 24 * time.Hour
 	AccessModeFull         = "full"
@@ -45,6 +46,26 @@ const (
 	PairingStatusPairingSessionAvailable        PairingStatus = "pairing session available"
 	PairingStatusReadyForAdditionalLocalPairing PairingStatus = "ready for additional local pairing"
 )
+
+// NearbyLinkResponse is the app-facing response for a pending LAN approval request.
+type NearbyLinkResponse struct {
+	LinkID     string    `json:"linkId"`
+	LinkCode   string    `json:"linkCode"`
+	PollToken  string    `json:"pollToken,omitempty"`
+	DeviceName string    `json:"deviceName"`
+	DeviceKind string    `json:"deviceKind"`
+	Status     string    `json:"status"`
+	CreatedAt  time.Time `json:"createdAt"`
+	ExpiresAt  time.Time `json:"expiresAt"`
+}
+
+// NearbyLinkPollResponse is returned to an app polling for local admin approval.
+type NearbyLinkPollResponse struct {
+	LinkID    string         `json:"linkId"`
+	Status    string         `json:"status"`
+	ExpiresAt time.Time      `json:"expiresAt"`
+	Session   *SessionBundle `json:"session,omitempty"`
+}
 
 // Service owns local pairing, refresh, and access-token verification.
 type Service struct {
@@ -84,6 +105,93 @@ func (s *Service) CreatePairingSession() (PairingSessionResponse, error) {
 		PairingCode: session.Code,
 		ExpiresAt:   session.ExpiresAt,
 	}, nil
+}
+
+// CreateNearbyLink starts a LAN-local admin approval request for a nearby app device.
+func (s *Service) CreateNearbyLink(deviceName string, deviceKind string) (NearbyLinkResponse, error) {
+	now := time.Now().UTC()
+	link, pollToken, err := s.registry.CreateNearbyLink(
+		strings.TrimSpace(deviceName),
+		strings.TrimSpace(deviceKind),
+		now,
+		now.Add(defaultNearbyLinkTTL),
+	)
+	if err != nil {
+		return NearbyLinkResponse{}, err
+	}
+	return nearbyLinkResponse(link, pollToken), nil
+}
+
+// NearbyLinks returns active local approval requests for the admin surface.
+func (s *Service) NearbyLinks() ([]NearbyLinkResponse, error) {
+	links := s.registry.NearbyLinks(time.Now().UTC())
+	responses := make([]NearbyLinkResponse, 0, len(links))
+	for _, link := range links {
+		responses = append(responses, nearbyLinkResponse(link, ""))
+	}
+	return responses, nil
+}
+
+// ApproveNearbyLink marks a Link Code as locally approved by an administrator.
+func (s *Service) ApproveNearbyLink(linkCode string) (NearbyLinkResponse, error) {
+	link, err := s.registry.ApproveNearbyLink(linkCode, time.Now().UTC())
+	if err != nil {
+		return NearbyLinkResponse{}, err
+	}
+	return nearbyLinkResponse(link, ""), nil
+}
+
+// DenyNearbyLink rejects a pending local approval request.
+func (s *Service) DenyNearbyLink(linkID string) (NearbyLinkResponse, error) {
+	link, err := s.registry.DenyNearbyLink(linkID, time.Now().UTC())
+	if err != nil {
+		return NearbyLinkResponse{}, err
+	}
+	return nearbyLinkResponse(link, ""), nil
+}
+
+// CancelNearbyLink lets the requesting app cancel its own pending local approval request.
+func (s *Service) CancelNearbyLink(linkID string, pollToken string) (NearbyLinkResponse, error) {
+	link, err := s.registry.CancelNearbyLink(linkID, pollToken, time.Now().UTC())
+	if err != nil {
+		return NearbyLinkResponse{}, err
+	}
+	return nearbyLinkResponse(link, ""), nil
+}
+
+// PollNearbyLink returns pending/denied state or consumes an approved link into an app session.
+func (s *Service) PollNearbyLink(linkID string, pollToken string, baseURL string) (NearbyLinkPollResponse, error) {
+	now := time.Now().UTC()
+	link, err := s.registry.PollNearbyLink(linkID, pollToken, now)
+	if err != nil {
+		return NearbyLinkPollResponse{}, err
+	}
+	response := NearbyLinkPollResponse{
+		LinkID:    link.LinkID,
+		Status:    link.Status(),
+		ExpiresAt: link.ExpiresAt,
+	}
+	if response.Status != store.NearbyLinkStatusApproved {
+		return response, nil
+	}
+
+	device, link, err := s.registry.RedeemNearbyLink(
+		linkID,
+		pollToken,
+		now,
+		now.Add(defaultRefreshTokenTTL),
+	)
+	if err != nil {
+		return NearbyLinkPollResponse{}, err
+	}
+	bundle, err := s.buildSessionBundle(device, baseURL, now)
+	if err != nil {
+		return NearbyLinkPollResponse{}, err
+	}
+	response.Status = link.Status()
+	response.ExpiresAt = link.ExpiresAt
+	response.Session = &bundle
+	return response, nil
 }
 
 // ActivePairingSession returns the current unredeemed, unexpired pairing session for a code.
@@ -211,5 +319,24 @@ func IsClientError(err error) bool {
 		errors.Is(err, store.ErrPairingSessionUsed) ||
 		errors.Is(err, store.ErrDeviceLimitReached) ||
 		errors.Is(err, store.ErrRefreshTokenNotFound) ||
-		errors.Is(err, store.ErrRefreshTokenExpired)
+		errors.Is(err, store.ErrRefreshTokenExpired) ||
+		errors.Is(err, store.ErrNearbyLinkNotFound) ||
+		errors.Is(err, store.ErrNearbyLinkDenied) ||
+		errors.Is(err, store.ErrNearbyLinkNotApproved) ||
+		errors.Is(err, store.ErrNearbyLinkConsumed) ||
+		errors.Is(err, store.ErrNearbyLinkPollTokenInvalid) ||
+		errors.Is(err, store.ErrNearbyLinkLimitReached)
+}
+
+func nearbyLinkResponse(link store.NearbyLink, pollToken string) NearbyLinkResponse {
+	return NearbyLinkResponse{
+		LinkID:     link.LinkID,
+		LinkCode:   link.LinkCode,
+		PollToken:  pollToken,
+		DeviceName: link.DeviceName,
+		DeviceKind: link.DeviceKind,
+		Status:     link.Status(),
+		CreatedAt:  link.CreatedAt,
+		ExpiresAt:  link.ExpiresAt,
+	}
 }

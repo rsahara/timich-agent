@@ -54,6 +54,7 @@ type DeviceRecord struct {
 // DeviceRegistry holds the persisted local pairing/device state.
 type DeviceRegistry struct {
 	PairingSessions []PairingSession `json:"pairingSessions"`
+	NearbyLinks     []NearbyLink     `json:"nearbyLinks,omitempty"`
 	Devices         []DeviceRecord   `json:"devices"`
 }
 
@@ -92,6 +93,7 @@ func LoadOrCreateDeviceRegistry(dataDir string, deviceLimit int) (*DeviceRegistr
 	path := filepath.Join(dataDir, deviceRegistryFileName)
 	registry := DeviceRegistry{
 		PairingSessions: []PairingSession{},
+		NearbyLinks:     []NearbyLink{},
 		Devices:         []DeviceRecord{},
 	}
 
@@ -103,6 +105,15 @@ func LoadOrCreateDeviceRegistry(dataDir string, deviceLimit int) (*DeviceRegistr
 		return nil, fmt.Errorf("read device registry %s: %w", path, err)
 	} else if err := writeDeviceRegistryFile(path, registry); err != nil {
 		return nil, err
+	}
+	if registry.PairingSessions == nil {
+		registry.PairingSessions = []PairingSession{}
+	}
+	if registry.NearbyLinks == nil {
+		registry.NearbyLinks = []NearbyLink{}
+	}
+	if registry.Devices == nil {
+		registry.Devices = []DeviceRecord{}
 	}
 
 	store := &DeviceRegistryStore{
@@ -361,6 +372,18 @@ func (s *DeviceRegistryStore) cleanupExpiredLocked(now time.Time) {
 		activePairings = append(activePairings, session)
 	}
 	s.registry.PairingSessions = activePairings
+
+	activeNearbyLinks := s.registry.NearbyLinks[:0]
+	for _, link := range s.registry.NearbyLinks {
+		if link.ConsumedAt != nil {
+			continue
+		}
+		if now.After(link.ExpiresAt) {
+			continue
+		}
+		activeNearbyLinks = append(activeNearbyLinks, link)
+	}
+	s.registry.NearbyLinks = activeNearbyLinks
 }
 
 func (s *DeviceRegistryStore) recordFailedPairingAttemptLocked(now time.Time) error {
@@ -423,9 +446,11 @@ func newDeviceRecord(
 
 func cloneRegistry(registry DeviceRegistry) DeviceRegistry {
 	pairings := append([]PairingSession(nil), registry.PairingSessions...)
+	nearbyLinks := append([]NearbyLink(nil), registry.NearbyLinks...)
 	devices := append([]DeviceRecord(nil), registry.Devices...)
 	return DeviceRegistry{
 		PairingSessions: pairings,
+		NearbyLinks:     nearbyLinks,
 		Devices:         devices,
 	}
 }
