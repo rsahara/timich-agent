@@ -820,6 +820,45 @@ func (a *AgentRuntime) ActivePairingSession(code string) (pairing.PairingSession
 	return a.pairing.ActivePairingSession(code)
 }
 
+// CreateNearbyLink starts a LAN-local approval request from an app device.
+func (a *AgentRuntime) CreateNearbyLink(deviceName string, deviceKind string) (pairing.NearbyLinkResponse, error) {
+	return a.pairing.CreateNearbyLink(deviceName, deviceKind)
+}
+
+// NearbyLinks returns active LAN-local approval requests for the admin surface.
+func (a *AgentRuntime) NearbyLinks() ([]pairing.NearbyLinkResponse, error) {
+	return a.pairing.NearbyLinks()
+}
+
+// ApproveNearbyLink approves a pending app device by Link Code.
+func (a *AgentRuntime) ApproveNearbyLink(linkCode string) (pairing.NearbyLinkResponse, error) {
+	return a.pairing.ApproveNearbyLink(linkCode)
+}
+
+// DenyNearbyLink rejects a pending app device approval request.
+func (a *AgentRuntime) DenyNearbyLink(linkID string) (pairing.NearbyLinkResponse, error) {
+	return a.pairing.DenyNearbyLink(linkID)
+}
+
+// CancelNearbyLink cancels a requesting app's Nearby Link using its poll token.
+func (a *AgentRuntime) CancelNearbyLink(linkID string, pollToken string) (pairing.NearbyLinkResponse, error) {
+	return a.pairing.CancelNearbyLink(linkID, pollToken)
+}
+
+// PollNearbyLink returns pending/denied state or consumes an approved request into an app session.
+func (a *AgentRuntime) PollNearbyLink(linkID string, pollToken string, baseURL string) (pairing.NearbyLinkPollResponse, error) {
+	response, err := a.pairing.PollNearbyLink(linkID, pollToken, baseURL)
+	if err != nil || response.Session == nil {
+		return response, err
+	}
+	if err := a.ensureDeviceProfile(response.Session.DeviceID); err != nil {
+		_ = a.registry.RevokeDevice(response.Session.DeviceID)
+		_ = a.profiles.DeleteProfile(response.Session.DeviceID)
+		return pairing.NearbyLinkPollResponse{}, err
+	}
+	return response, nil
+}
+
 // RedeemPairing redeems a one-time pairing code on the LAN-facing media surface.
 func (a *AgentRuntime) RedeemPairing(code string, deviceName string, baseURL string) (pairing.SessionBundle, error) {
 	bundle, err := a.pairing.RedeemPairing(code, deviceName, baseURL)

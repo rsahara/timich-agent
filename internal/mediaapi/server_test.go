@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -137,6 +138,139 @@ func TestCopyProxyResponseOmitsHeadBody(t *testing.T) {
 
 	if recorder.Body.Len() != 0 {
 		t.Fatalf("expected empty HEAD body, got %q", recorder.Body.String())
+	}
+}
+
+func TestNearbyLinkFlowCreatesSessionAfterAdminApproval(t *testing.T) {
+	t.Parallel()
+
+	runtime := newUploadTestRuntime(t)
+	handler := NewMux(runtime)
+
+	createRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		createRecorder,
+		httptest.NewRequest(http.MethodPost, "http://agent.local:8082/v1/nearby-links", bytes.NewReader([]byte(`{"deviceName":"Living Room TV","deviceKind":"android_tv"}`))),
+	)
+	if createRecorder.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 body=%s", createRecorder.Code, createRecorder.Body.String())
+	}
+	var created struct {
+		LinkID    string `json:"linkId"`
+		LinkCode  string `json:"linkCode"`
+		PollToken string `json:"pollToken"`
+		Status    string `json:"status"`
+	}
+	if err := json.Unmarshal(createRecorder.Body.Bytes(), &created); err != nil {
+		t.Fatalf("create response is not JSON: %v body=%s", err, createRecorder.Body.String())
+	}
+	if created.LinkID == "" || created.LinkCode == "" || created.PollToken == "" || created.Status != store.NearbyLinkStatusPending {
+		t.Fatalf("created = %+v, want pending Nearby Link with poll token", created)
+	}
+
+	pendingRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		pendingRecorder,
+		httptest.NewRequest(http.MethodPost, "http://agent.local:8082/v1/nearby-links/"+created.LinkID+"/poll", bytes.NewReader([]byte(`{"pollToken":"`+created.PollToken+`"}`))),
+	)
+	if pendingRecorder.Code != http.StatusOK {
+		t.Fatalf("pending status = %d, want 200 body=%s", pendingRecorder.Code, pendingRecorder.Body.String())
+	}
+	var pending struct {
+		Status  string          `json:"status"`
+		Session json.RawMessage `json:"session"`
+	}
+	if err := json.Unmarshal(pendingRecorder.Body.Bytes(), &pending); err != nil {
+		t.Fatalf("pending response is not JSON: %v body=%s", err, pendingRecorder.Body.String())
+	}
+	if pending.Status != store.NearbyLinkStatusPending || len(pending.Session) != 0 {
+		t.Fatalf("pending = %+v, want pending without session", pending)
+	}
+
+	if _, err := runtime.ApproveNearbyLink(created.LinkCode); err != nil {
+		t.Fatalf("ApproveNearbyLink() error = %v", err)
+	}
+
+	approvedRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		approvedRecorder,
+		httptest.NewRequest(http.MethodPost, "http://agent.local:8082/v1/nearby-links/"+created.LinkID+"/poll", bytes.NewReader([]byte(`{"pollToken":"`+created.PollToken+`"}`))),
+	)
+	if approvedRecorder.Code != http.StatusOK {
+		t.Fatalf("approved status = %d, want 200 body=%s", approvedRecorder.Code, approvedRecorder.Body.String())
+	}
+	var approved struct {
+		Status  string `json:"status"`
+		Session struct {
+			DeviceID     string `json:"deviceId"`
+			BaseURL      string `json:"baseURL"`
+			RefreshToken string `json:"refreshToken"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(approvedRecorder.Body.Bytes(), &approved); err != nil {
+		t.Fatalf("approved response is not JSON: %v body=%s", err, approvedRecorder.Body.String())
+	}
+	if approved.Status != store.NearbyLinkStatusApproved || approved.Session.DeviceID == "" || approved.Session.RefreshToken == "" {
+		t.Fatalf("approved = %+v, want approved session", approved)
+	}
+	if approved.Session.BaseURL != "http://agent.local:8082" {
+		t.Fatalf("session baseURL = %q, want request base URL", approved.Session.BaseURL)
+	}
+}
+
+func TestNearbyLinkCancelDeniesRequest(t *testing.T) {
+	t.Parallel()
+
+	runtime := newUploadTestRuntime(t)
+	handler := NewMux(runtime)
+
+	createRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		createRecorder,
+		httptest.NewRequest(http.MethodPost, "http://agent.local:8082/v1/nearby-links", bytes.NewReader([]byte(`{"deviceName":"Living Room TV","deviceKind":"android_tv"}`))),
+	)
+	if createRecorder.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 body=%s", createRecorder.Code, createRecorder.Body.String())
+	}
+	var created struct {
+		LinkID    string `json:"linkId"`
+		LinkCode  string `json:"linkCode"`
+		PollToken string `json:"pollToken"`
+	}
+	if err := json.Unmarshal(createRecorder.Body.Bytes(), &created); err != nil {
+		t.Fatalf("create response is not JSON: %v body=%s", err, createRecorder.Body.String())
+	}
+
+	invalidRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		invalidRecorder,
+		httptest.NewRequest(http.MethodPost, "http://agent.local:8082/v1/nearby-links/"+created.LinkID+"/cancel", bytes.NewReader([]byte(`{"pollToken":"wrong"}`))),
+	)
+	if invalidRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid cancel status = %d, want 401 body=%s", invalidRecorder.Code, invalidRecorder.Body.String())
+	}
+
+	cancelRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(
+		cancelRecorder,
+		httptest.NewRequest(http.MethodPost, "http://agent.local:8082/v1/nearby-links/"+created.LinkID+"/cancel", bytes.NewReader([]byte(`{"pollToken":"`+created.PollToken+`"}`))),
+	)
+	if cancelRecorder.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d, want 200 body=%s", cancelRecorder.Code, cancelRecorder.Body.String())
+	}
+	var canceled struct {
+		LinkID    string `json:"linkId"`
+		PollToken string `json:"pollToken"`
+		Status    string `json:"status"`
+	}
+	if err := json.Unmarshal(cancelRecorder.Body.Bytes(), &canceled); err != nil {
+		t.Fatalf("cancel response is not JSON: %v body=%s", err, cancelRecorder.Body.String())
+	}
+	if canceled.LinkID != created.LinkID || canceled.Status != store.NearbyLinkStatusDenied || canceled.PollToken != "" {
+		t.Fatalf("canceled = %+v, want denied without poll token", canceled)
+	}
+	if _, err := runtime.ApproveNearbyLink(created.LinkCode); !errors.Is(err, store.ErrNearbyLinkDenied) {
+		t.Fatalf("ApproveNearbyLink(canceled) error = %v, want %v", err, store.ErrNearbyLinkDenied)
 	}
 }
 

@@ -226,6 +226,11 @@ const dashboardHTML = `<!doctype html>
     .pairing-link { min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; color: var(--muted); }
     .pairing-code-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
     .pairing-url-controls { display: grid; gap: 8px; }
+    .pairing-methods { display: grid; gap: 18px; margin-top: 14px; }
+    .pairing-method { display: grid; gap: 10px; }
+    .pairing-method + .pairing-method { padding-top: 18px; border-top: 1px solid var(--line); }
+    .pairing-method h3 { margin: 0; font-size: 14px; letter-spacing: 0; }
+    .pairing-method p { margin: 0; max-width: 760px; color: var(--muted); }
     .code { min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 18px; overflow-wrap: anywhere; }
     .checks { display: grid; gap: 10px; }
     .check { display: grid; gap: 3px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
@@ -309,11 +314,30 @@ const dashboardHTML = `<!doctype html>
       </section>
       <section class="wide">
         <h2>Pair New Device</h2>
-        <p class="muted">Create a one-time code for pairing the Timich app on a phone or tablet.</p>
-        <div class="actions">
-          <button class="primary" id="createPairing">Create device pairing code</button>
+        <p class="section-note">Approve a Nearby Link code shown on a local device, or create a manual one-time code for fallback pairing.</p>
+        <div class="pairing-methods">
+          <div class="pairing-method">
+            <h3>Nearby Link</h3>
+            <p>Approve the Link Code shown on a nearby app or TV.</p>
+            <form class="stack" id="nearbyLinkForm">
+              <label>Nearby Link Code
+                <input id="nearbyLinkCode" inputmode="numeric" autocomplete="off" placeholder="123 456">
+              </label>
+              <div class="actions">
+                <button class="primary" type="submit">Approve Nearby Link</button>
+                <span class="muted" id="nearbyLinkMessage"></span>
+              </div>
+            </form>
+          </div>
+          <div class="pairing-method">
+            <h3>Manual pairing code</h3>
+            <p>Create a one-time code for devices that cannot use Nearby Link.</p>
+            <div class="actions">
+              <button class="primary" id="createPairing">Create device pairing code</button>
+            </div>
+            <div id="pairingResult"></div>
+          </div>
         </div>
-        <div id="pairingResult"></div>
       </section>
       <section class="wide">
         <h2>Device List</h2>
@@ -352,6 +376,9 @@ const dashboardHTML = `<!doctype html>
     const datasourceURL = document.querySelector('#datasourceURL');
     const datasourceAccessToken = document.querySelector('#datasourceAccessToken');
     const datasourceMessage = document.querySelector('#datasourceMessage');
+    const nearbyLinkForm = document.querySelector('#nearbyLinkForm');
+    const nearbyLinkCode = document.querySelector('#nearbyLinkCode');
+    const nearbyLinkMessage = document.querySelector('#nearbyLinkMessage');
     const devicesNode = document.querySelector('#devices');
     const uploadRootsNode = document.querySelector('#uploadRoots');
     const pairingResult = document.querySelector('#pairingResult');
@@ -632,6 +659,37 @@ const dashboardHTML = `<!doctype html>
         textarea.remove();
       }
     }
+
+    nearbyLinkForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = nearbyLinkForm.querySelector('button[type="submit"]');
+      const linkCode = nearbyLinkCode.value.trim();
+      if (!linkCode) {
+        nearbyLinkMessage.textContent = 'Enter the Link Code shown on the device';
+        nearbyLinkMessage.className = 'status-warn';
+        nearbyLinkCode.focus();
+        return;
+      }
+      button.disabled = true;
+      nearbyLinkMessage.textContent = 'Approving...';
+      nearbyLinkMessage.className = 'muted';
+      try {
+        const link = await api('/v1/nearby-links/approve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ linkCode }),
+        });
+        nearbyLinkCode.value = '';
+        nearbyLinkMessage.textContent = 'Approved ' + (link.deviceName || 'device') + '. Keep the app open until pairing finishes.';
+        nearbyLinkMessage.className = 'status-ok';
+        await loadStatus();
+      } catch (error) {
+        nearbyLinkMessage.textContent = error.message;
+        nearbyLinkMessage.className = 'status-failed';
+      } finally {
+        button.disabled = false;
+      }
+    });
 
     async function loadStatus({ checkDatasourceReachability = false } = {}) {
       const status = await api('/status');

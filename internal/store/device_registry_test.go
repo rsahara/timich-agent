@@ -100,6 +100,353 @@ func TestDeviceRegistryStoreRevokeDevice(t *testing.T) {
 	}
 }
 
+func TestDeviceRegistryStoreNearbyLinkApproveAndRedeem(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	registry, err := LoadOrCreateDeviceRegistry(dataDir, 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+
+	now := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	link, pollToken, err := registry.CreateNearbyLink("Living Room TV", "android_tv", now, now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("CreateNearbyLink() error = %v", err)
+	}
+	if len(link.LinkCode) != 6 {
+		t.Fatalf("LinkCode length = %d, want 6", len(link.LinkCode))
+	}
+	for _, char := range link.LinkCode {
+		if char < '0' || char > '9' {
+			t.Fatalf("LinkCode = %q, want decimal digits only", link.LinkCode)
+		}
+	}
+	if pollToken == "" {
+		t.Fatal("CreateNearbyLink() returned an empty poll token")
+	}
+	raw, err := os.ReadFile(filepath.Join(dataDir, deviceRegistryFileName))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if strings.Contains(string(raw), pollToken) {
+		t.Fatal("device registry persisted the raw Nearby Link poll token")
+	}
+	if !strings.Contains(string(raw), "\"pollTokenHash\"") {
+		t.Fatal("device registry is missing the Nearby Link poll token hash")
+	}
+
+	pending, err := registry.PollNearbyLink(link.LinkID, pollToken, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("PollNearbyLink() pending error = %v", err)
+	}
+	if pending.Status() != NearbyLinkStatusPending {
+		t.Fatalf("NearbyLink status = %q, want %q", pending.Status(), NearbyLinkStatusPending)
+	}
+
+	approved, err := registry.ApproveNearbyLink(link.LinkCode[:3]+" "+link.LinkCode[3:], now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("ApproveNearbyLink() error = %v", err)
+	}
+	if approved.Status() != NearbyLinkStatusApproved {
+		t.Fatalf("approved status = %q, want %q", approved.Status(), NearbyLinkStatusApproved)
+	}
+
+	device, redeemed, err := registry.RedeemNearbyLink(
+		link.LinkID,
+		pollToken,
+		now.Add(3*time.Minute),
+		now.Add(24*time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("RedeemNearbyLink() error = %v", err)
+	}
+	if device.DeviceName != "Living Room TV" {
+		t.Fatalf("device name = %q, want Living Room TV", device.DeviceName)
+	}
+	if redeemed.ConsumedAt == nil {
+		t.Fatal("RedeemNearbyLink() did not mark the link consumed")
+	}
+	snapshot := registry.Snapshot()
+	if len(snapshot.NearbyLinks) != 0 {
+		t.Fatalf("Snapshot().NearbyLinks length = %d, want 0 after redeem", len(snapshot.NearbyLinks))
+	}
+	if len(snapshot.Devices) != 1 || snapshot.Devices[0].DeviceID != device.DeviceID {
+		t.Fatalf("Snapshot().Devices = %+v, want redeemed device", snapshot.Devices)
+	}
+}
+
+func TestDeviceRegistryStoreRedeemNearbyLinkKeepsLinkOnPersistError(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	registry, err := LoadOrCreateDeviceRegistry(dataDir, 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+
+	now := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	link, pollToken, err := registry.CreateNearbyLink("Living Room TV", "android_tv", now, now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("CreateNearbyLink() error = %v", err)
+	}
+	if _, err := registry.ApproveNearbyLink(link.LinkCode, now.Add(time.Minute)); err != nil {
+		t.Fatalf("ApproveNearbyLink() error = %v", err)
+	}
+
+	originalPath := registry.path
+	registry.path = filepath.Join(t.TempDir(), "missing", deviceRegistryFileName)
+	if _, _, err := registry.RedeemNearbyLink(
+		link.LinkID,
+		pollToken,
+		now.Add(2*time.Minute),
+		now.Add(24*time.Hour),
+	); err == nil {
+		t.Fatal("RedeemNearbyLink() error = nil, want persist error")
+	}
+
+	snapshot := registry.Snapshot()
+	if len(snapshot.Devices) != 0 {
+		t.Fatalf("Snapshot().Devices length = %d after failed redeem, want 0", len(snapshot.Devices))
+	}
+	if len(snapshot.NearbyLinks) != 1 {
+		t.Fatalf("Snapshot().NearbyLinks length = %d after failed redeem, want 1", len(snapshot.NearbyLinks))
+	}
+	if snapshot.NearbyLinks[0].ConsumedAt != nil {
+		t.Fatal("Nearby Link was consumed after failed redeem")
+	}
+	if snapshot.NearbyLinks[0].Status() != NearbyLinkStatusApproved {
+		t.Fatalf("Nearby Link status = %q after failed redeem, want %q", snapshot.NearbyLinks[0].Status(), NearbyLinkStatusApproved)
+	}
+
+	registry.path = originalPath
+	device, redeemed, err := registry.RedeemNearbyLink(
+		link.LinkID,
+		pollToken,
+		now.Add(3*time.Minute),
+		now.Add(24*time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("RedeemNearbyLink() retry error = %v", err)
+	}
+	if device.DeviceID == "" {
+		t.Fatal("RedeemNearbyLink() retry returned an empty device id")
+	}
+	if redeemed.ConsumedAt == nil {
+		t.Fatal("RedeemNearbyLink() retry did not mark the link consumed")
+	}
+}
+
+func TestDeviceRegistryStoreCreateNearbyLinkKeepsMemoryOnPersistError(t *testing.T) {
+	t.Parallel()
+
+	registry, err := LoadOrCreateDeviceRegistry(t.TempDir(), 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+
+	now := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	registry.path = filepath.Join(t.TempDir(), "missing", deviceRegistryFileName)
+	if link, pollToken, err := registry.CreateNearbyLink("Living Room TV", "android_tv", now, now.Add(5*time.Minute)); err == nil {
+		t.Fatalf("CreateNearbyLink() error = nil, want persist error; link=%+v pollToken=%q", link, pollToken)
+	} else if pollToken != "" {
+		t.Fatalf("CreateNearbyLink() pollToken = %q after persist error, want empty", pollToken)
+	}
+
+	snapshot := registry.Snapshot()
+	if len(snapshot.NearbyLinks) != 0 {
+		t.Fatalf("Snapshot().NearbyLinks length = %d after failed create, want 0", len(snapshot.NearbyLinks))
+	}
+}
+
+func TestDeviceRegistryStoreApproveNearbyLinkKeepsPendingOnPersistError(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	registry, err := LoadOrCreateDeviceRegistry(dataDir, 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+
+	now := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	link, _, err := registry.CreateNearbyLink("Living Room TV", "android_tv", now, now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("CreateNearbyLink() error = %v", err)
+	}
+
+	originalPath := registry.path
+	registry.path = filepath.Join(t.TempDir(), "missing", deviceRegistryFileName)
+	if _, err := registry.ApproveNearbyLink(link.LinkCode, now.Add(time.Minute)); err == nil {
+		t.Fatal("ApproveNearbyLink() error = nil, want persist error")
+	}
+
+	snapshot := registry.Snapshot()
+	if len(snapshot.NearbyLinks) != 1 {
+		t.Fatalf("Snapshot().NearbyLinks length = %d after failed approve, want 1", len(snapshot.NearbyLinks))
+	}
+	if snapshot.NearbyLinks[0].Status() != NearbyLinkStatusPending {
+		t.Fatalf("Nearby Link status = %q after failed approve, want %q", snapshot.NearbyLinks[0].Status(), NearbyLinkStatusPending)
+	}
+
+	registry.path = originalPath
+	approved, err := registry.ApproveNearbyLink(link.LinkCode, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("ApproveNearbyLink() retry error = %v", err)
+	}
+	if approved.Status() != NearbyLinkStatusApproved {
+		t.Fatalf("ApproveNearbyLink() retry status = %q, want %q", approved.Status(), NearbyLinkStatusApproved)
+	}
+}
+
+func TestDeviceRegistryStoreDenyNearbyLinkKeepsPendingOnPersistError(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	registry, err := LoadOrCreateDeviceRegistry(dataDir, 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+
+	now := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	link, _, err := registry.CreateNearbyLink("Living Room TV", "android_tv", now, now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("CreateNearbyLink() error = %v", err)
+	}
+
+	originalPath := registry.path
+	registry.path = filepath.Join(t.TempDir(), "missing", deviceRegistryFileName)
+	if _, err := registry.DenyNearbyLink(link.LinkID, now.Add(time.Minute)); err == nil {
+		t.Fatal("DenyNearbyLink() error = nil, want persist error")
+	}
+
+	snapshot := registry.Snapshot()
+	if len(snapshot.NearbyLinks) != 1 {
+		t.Fatalf("Snapshot().NearbyLinks length = %d after failed deny, want 1", len(snapshot.NearbyLinks))
+	}
+	if snapshot.NearbyLinks[0].Status() != NearbyLinkStatusPending {
+		t.Fatalf("Nearby Link status = %q after failed deny, want %q", snapshot.NearbyLinks[0].Status(), NearbyLinkStatusPending)
+	}
+
+	registry.path = originalPath
+	denied, err := registry.DenyNearbyLink(link.LinkID, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("DenyNearbyLink() retry error = %v", err)
+	}
+	if denied.Status() != NearbyLinkStatusDenied {
+		t.Fatalf("DenyNearbyLink() retry status = %q, want %q", denied.Status(), NearbyLinkStatusDenied)
+	}
+}
+
+func TestDeviceRegistryStoreCancelNearbyLinkKeepsPendingOnPersistError(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	registry, err := LoadOrCreateDeviceRegistry(dataDir, 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+
+	now := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	link, pollToken, err := registry.CreateNearbyLink("Living Room TV", "android_tv", now, now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("CreateNearbyLink() error = %v", err)
+	}
+
+	originalPath := registry.path
+	registry.path = filepath.Join(t.TempDir(), "missing", deviceRegistryFileName)
+	if _, err := registry.CancelNearbyLink(link.LinkID, pollToken, now.Add(time.Minute)); err == nil {
+		t.Fatal("CancelNearbyLink() error = nil, want persist error")
+	}
+
+	snapshot := registry.Snapshot()
+	if len(snapshot.NearbyLinks) != 1 {
+		t.Fatalf("Snapshot().NearbyLinks length = %d after failed cancel, want 1", len(snapshot.NearbyLinks))
+	}
+	if snapshot.NearbyLinks[0].Status() != NearbyLinkStatusPending {
+		t.Fatalf("Nearby Link status = %q after failed cancel, want %q", snapshot.NearbyLinks[0].Status(), NearbyLinkStatusPending)
+	}
+
+	registry.path = originalPath
+	canceled, err := registry.CancelNearbyLink(link.LinkID, pollToken, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("CancelNearbyLink() retry error = %v", err)
+	}
+	if canceled.Status() != NearbyLinkStatusDenied {
+		t.Fatalf("CancelNearbyLink() retry status = %q, want %q", canceled.Status(), NearbyLinkStatusDenied)
+	}
+}
+
+func TestDeviceRegistryStoreNearbyLinkFailedAttemptKeepsStateOnPersistError(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	registry, err := LoadOrCreateDeviceRegistry(dataDir, 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+
+	now := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	link, _, err := registry.CreateNearbyLink("Living Room TV", "android_tv", now, now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("CreateNearbyLink() error = %v", err)
+	}
+
+	originalPath := registry.path
+	registry.path = filepath.Join(t.TempDir(), "missing", deviceRegistryFileName)
+	if _, err := registry.PollNearbyLink(link.LinkID, "wrong-token", now.Add(time.Minute)); err == nil {
+		t.Fatal("PollNearbyLink(wrong token) error = nil, want persist error")
+	}
+
+	snapshot := registry.Snapshot()
+	if len(snapshot.NearbyLinks) != 1 {
+		t.Fatalf("Snapshot().NearbyLinks length = %d after failed poll attempt, want 1", len(snapshot.NearbyLinks))
+	}
+	if snapshot.NearbyLinks[0].FailedAttempts != 0 {
+		t.Fatalf("Nearby Link failed attempts = %d after failed persist, want 0", snapshot.NearbyLinks[0].FailedAttempts)
+	}
+	if snapshot.NearbyLinks[0].Status() != NearbyLinkStatusPending {
+		t.Fatalf("Nearby Link status = %q after failed poll attempt, want %q", snapshot.NearbyLinks[0].Status(), NearbyLinkStatusPending)
+	}
+
+	registry.path = originalPath
+	if _, err := registry.PollNearbyLink(link.LinkID, "wrong-token", now.Add(2*time.Minute)); !errors.Is(err, ErrNearbyLinkPollTokenInvalid) {
+		t.Fatalf("PollNearbyLink(wrong token) retry error = %v, want %v", err, ErrNearbyLinkPollTokenInvalid)
+	}
+	snapshot = registry.Snapshot()
+	if snapshot.NearbyLinks[0].FailedAttempts != 1 {
+		t.Fatalf("Nearby Link failed attempts = %d after retry, want 1", snapshot.NearbyLinks[0].FailedAttempts)
+	}
+}
+
+func TestDeviceRegistryStoreNearbyLinkCancelRequiresPollToken(t *testing.T) {
+	t.Parallel()
+
+	registry, err := LoadOrCreateDeviceRegistry(t.TempDir(), 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+
+	now := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	link, pollToken, err := registry.CreateNearbyLink("Living Room TV", "android_tv", now, now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("CreateNearbyLink() error = %v", err)
+	}
+	if _, err := registry.CancelNearbyLink(link.LinkID, "wrong-token", now.Add(time.Minute)); !errors.Is(err, ErrNearbyLinkPollTokenInvalid) {
+		t.Fatalf("CancelNearbyLink(wrong token) error = %v, want %v", err, ErrNearbyLinkPollTokenInvalid)
+	}
+
+	canceled, err := registry.CancelNearbyLink(link.LinkID, pollToken, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("CancelNearbyLink() error = %v", err)
+	}
+	if canceled.Status() != NearbyLinkStatusDenied {
+		t.Fatalf("canceled status = %q, want %q", canceled.Status(), NearbyLinkStatusDenied)
+	}
+	if _, err := registry.ApproveNearbyLink(link.LinkCode, now.Add(3*time.Minute)); !errors.Is(err, ErrNearbyLinkDenied) {
+		t.Fatalf("ApproveNearbyLink(canceled) error = %v, want %v", err, ErrNearbyLinkDenied)
+	}
+}
+
 func TestDeviceRegistryStoreRenameDevice(t *testing.T) {
 	t.Parallel()
 

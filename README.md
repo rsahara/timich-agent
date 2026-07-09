@@ -110,9 +110,10 @@ http://AGENT_LAN_HOST:8081/
 ```
 
 Use `http://127.0.0.1:8081/` when you are on the agent host itself for setup
-and manual code entry. Pairing code entry is the primary path. After creating a
-code, the Admin UI can optionally show a QR code when you select or enter a
-Media API URL that the phone or tablet can reach on the trusted LAN.
+and manual code entry. Manual pairing codes remain available for reviewer
+access, command-line clients, and troubleshooting. Clients that support Nearby
+Link can instead show a short Link Code on the device and wait for a local admin
+approval through the authenticated Admin API.
 
 First-run setup in the Admin UI:
 
@@ -120,7 +121,8 @@ First-run setup in the Admin UI:
 2. Configure the primary Immich datasource with the Immich server URL and an
    Immich API key. For the common Docker Compose layout where this Agent joins
    Immich's `immich_default` network, use `http://immich_server:2283`.
-3. Create a pairing code and enter it in the Timich iOS app.
+3. Pair an app device. Use Nearby Link when the app supports it, or create a
+   manual pairing code and enter it in the Timich iOS app.
 4. Confirm the app can load the gallery on the trusted LAN.
 5. Optional: run Remote Browsing checks if you want Timich Reach access away
    from home.
@@ -256,6 +258,7 @@ The Admin UI currently covers:
 - first-run admin-token setup
 - agent update checks
 - primary Immich datasource editing and reachability checks
+- Nearby Link Code approval
 - pairing-code creation
 - paired-device listing and revoke
 - configured upload root status
@@ -284,6 +287,9 @@ Admin API:
 - `GET http://AGENT_LAN_HOST:8081/v1/datasource/primary`
 - `PUT http://AGENT_LAN_HOST:8081/v1/datasource/primary`
 - `POST http://AGENT_LAN_HOST:8081/v1/datasource/primary/check`
+- `GET http://AGENT_LAN_HOST:8081/v1/nearby-links`
+- `POST http://AGENT_LAN_HOST:8081/v1/nearby-links/approve`
+- `POST http://AGENT_LAN_HOST:8081/v1/nearby-links/{linkID}/deny`
 - `POST http://AGENT_LAN_HOST:8081/v1/pairing-sessions`
 - `POST http://AGENT_LAN_HOST:8081/v1/pairing-links`
 - `POST http://AGENT_LAN_HOST:8081/v1/compatibility-check`
@@ -301,6 +307,9 @@ Media API:
 - `GET http://AGENT_LAN_HOST:8082/healthz`
 - `GET http://AGENT_LAN_HOST:8082/version`
 - `GET http://AGENT_LAN_HOST:8082/v1/info`
+- `POST http://AGENT_LAN_HOST:8082/v1/nearby-links`
+- `POST http://AGENT_LAN_HOST:8082/v1/nearby-links/{linkID}/cancel`
+- `POST http://AGENT_LAN_HOST:8082/v1/nearby-links/{linkID}/poll`
 - `POST http://AGENT_LAN_HOST:8082/v1/pairing/redeem`
 - `POST http://AGENT_LAN_HOST:8082/v1/session/refresh`
 - `POST http://AGENT_LAN_HOST:8082/v1/assets/search`
@@ -347,6 +356,15 @@ curl -s http://127.0.0.1:8081/status \
 
 ## Pairing Security Notes
 
+- Nearby Link uses a short six-digit Link Code only for human confirmation on a
+  trusted LAN. The app also receives a high-entropy poll token that is stored by
+  the agent only as a salted hash. Admin approval requires the authenticated
+  Admin API, and the approved app session is delivered only once to the polling
+  app that holds the poll token. The same poll token is required when the app
+  cancels its own pending Nearby Link request.
+- Nearby Link requests are short-lived, limited in number, and separate from
+  manual pairing sessions so creating or approving a Link Code does not replace
+  the current manual pairing code.
 - Pairing codes are one-time 128-bit random values encoded as 32 hex characters.
 - The Admin API creates the manual pairing code first. The Admin UI or
   `/v1/pairing-links` can then generate a Timich app Universal Link and QR code
@@ -477,6 +495,41 @@ make compose-down
 ```
 
 ## Developer Smoke Tests
+
+Start a Nearby Link request from the LAN-facing media API:
+
+```bash
+curl -s -X POST http://127.0.0.1:8082/v1/nearby-links \
+  -H 'Content-Type: application/json' \
+  -d '{"deviceName":"Living Room TV","deviceKind":"android_tv"}'
+```
+
+Approve the displayed Link Code from the authenticated admin API:
+
+```bash
+curl -s -X POST http://127.0.0.1:8081/v1/nearby-links/approve \
+  -H "Authorization: Bearer $TIMICH_AGENT_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"linkCode":"LINK_CODE"}'
+```
+
+Poll the Nearby Link request from the app side until the response includes a
+`session` object:
+
+```bash
+curl -s -X POST http://127.0.0.1:8082/v1/nearby-links/LINK_ID/poll \
+  -H 'Content-Type: application/json' \
+  -d '{"pollToken":"POLL_TOKEN"}'
+```
+
+If the app leaves the Link Code screen before approval, cancel the request with
+the same poll token:
+
+```bash
+curl -s -X POST http://127.0.0.1:8082/v1/nearby-links/LINK_ID/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"pollToken":"POLL_TOKEN"}'
+```
 
 Create a pairing code from the authenticated admin API:
 

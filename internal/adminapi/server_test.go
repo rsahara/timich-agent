@@ -146,7 +146,22 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 	if !bytes.Contains(body, []byte("Create device pairing code")) {
 		t.Fatalf("dashboard body is missing pairing action: %s", recorder.Body.String())
 	}
-	if !bytes.Contains(body, []byte("pairing the Timich app on a phone or tablet")) {
+	if !bytes.Contains(body, []byte("Approve Nearby Link")) {
+		t.Fatalf("dashboard body is missing Nearby Link approval action: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("Manual pairing code")) {
+		t.Fatalf("dashboard body is missing separated manual pairing method: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("pairing-methods")) {
+		t.Fatalf("dashboard body is missing pairing method layout: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("nearbyLinkCode")) {
+		t.Fatalf("dashboard body is missing Nearby Link code input: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("/v1/nearby-links/approve")) {
+		t.Fatalf("dashboard body is missing Nearby Link approval API call: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("manual one-time code for fallback pairing")) {
 		t.Fatalf("dashboard body is missing pairing explanation: %s", recorder.Body.String())
 	}
 	if !bytes.Contains(body, []byte("copyPairingCode")) {
@@ -272,6 +287,9 @@ func TestAdminRoutesRequireAuthentication(t *testing.T) {
 		{method: http.MethodGet, path: "/v1/datasource/primary"},
 		{method: http.MethodPut, path: "/v1/datasource/primary"},
 		{method: http.MethodPost, path: "/v1/datasource/primary/check"},
+		{method: http.MethodGet, path: "/v1/nearby-links"},
+		{method: http.MethodPost, path: "/v1/nearby-links/approve"},
+		{method: http.MethodPost, path: "/v1/nearby-links/link-1/deny"},
 		{method: http.MethodPost, path: "/v1/pairing-sessions"},
 		{method: http.MethodPost, path: "/v1/pairing-links"},
 		{method: http.MethodPost, path: "/v1/compatibility-check"},
@@ -722,6 +740,78 @@ func TestPairingSessionsCreatesSession(t *testing.T) {
 	}
 	if !hasAgentBaseURLChoice(payload.AgentBaseURLChoices, "http://agent.local:8082") {
 		t.Fatalf("agentBaseURLChoices = %#v, want current Admin UI host candidate", payload.AgentBaseURLChoices)
+	}
+}
+
+func TestNearbyLinksListApproveAndDeny(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestRuntime(t, 5)
+	handler := NewMux(runtime)
+	created, err := runtime.CreateNearbyLink("Living Room TV", "android_tv")
+	if err != nil {
+		t.Fatalf("CreateNearbyLink() error = %v", err)
+	}
+
+	listRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(listRecorder, authenticatedRequest(http.MethodGet, "/v1/nearby-links", nil))
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("list status = %d, want 200 body=%s", listRecorder.Code, listRecorder.Body.String())
+	}
+	var listPayload struct {
+		NearbyLinks []struct {
+			LinkID    string `json:"linkId"`
+			LinkCode  string `json:"linkCode"`
+			PollToken string `json:"pollToken"`
+			Status    string `json:"status"`
+		} `json:"nearbyLinks"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &listPayload); err != nil {
+		t.Fatalf("list response is not JSON: %v body=%s", err, listRecorder.Body.String())
+	}
+	if len(listPayload.NearbyLinks) != 1 || listPayload.NearbyLinks[0].LinkID != created.LinkID || listPayload.NearbyLinks[0].Status != "pending" {
+		t.Fatalf("nearbyLinks = %+v, want created pending link", listPayload.NearbyLinks)
+	}
+	if listPayload.NearbyLinks[0].PollToken != "" {
+		t.Fatalf("admin list exposed poll token %q", listPayload.NearbyLinks[0].PollToken)
+	}
+
+	approveBody := bytes.NewReader([]byte(`{"linkCode":"` + created.LinkCode + `"}`))
+	approveRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(approveRecorder, authenticatedRequest(http.MethodPost, "/v1/nearby-links/approve", approveBody))
+	if approveRecorder.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want 200 body=%s", approveRecorder.Code, approveRecorder.Body.String())
+	}
+	var approved struct {
+		LinkID    string `json:"linkId"`
+		PollToken string `json:"pollToken"`
+		Status    string `json:"status"`
+	}
+	if err := json.Unmarshal(approveRecorder.Body.Bytes(), &approved); err != nil {
+		t.Fatalf("approve response is not JSON: %v body=%s", err, approveRecorder.Body.String())
+	}
+	if approved.LinkID != created.LinkID || approved.Status != "approved" || approved.PollToken != "" {
+		t.Fatalf("approved = %+v, want approved link without poll token", approved)
+	}
+
+	denyCandidate, err := runtime.CreateNearbyLink("Bedroom TV", "android_tv")
+	if err != nil {
+		t.Fatalf("CreateNearbyLink() deny candidate error = %v", err)
+	}
+	denyRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(denyRecorder, authenticatedRequest(http.MethodPost, "/v1/nearby-links/"+denyCandidate.LinkID+"/deny", nil))
+	if denyRecorder.Code != http.StatusOK {
+		t.Fatalf("deny status = %d, want 200 body=%s", denyRecorder.Code, denyRecorder.Body.String())
+	}
+	var denied struct {
+		LinkID string `json:"linkId"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(denyRecorder.Body.Bytes(), &denied); err != nil {
+		t.Fatalf("deny response is not JSON: %v body=%s", err, denyRecorder.Body.String())
+	}
+	if denied.LinkID != denyCandidate.LinkID || denied.Status != "denied" {
+		t.Fatalf("denied = %+v, want denied candidate", denied)
 	}
 }
 

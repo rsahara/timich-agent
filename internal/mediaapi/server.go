@@ -39,6 +39,9 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 				"/v1/uploads/sessions/{uploadId}/chunk",
 				"/v1/uploads/sessions/{uploadId}/complete",
 				"/v1/uploads/sessions/{uploadId}/abort",
+				"/v1/nearby-links",
+				"/v1/nearby-links/{linkId}/cancel",
+				"/v1/nearby-links/{linkId}/poll",
 				"/v1/pairing/redeem",
 				"/v1/session/refresh",
 				"/v1/assets/{assetID}/preview",
@@ -76,6 +79,85 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 	})
 	mux.HandleFunc("/v1/info", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, runtime.InfoResponse())
+	})
+	mux.HandleFunc("/v1/nearby-links", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeMethodNotAllowed(w, "Use POST to start a Nearby Link request.")
+			return
+		}
+
+		var request struct {
+			DeviceName string `json:"deviceName"`
+			DeviceKind string `json:"deviceKind"`
+		}
+		if err := decodeJSONRequest(w, r, &request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_request",
+				"message": "Could not parse the Nearby Link request.",
+			})
+			return
+		}
+
+		response, err := runtime.CreateNearbyLink(request.DeviceName, request.DeviceKind)
+		if err != nil {
+			writeNearbyLinkError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, response)
+	})
+	mux.HandleFunc("/v1/nearby-links/", func(w http.ResponseWriter, r *http.Request) {
+		linkID, action, ok := parseNearbyLinkRequest(r.URL.Path)
+		if !ok || (action != "poll" && action != "cancel") {
+			writeRouteNotFound(w, "Unknown Nearby Link route.")
+			return
+		}
+		if action == "cancel" {
+			if r.Method != http.MethodPost {
+				writeMethodNotAllowed(w, "Use POST to cancel a Nearby Link request.")
+				return
+			}
+
+			var request struct {
+				PollToken string `json:"pollToken"`
+			}
+			if err := decodeJSONRequest(w, r, &request); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error":   "invalid_request",
+					"message": "Could not parse the Nearby Link cancel request.",
+				})
+				return
+			}
+
+			response, err := runtime.CancelNearbyLink(linkID, request.PollToken)
+			if err != nil {
+				writeNearbyLinkError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, response)
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeMethodNotAllowed(w, "Use POST to poll a Nearby Link request.")
+			return
+		}
+
+		var request struct {
+			PollToken string `json:"pollToken"`
+		}
+		if err := decodeJSONRequest(w, r, &request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_request",
+				"message": "Could not parse the Nearby Link polling request.",
+			})
+			return
+		}
+
+		response, err := runtime.PollNearbyLink(linkID, request.PollToken, requestBaseURL(r))
+		if err != nil {
+			writeNearbyLinkError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, response)
 	})
 	mux.HandleFunc("/v1/pairing/redeem", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -442,6 +524,18 @@ func parseUploadSessionRequest(path string) (uploadID string, action string, ok 
 	return "", "", false
 }
 
+func parseNearbyLinkRequest(path string) (linkID string, action string, ok bool) {
+	trimmedPath := strings.Trim(strings.TrimPrefix(path, "/v1/nearby-links/"), "/")
+	if trimmedPath == "" {
+		return "", "", false
+	}
+	parts := strings.Split(trimmedPath, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
 func parseRequiredInt64Header(r *http.Request, name string) (int64, error) {
 	rawValue := strings.TrimSpace(r.Header.Get(name))
 	if rawValue == "" {
@@ -517,6 +611,46 @@ func writePairingError(w http.ResponseWriter, err error) {
 		status = http.StatusGone
 		errorCode = "pairing_used"
 		message = "The pairing code has already been redeemed."
+	case errors.Is(err, store.ErrDeviceLimitReached):
+		status = http.StatusConflict
+		errorCode = "device_limit_reached"
+		message = "The local agent has reached its paired-device limit."
+	}
+	writeJSON(w, status, map[string]string{
+		"error":   errorCode,
+		"message": message,
+	})
+}
+
+func writeNearbyLinkError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	errorCode := "nearby_link_failed"
+	message := "Could not complete the Nearby Link request."
+	switch {
+	case errors.Is(err, store.ErrNearbyLinkNotFound):
+		status = http.StatusNotFound
+		errorCode = "nearby_link_not_found"
+		message = "The Nearby Link request was not found."
+	case errors.Is(err, store.ErrNearbyLinkDenied):
+		status = http.StatusGone
+		errorCode = "nearby_link_denied"
+		message = "The Nearby Link request was denied."
+	case errors.Is(err, store.ErrNearbyLinkNotApproved):
+		status = http.StatusConflict
+		errorCode = "nearby_link_pending"
+		message = "The Nearby Link request is still waiting for approval."
+	case errors.Is(err, store.ErrNearbyLinkConsumed):
+		status = http.StatusGone
+		errorCode = "nearby_link_used"
+		message = "The Nearby Link request has already been used."
+	case errors.Is(err, store.ErrNearbyLinkPollTokenInvalid):
+		status = http.StatusUnauthorized
+		errorCode = "nearby_link_poll_token_invalid"
+		message = "The Nearby Link polling token is not valid."
+	case errors.Is(err, store.ErrNearbyLinkLimitReached):
+		status = http.StatusTooManyRequests
+		errorCode = "nearby_link_limit_reached"
+		message = "Too many Nearby Link requests are active. Try again shortly."
 	case errors.Is(err, store.ErrDeviceLimitReached):
 		status = http.StatusConflict
 		errorCode = "device_limit_reached"
