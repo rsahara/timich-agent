@@ -468,26 +468,7 @@ dist:
 	@printf '%s\n' \
 		".local" \
 		"media-runtime" > "$(DIST_STAGE)/.dockerignore"
-	@printf '%s\n' \
-		"FROM alpine:3.22" \
-		"" \
-		"RUN apk add --no-cache ca-certificates ffmpeg vips-tools vips-heif" \
-		"" \
-		"WORKDIR /app" \
-		"" \
-		"COPY timich-agent /usr/local/bin/timich-agent" \
-		"COPY timich-semantic-helper /usr/local/bin/timich-semantic-helper" \
-		"COPY timich-media-helper /usr/local/bin/timich-media-helper" \
-		"COPY semantic-runtime /usr/local/bin/semantic-runtime" \
-		"COPY docker/entrypoint.sh /usr/local/bin/timich-agent-entrypoint" \
-		"" \
-		"RUN chmod +x /usr/local/bin/timich-agent-entrypoint && \\" \
-		"	mkdir -p /var/lib/timich-agent" \
-		"" \
-		"EXPOSE 8081 8082" \
-		"" \
-		"ENTRYPOINT [\"/usr/local/bin/timich-agent-entrypoint\"]" \
-		"CMD []" > "$(DIST_STAGE)/Dockerfile"
+	@cp docker/release-bundle.Dockerfile "$(DIST_STAGE)/Dockerfile"
 	@bash tools/release/render_bundle_compose.sh \
 		compose.yaml \
 		"$(DIST_STAGE)/compose.yaml" \

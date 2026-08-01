@@ -33,8 +33,8 @@ Package the runtime for local thumbnail decoding, not general media encoding:
   native libraries
 - validate with real camera-origin JPEG, PNG, WebP, HEIC, and HEIF fixtures
 
-Docker images install their own Alpine `vips-tools` and `vips-heif` packages, so
-this directory is for direct native release archives.
+Docker images install Debian's `libvips-tools` package, so this directory is for
+direct native release archives.
 
 ## Builder
 
@@ -79,11 +79,10 @@ HEVC-related codec libraries such as `x265-libs`.
 - the QNAP host did not have a native `vips` executable on `PATH`
 - no camera-origin `.heic` or `.heif` fixture was present in the inspected NAS
   media roots, so real-camera HEIC/HEIF validation remains open
-- Alpine `vips-tools` plus `vips-heif` on the NAS Docker engine exposed
-  `heifload` and `heifsave`; a generated HEIC input could be rendered to a JPEG
-  thumbnail through `vips thumbnail`
-- the Alpine package path pulled `x265-libs` as a dependency of `vips-heif`.
-  Treat that as a release licensing decision point: either accept the Docker
-  image's GPL-adjacent dependency posture, or assemble a decode-focused libvips
-  runtime that keeps HEIC/HEIF decoding support without encoder dependencies
-  such as x265.
+- the then-current Alpine `vips-tools` plus `vips-heif` image on the NAS Docker
+  engine exposed `heifload` and `heifsave`; a generated HEIC input could be
+  rendered to a JPEG thumbnail through `vips thumbnail`
+- the historical Alpine package path pulled `x265-libs` as a dependency of
+  `vips-heif`. Current Docker images use Debian packages; their transitive codec
+  set still requires release review, or a decode-focused libvips runtime should
+  replace distribution packages.

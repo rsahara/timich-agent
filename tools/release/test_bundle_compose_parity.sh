@@ -6,6 +6,7 @@ agent_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 source_compose="$agent_root/compose.yaml"
 local_media_compose="$agent_root/compose.local-media.example.yaml"
 public_readme="$agent_root/README.md"
+bundle_dockerfile="$agent_root/docker/release-bundle.Dockerfile"
 renderer="$script_dir/render_bundle_compose.sh"
 temporary_dir=$(mktemp -d)
 trap 'rm -rf "$temporary_dir"' EXIT
@@ -76,6 +77,11 @@ grep -Fq \
 grep -Fq \
   'cp compose.local-media.example.yaml' \
   "$temporary_dir/dist-dry-run"
+grep -Fq \
+  'cp docker/release-bundle.Dockerfile' \
+  "$temporary_dir/dist-dry-run"
+grep -Fxq 'FROM debian:bookworm-slim' "$bundle_dockerfile"
+grep -Fq 'libvips-tools' "$bundle_dockerfile"
 grep -Fq \
   '"# TIMICH_AGENT_LOCAL_MEDIA_HOST_PATH=/share/Photos"' \
   "$temporary_dir/dist-dry-run"

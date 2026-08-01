@@ -33,8 +33,8 @@ Package the runtime for thumbnail decoding, not general media encoding:
   native libraries and codecs
 - validate with real camera-origin MP4 and MOV fixtures before publishing
 
-Docker images install their own Alpine `ffmpeg` package, so this directory is
-for direct native release archives.
+Docker images install Debian's `ffmpeg` package, so this directory is for direct
+native release archives.
 
 ## Building the Runtime
 
