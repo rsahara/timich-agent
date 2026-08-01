@@ -113,13 +113,15 @@ download_and_verify() {
   # GNU Bash reports and accepts ulimit -f in 1024-byte blocks outside POSIX
   # mode, which is how this script runs on the protected Ubuntu runner.
   file_limit_blocks=$(((remote_size + 1023) / 1024))
-  (
-    ulimit -f "$file_limit_blocks"
-    gh release download "$staging_tag" \
+  if ! (
+    ulimit -f "$file_limit_blocks" || exit 1
+    exec gh release download "$staging_tag" \
       --repo "$target_repository" \
       --pattern "$remote_name" \
       --dir "$output_dir"
-  )
+  ); then
+    fail "semantic release asset $remote_name download exceeded its declared size or failed"
+  fi
   [ -f "$local_path" ] || fail "semantic release asset $remote_name was not downloaded"
   local_size=$(wc -c < "$local_path" | tr -d '[:space:]')
   local_sha256=$(sha256sum "$local_path" | awk '{print $1}')
