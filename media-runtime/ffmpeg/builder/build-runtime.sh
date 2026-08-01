@@ -33,9 +33,18 @@ trap 'rm -rf "$work_dir"' EXIT INT TERM
 
 cd "$work_dir"
 
-curl -fsSL "$source_url" -o ffmpeg.tar.xz
-curl -fsSL "${source_url}.asc" -o ffmpeg.tar.xz.asc
-curl -fsSL "$gpg_key_url" -o ffmpeg-devel.asc
+download() {
+  curl -fsSL \
+    --connect-timeout 20 \
+    --retry 5 \
+    --retry-all-errors \
+    --retry-delay 2 \
+    "$1" -o "$2"
+}
+
+download "$source_url" ffmpeg.tar.xz
+download "${source_url}.asc" ffmpeg.tar.xz.asc
+download "$gpg_key_url" ffmpeg-devel.asc
 sh "$script_dir/verify-source-signature.sh" \
   ffmpeg-devel.asc \
   ffmpeg.tar.xz.asc \
