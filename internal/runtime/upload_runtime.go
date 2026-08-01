@@ -205,6 +205,18 @@ func (a *AgentRuntime) StartUploadSession(deviceID string, input UploadSessionSt
 			Reason: "Upload root is not configured.",
 		}), nil
 	}
+	if err := a.ensureStateWritesAvailable(); err != nil {
+		return blockedUploadSessionResponse(DeviceUploadPolicyStatus{
+			State:  "blocked",
+			Reason: storageBlockedReason(err),
+		}), nil
+	}
+	if err := ensurePathWritesAvailable(root.Path); err != nil {
+		return blockedUploadSessionResponse(DeviceUploadPolicyStatus{
+			State:  "blocked",
+			Reason: storageBlockedReason(err),
+		}), nil
+	}
 	now := time.Now().UTC()
 	if session, ok, err := a.uploads.GetActiveSessionBySourceIdentity(
 		device.DeviceID,
@@ -289,6 +301,12 @@ func (a *AgentRuntime) AppendUploadChunk(deviceID string, uploadID string, input
 	if err != nil {
 		return UploadSessionActionResponse{}, err
 	}
+	if err := a.ensureStateWritesAvailable(); err != nil {
+		return UploadSessionActionResponse{}, err
+	}
+	if err := ensurePathWritesAvailable(root.Path); err != nil {
+		return UploadSessionActionResponse{}, err
+	}
 	if session.NextOffset != input.Offset {
 		return UploadSessionActionResponse{}, store.ErrUploadSessionOffsetConflict
 	}
@@ -342,6 +360,7 @@ func (a *AgentRuntime) CompleteUploadSession(deviceID string, uploadID string, i
 		return UploadSessionActionResponse{}, err
 	} else if ok {
 		if asset.Status == "uploaded" {
+			a.scheduleLocalDiscoveryAfterUpload(asset)
 			return completedUploadResponse(asset), nil
 		}
 		if recovered, ok, err := a.recoverPendingUploadAssetLocked(asset); err != nil {
@@ -398,6 +417,7 @@ func (a *AgentRuntime) CompleteUploadSession(deviceID string, uploadID string, i
 	if err != nil {
 		return UploadSessionActionResponse{}, err
 	}
+	a.scheduleLocalDiscoveryAfterUpload(uploaded)
 	return completedUploadResponse(uploaded), nil
 }
 
@@ -471,10 +491,34 @@ func (a *AgentRuntime) deviceUploadEffectiveStatus(upload store.DeviceUploadProf
 			Root:   &appRootStatus,
 		}
 	}
+	if err := a.ensureStateWritesAvailable(); err != nil {
+		return DeviceUploadPolicyStatus{
+			State:  "blocked",
+			Reason: storageBlockedReason(err),
+			Root:   &appRootStatus,
+		}
+	}
+	if err := ensurePathWritesAvailable(root.Path); err != nil {
+		return DeviceUploadPolicyStatus{
+			State:  "blocked",
+			Reason: storageBlockedReason(err),
+			Root:   &appRootStatus,
+		}
+	}
 	return DeviceUploadPolicyStatus{
 		State: "ready",
 		Root:  &appRootStatus,
 	}
+}
+
+func storageBlockedReason(err error) string {
+	message := strings.TrimSpace(err.Error())
+	prefix := ErrStorageWriteBlocked.Error() + ":"
+	message = strings.TrimSpace(strings.TrimPrefix(message, prefix))
+	if message == "" {
+		return "Storage free space is below the write guardrail."
+	}
+	return message
 }
 
 func (a *AgentRuntime) uploadRootConfig(rootKey string) (config.UploadRootConfig, bool) {
@@ -1137,6 +1181,7 @@ func (a *AgentRuntime) recoverPendingUploadAssetLocked(asset store.UploadedAsset
 		} else if ok {
 			_, _ = removeUploadTempFile(root, session.TempRelativePath)
 		}
+		a.scheduleLocalDiscoveryAfterUpload(uploaded)
 		return uploaded, true, nil
 	}
 	session, ok, err := a.uploads.GetSession(asset.UploadID)
@@ -1165,6 +1210,7 @@ func (a *AgentRuntime) recoverPendingUploadAssetLocked(asset store.UploadedAsset
 		}
 		return store.UploadedAsset{}, false, err
 	}
+	a.scheduleLocalDiscoveryAfterUpload(uploaded)
 	return uploaded, true, nil
 }
 

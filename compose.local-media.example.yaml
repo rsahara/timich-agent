@@ -1,0 +1,18 @@
+# Optional read-only Local datasource mount for Docker Compose installs.
+#
+# Use with:
+#   cp compose.local-media.example.yaml compose.local-media.yaml
+#   set TIMICH_AGENT_LOCAL_MEDIA_HOST_PATH in .env
+#   docker compose -f compose.yaml -f compose.local-media.yaml up -d --build
+#
+# The container path /media/photos must also be registered in
+# .local/agent.json under localMediaRoots before the Admin UI can add a Local
+# datasource. Stop the Agent before editing that file, then restart it with the
+# same Compose file list.
+services:
+  timich-agent:
+    volumes:
+      - type: bind
+        source: "${TIMICH_AGENT_LOCAL_MEDIA_HOST_PATH:?set TIMICH_AGENT_LOCAL_MEDIA_HOST_PATH in .env}"
+        target: /media/photos
+        read_only: true

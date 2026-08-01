@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -87,6 +88,39 @@ func TestMuxRootOnlyServesRouteIndex(t *testing.T) {
 	}
 }
 
+func TestWriteCatalogErrorMapsDatasourceFailureToBadGateway(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	writeCatalogError(recorder, fmt.Errorf("upstream auth failed: %w", catalog.ErrDatasourceUnavailable))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadGateway)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["error"] != "datasource_unavailable" {
+		t.Fatalf("error = %#v, want datasource_unavailable", payload["error"])
+	}
+}
+
+func TestParseAssetRequestSupportsMetadataAndMediaRoutes(t *testing.T) {
+	t.Parallel()
+
+	assetID, variant, ok := parseAssetRequest("/v1/assets/ta1_asset.signature")
+	if !ok || assetID != "ta1_asset.signature" || variant != "" {
+		t.Fatalf("metadata route = (%q, %q, %v)", assetID, variant, ok)
+	}
+	assetID, variant, ok = parseAssetRequest("/v1/assets/ta1_asset.signature/preview")
+	if !ok || assetID != "ta1_asset.signature" || variant != "preview" {
+		t.Fatalf("preview route = (%q, %q, %v)", assetID, variant, ok)
+	}
+	if _, _, ok := parseAssetRequest("/v1/assets/ta1_asset.signature/"); ok {
+		t.Fatal("trailing-slash asset route should be rejected")
+	}
+}
+
 func TestCopyProxyResponseCopiesStreamingHeaders(t *testing.T) {
 	t.Parallel()
 
@@ -95,6 +129,7 @@ func TestCopyProxyResponseCopiesStreamingHeaders(t *testing.T) {
 		StatusCode: http.StatusPartialContent,
 		Header: http.Header{
 			"Content-Type":   []string{"video/mp4"},
+			"Cache-Control":  []string{"public, s-maxage=86400"},
 			"Accept-Ranges":  []string{"bytes"},
 			"Content-Range":  []string{"bytes 0-1/100"},
 			"Content-Length": []string{"2"},
@@ -116,6 +151,9 @@ func TestCopyProxyResponseCopiesStreamingHeaders(t *testing.T) {
 	}
 	if recorder.Header().Get("Server-Timing") != "total;dur=12.0" {
 		t.Fatalf("expected Server-Timing header, got %q", recorder.Header().Get("Server-Timing"))
+	}
+	if recorder.Header().Get("Cache-Control") != "private, max-age=3600" {
+		t.Fatalf("Cache-Control = %q, want private media policy", recorder.Header().Get("Cache-Control"))
 	}
 	if recorder.Body.String() != "ok" {
 		t.Fatalf("expected body ok, got %q", recorder.Body.String())
@@ -450,6 +488,23 @@ func TestWriteUploadErrorMapsFinalPathConflict(t *testing.T) {
 	}
 	if payload["error"] != "upload_final_path_conflict" {
 		t.Fatalf("error = %q, want upload_final_path_conflict", payload["error"])
+	}
+}
+
+func TestWriteUploadErrorMapsStorageWriteBlocked(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	writeUploadError(recorder, runtimestate.ErrStorageWriteBlocked)
+	if recorder.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, want 507 body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
+	}
+	if payload["error"] != "storage_write_blocked" {
+		t.Fatalf("error = %q, want storage_write_blocked", payload["error"])
 	}
 }
 

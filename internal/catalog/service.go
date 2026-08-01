@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,12 +14,15 @@ import (
 	imagedraw "image/draw"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
-	"path/filepath"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rsahara/timich-agent/internal/config"
@@ -33,7 +37,12 @@ import (
 
 var ErrNoDatasourceConfigured = errors.New("no datasource configured")
 var ErrMediaTooLarge = errors.New("media response too large")
+var ErrMediaInvalid = errors.New("media response invalid")
 var ErrAssetNotFound = errors.New("asset not found")
+var ErrDatasourceUnavailable = errors.New("datasource unavailable")
+var ErrSemanticAssetInput = errors.New("semantic asset input invalid")
+var ErrSemanticSourceUnavailable = errors.New("semantic datasource unavailable")
+var ErrSemanticRuntimeUnavailable = errors.New("semantic embedding runtime unavailable")
 var ErrInvalidSearchRequest = errors.New("invalid search request")
 var ErrUnsupportedSearch = errors.New("unsupported search")
 
@@ -47,22 +56,34 @@ const (
 	detailPreviewMaxBytes      = 1 << 20
 	detailPreviewMaxSource     = 32 << 20
 	statisticsTotalCacheTTL    = time.Minute
+	statisticsFailureCacheTTL  = 15 * time.Second
+	statisticsRequestTimeout   = 2 * time.Second
 	defaultPageSize            = 60
 	maxPageSize                = 200
+	semanticRetryBaseInterval  = 30 * time.Second
+	semanticRetryMaxInterval   = 30 * time.Minute
+	mediaFallbackSourceTimeout = 3 * time.Second
+	mediaFallbackSourceBackoff = 30 * time.Second
 )
 
 var (
 	previewJPEGQualities       = []int{58, 50, 42}
 	detailPreviewJPEGQualities = []int{detailPreviewJPEGQuality, 70, 58, 50, 42}
+
+	// ErrSemanticSearchIndexNotReady means no searchable image semantic index is
+	// currently available to load into the in-memory search cache.
+	ErrSemanticSearchIndexNotReady = errors.New("semantic search index is not ready")
 )
 
 // Asset matches the Timich app-facing asset model returned to clients.
 type Asset struct {
-	ID         string    `json:"id"`
-	Type       string    `json:"type"`
-	Filename   string    `json:"filename"`
-	CapturedAt time.Time `json:"capturedAt"`
-	Duration   *string   `json:"duration,omitempty"`
+	SourceKey     string    `json:"-"`
+	ID            string    `json:"id"`
+	Type          string    `json:"type"`
+	Filename      string    `json:"filename"`
+	CapturedAt    time.Time `json:"capturedAt"`
+	Duration      *string   `json:"duration,omitempty"`
+	SemanticScore *float32  `json:"semanticScore,omitempty"`
 }
 
 // AssetSearchRequest describes a page from a browsable Timich asset collection.
@@ -135,6 +156,7 @@ type AssetSearchPage struct {
 	Items         []Asset                `json:"items"`
 	Total         int                    `json:"total"`
 	TotalAccuracy string                 `json:"totalAccuracy"`
+	ElapsedMs     int64                  `json:"elapsedMs,omitempty"`
 	NextPageIndex *int                   `json:"nextPageIndex,omitempty"`
 	Boundary      *AssetSearchBoundary   `json:"boundary,omitempty"`
 	Resolved      AssetSearchResolved    `json:"resolved"`
@@ -145,18 +167,75 @@ type AssetSearchBoundary struct {
 }
 
 type AssetSearchResolved struct {
-	CollectionKind string          `json:"collectionKind"`
-	QueryMode      string          `json:"queryMode"`
-	Sort           AssetSearchSort `json:"sort"`
-	TimelineLike   bool            `json:"timelineLike"`
+	CollectionKind string                         `json:"collectionKind"`
+	QueryMode      string                         `json:"queryMode"`
+	Sort           AssetSearchSort                `json:"sort"`
+	TimelineLike   bool                           `json:"timelineLike"`
+	Semantic       *AssetSearchSemanticResolution `json:"semantic,omitempty"`
+}
+
+type AssetSearchSemanticResolution struct {
+	Status               string                   `json:"status"`
+	Eligible             bool                     `json:"eligible"`
+	ModelID              string                   `json:"modelId,omitempty"`
+	VectorSpaceID        string                   `json:"vectorSpaceId,omitempty"`
+	EmbeddingDim         int                      `json:"embeddingDim,omitempty"`
+	ProfileKind          string                   `json:"profileKind,omitempty"`
+	InputKind            string                   `json:"inputKind,omitempty"`
+	CompletedVectorCount int                      `json:"completedVectorCount"`
+	IndexedVectorCount   int                      `json:"indexedVectorCount"`
+	MessageCode          string                   `json:"messageCode,omitempty"`
+	FallbackQueryMode    string                   `json:"fallbackQueryMode,omitempty"`
+	ModelPack            *SemanticModelPackStatus `json:"modelPack,omitempty"`
 }
 
 type AssetSearchCapabilities struct {
-	QueryModes    []string                      `json:"queryModes"`
-	Filters       AssetSearchFilterCapabilities `json:"filters"`
-	Sorts         []AssetSearchSortCapability   `json:"sorts"`
-	TotalAccuracy []string                      `json:"totalAccuracy"`
-	Page          AssetSearchPageCapabilities   `json:"page"`
+	QueryModes    []string                         `json:"queryModes"`
+	Filters       AssetSearchFilterCapabilities    `json:"filters"`
+	Sorts         []AssetSearchSortCapability      `json:"sorts"`
+	TotalAccuracy []string                         `json:"totalAccuracy"`
+	Page          AssetSearchPageCapabilities      `json:"page"`
+	Semantic      *AssetSearchSemanticCapabilities `json:"semantic,omitempty"`
+}
+
+type AssetSearchSemanticCapabilities struct {
+	Status               string                   `json:"status"`
+	ModelID              string                   `json:"modelId,omitempty"`
+	VectorSpaceID        string                   `json:"vectorSpaceId,omitempty"`
+	EmbeddingDim         int                      `json:"embeddingDim,omitempty"`
+	ProfileKind          string                   `json:"profileKind,omitempty"`
+	InputKind            string                   `json:"inputKind,omitempty"`
+	CompletedVectorCount int                      `json:"completedVectorCount"`
+	IndexedVectorCount   int                      `json:"indexedVectorCount"`
+	MessageCode          string                   `json:"messageCode,omitempty"`
+	ModelPack            *SemanticModelPackStatus `json:"modelPack,omitempty"`
+}
+
+type SemanticModelPackStatus struct {
+	ID             string                       `json:"id,omitempty"`
+	Name           string                       `json:"name,omitempty"`
+	Version        string                       `json:"version,omitempty"`
+	Role           string                       `json:"role,omitempty"`
+	Status         string                       `json:"status,omitempty"`
+	Source         string                       `json:"source,omitempty"`
+	InputKind      string                       `json:"inputKind,omitempty"`
+	VectorSpaceID  string                       `json:"vectorSpaceId,omitempty"`
+	EmbeddingDim   int                          `json:"embeddingDim,omitempty"`
+	QueryLanguages []string                     `json:"queryLanguages,omitempty"`
+	Runtime        string                       `json:"runtime,omitempty"`
+	Quantization   string                       `json:"quantization,omitempty"`
+	SizeBytes      int64                        `json:"sizeBytes,omitempty"`
+	License        string                       `json:"license,omitempty"`
+	Artifact       *SemanticModelArtifactStatus `json:"artifact,omitempty"`
+	Installed      bool                         `json:"installed"`
+	InstalledAt    time.Time                    `json:"installedAt,omitempty"`
+}
+
+type SemanticModelArtifactStatus struct {
+	Filename  string `json:"filename,omitempty"`
+	URL       string `json:"url,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	SizeBytes int64  `json:"sizeBytes,omitempty"`
 }
 
 type AssetSearchFilterCapabilities struct {
@@ -177,6 +256,12 @@ type normalizedAssetSearch struct {
 	Request       AssetSearchRequest
 	Resolved      AssetSearchResolved
 	CollectionKey string
+}
+
+type AssetSearchOptions struct {
+	IncludeSemanticScores bool
+	SemanticModelID       string
+	SemanticVectorSpaceID string
 }
 
 const (
@@ -234,73 +319,703 @@ type hostedImageProfile struct {
 	ForceJPEG      bool
 }
 
-// Service proxies the first configured Immich datasource for local catalog/media reads.
+// Service proxies configured datasources for local catalog/media reads.
 type Service struct {
 	client *http.Client
 
-	mu            sync.Mutex
-	datasource    *config.DatasourceConfig
-	staticDemo    *staticDemoSource
-	staticDemoErr error
-	cachedTotal   int
-	cachedTotalAt time.Time
+	mu                           sync.Mutex
+	localRootTransitionGatesMu   sync.Mutex
+	localRootTransitionGates     map[localMediaRootTransitionKey]*localMediaRootTransitionGate
+	dataDir                      string
+	mediaHelperPath              string
+	mediaHelperAuto              bool
+	mediaHelperCheck             localMediaHelperCapabilityStatus
+	mediaVipsPath                string
+	mediaVipsAuto                bool
+	mediaVipsBundle              bool
+	mediaFFmpegPath              string
+	mediaFFmpegAuto              bool
+	mediaFFmpegCheck             localFFmpegCapabilityStatus
+	stateWriteCheck              func() error
+	statisticsTotalCache         map[immichStatisticsTotalCacheKey]immichStatisticsTotalCacheEntry
+	semanticSourceRetry          map[string]semanticSourceRetryState
+	semanticSourceNow            func() time.Time
+	mediaSourceRetry             map[string]time.Time
+	localWorkNotify              func()
+	localClaimRecoveryMu         sync.Mutex
+	localMetadataRecoveries      map[int64]localMetadataJob
+	localThumbnailRecoveries     map[int64]localThumbnailJob
+	localContentVerificationHash func(context.Context, *os.File) (string, int64, os.FileInfo, error)
+	datasourceGeneration         atomic.Uint64
+	datasourceState              atomic.Pointer[serviceDatasourceState]
+	catalog                      *CatalogStore
+	semanticModels               *SemanticModelPackStore
+	semanticText                 *semanticTextEmbeddingCache
 }
 
-// NewService creates a local catalog/media proxy for the first configured datasource.
-func NewService(datasources []config.DatasourceConfig) *Service {
-	service := &Service{
-		client: &http.Client{Timeout: 30 * time.Second},
+// SetLocalWorkNotifier installs the runtime wake hook used when Local work is
+// committed or request-time validation discovers work that must be regenerated.
+func (s *Service) SetLocalWorkNotifier(notify func()) {
+	if s == nil {
+		return
 	}
-	if len(datasources) > 0 {
-		datasource := datasources[0]
-		service.datasource = &datasource
-		if datasource.Kind == config.DatasourceKindStaticDemo {
-			service.staticDemo, service.staticDemoErr = newStaticDemoSource(datasource.URL)
-		}
-	}
-	return service
+	s.mu.Lock()
+	s.localWorkNotify = notify
+	s.mu.Unlock()
 }
 
-// Ready reports whether an upstream datasource is configured.
-func (s *Service) Ready() bool {
-	if s.datasource == nil {
+func (s *Service) notifyLocalWorkQueued() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	notify := s.localWorkNotify
+	s.mu.Unlock()
+	if notify != nil {
+		notify()
+	}
+}
+
+type semanticSourceRetryState struct {
+	Attempts  int
+	NotBefore time.Time
+}
+
+type serviceDatasourceState struct {
+	generation       uint64
+	primary          *config.DatasourceConfig
+	datasources      map[string]config.DatasourceConfig
+	localRoots       map[string]config.LocalMediaRootConfig
+	staticDemo       *staticDemoSource
+	staticDemoErr    error
+	galleryReadiness catalogGalleryReadiness
+}
+
+func (s *serviceDatasourceState) ready() bool {
+	if s == nil || s.primary == nil {
 		return false
 	}
-	if s.datasource.Kind == config.DatasourceKindStaticDemo {
+	if s.primary.Kind == config.DatasourceKindStaticDemo {
 		return s.staticDemo != nil && s.staticDemoErr == nil
 	}
 	return true
 }
 
+// ServiceOptions configures optional local catalog state.
+type ServiceOptions struct {
+	DataDir                   string
+	LocalRoots                []config.LocalMediaRootConfig
+	SemanticModels            *SemanticModelPackStore
+	MediaHelperPath           string
+	MediaVipsPath             string
+	MediaFFmpegPath           string
+	StateWriteCheck           func() error
+	EnableDatasourceHotReload bool
+}
+
+type LocalMediaRuntimeStatus struct {
+	Renderer                     string `json:"renderer"`
+	MediaHelperPath              string `json:"mediaHelperPath,omitempty"`
+	MediaHelperAvailable         bool   `json:"mediaHelperAvailable"`
+	MediaHelperAuto              bool   `json:"mediaHelperAutoDetected"`
+	MediaHelperUsable            bool   `json:"mediaHelperUsable"`
+	MediaHelperStatus            string `json:"mediaHelperStatus,omitempty"`
+	MediaHelperVersion           string `json:"mediaHelperVersion,omitempty"`
+	MediaHelperPlatform          string `json:"mediaHelperPlatform,omitempty"`
+	MediaHelperRenderImage       bool   `json:"mediaHelperRenderImage"`
+	MediaHelperRenderVideoPoster bool   `json:"mediaHelperRenderVideoPoster"`
+	MediaHelperInspectImage      bool   `json:"mediaHelperInspectImage"`
+	MediaHelperInspectVideo      bool   `json:"mediaHelperInspectVideo"`
+	MediaHelperLastError         string `json:"mediaHelperLastError,omitempty"`
+	VipsPath                     string `json:"vipsPath,omitempty"`
+	VipsAvailable                bool   `json:"vipsAvailable"`
+	VipsAutoDetected             bool   `json:"vipsAutoDetected"`
+	VipsBundled                  bool   `json:"vipsBundled"`
+	FFmpegPath                   string `json:"ffmpegPath,omitempty"`
+	FFmpegAvailable              bool   `json:"ffmpegAvailable"`
+	FFmpegAuto                   bool   `json:"ffmpegAutoDetected"`
+	FFmpegUsable                 bool   `json:"ffmpegUsable"`
+	FFmpegStatus                 string `json:"ffmpegStatus,omitempty"`
+	FFmpegVersion                string `json:"ffmpegVersion,omitempty"`
+	FFmpegDecoders               string `json:"ffmpegDecoders,omitempty"`
+	FFmpegLastError              string `json:"ffmpegLastError,omitempty"`
+}
+
+type SemanticModelBackfillOptions struct {
+	MaxAssets                int
+	Workers                  int
+	SourceKeys               []string
+	DrainIndexJobs           bool
+	AllowPartialIndexPublish bool
+}
+
+// NewService creates a local catalog/media proxy for the first configured datasource.
+func NewService(datasources []config.DatasourceConfig) *Service {
+	service, _ := NewServiceWithOptions(datasources, ServiceOptions{})
+	return service
+}
+
+// NewServiceWithOptions creates a catalog service with optional persistent catalog state.
+func NewServiceWithOptions(datasources []config.DatasourceConfig, options ServiceOptions) (*Service, error) {
+	service := &Service{
+		client:            &http.Client{Timeout: 30 * time.Second},
+		dataDir:           strings.TrimSpace(options.DataDir),
+		semanticModels:    options.SemanticModels,
+		semanticText:      newSemanticTextEmbeddingCache(semanticTextEmbeddingCacheSize),
+		stateWriteCheck:   options.StateWriteCheck,
+		semanticSourceNow: time.Now,
+		mediaSourceRetry:  map[string]time.Time{},
+	}
+	service.mediaHelperPath, service.mediaHelperAuto = resolveMediaHelperPath(options.MediaHelperPath)
+	service.mediaVipsPath, service.mediaVipsAuto = resolveMediaVipsPath(options.MediaVipsPath)
+	service.mediaVipsBundle = localMediaVipsBundleRoot(service.mediaVipsPath) != ""
+	service.mediaFFmpegPath, service.mediaFFmpegAuto = resolveMediaFFmpegPath(options.MediaFFmpegPath)
+	state := newServiceDatasourceState(datasources, options.LocalRoots, service.datasourceGeneration.Add(1))
+	service.datasourceState.Store(state)
+	if strings.TrimSpace(options.DataDir) != "" && (options.EnableDatasourceHotReload || catalogStoreNeededForDatasources(datasources)) {
+		catalogStore, err := LoadOrCreateCatalogStore(options.DataDir)
+		if err != nil {
+			return nil, err
+		}
+		catalogStore.datasourceState = &service.datasourceState
+		service.catalog = catalogStore
+	}
+	return service, nil
+}
+
+func catalogStoreNeededForDatasources(datasources []config.DatasourceConfig) bool {
+	for _, datasource := range datasources {
+		if config.IsIndexedDatasourceKind(datasource.Kind) {
+			return true
+		}
+	}
+	return false
+}
+
+func newServiceDatasourceState(datasources []config.DatasourceConfig, localRoots []config.LocalMediaRootConfig, generation uint64) *serviceDatasourceState {
+	state := &serviceDatasourceState{generation: generation}
+	if len(localRoots) > 0 {
+		state.localRoots = make(map[string]config.LocalMediaRootConfig, len(localRoots))
+		for _, root := range localRoots {
+			key := strings.TrimSpace(root.Key)
+			if key != "" {
+				state.localRoots[key] = root
+			}
+		}
+	}
+	if len(datasources) > 0 {
+		state.datasources = make(map[string]config.DatasourceConfig, len(datasources))
+		for index, datasource := range datasources {
+			datasource = cloneServiceDatasourceConfig(datasource)
+			if index == 0 {
+				primary := datasource
+				state.primary = &primary
+				if datasource.Kind == config.DatasourceKindStaticDemo {
+					state.staticDemo, state.staticDemoErr = newStaticDemoSource(datasource.URL)
+				}
+			}
+			sourceKey := strings.TrimSpace(datasource.SourceKey)
+			if sourceKey != "" {
+				state.datasources[sourceKey] = datasource
+			}
+		}
+	}
+	state.galleryReadiness = catalogGalleryReadinessForDatasources(datasources)
+	return state
+}
+
+func cloneServiceDatasourceConfig(datasource config.DatasourceConfig) config.DatasourceConfig {
+	if datasource.Indexing != nil {
+		indexing := *datasource.Indexing
+		datasource.Indexing = &indexing
+	}
+	if datasource.Scan != nil {
+		scan := *datasource.Scan
+		if scan.ImmichFallbackEnabled != nil {
+			enabled := *scan.ImmichFallbackEnabled
+			scan.ImmichFallbackEnabled = &enabled
+		}
+		datasource.Scan = &scan
+	}
+	return datasource
+}
+
+func (s *Service) datasourceStateSnapshot() *serviceDatasourceState {
+	if s == nil {
+		return nil
+	}
+	return s.datasourceState.Load()
+}
+
+// ReconfigureDatasources atomically replaces immutable datasource policy while
+// retaining the Catalog's long-lived database and media runtime resources.
+func (s *Service) ReconfigureDatasources(datasources []config.DatasourceConfig) {
+	if s == nil {
+		return
+	}
+	current := s.datasourceStateSnapshot()
+	localRoots := []config.LocalMediaRootConfig{}
+	if current != nil {
+		localRoots = make([]config.LocalMediaRootConfig, 0, len(current.localRoots))
+		for _, root := range current.localRoots {
+			localRoots = append(localRoots, root)
+		}
+	}
+	nextState := newServiceDatasourceState(datasources, localRoots, s.datasourceGeneration.Add(1))
+	s.mu.Lock()
+	s.datasourceState.Store(nextState)
+	s.statisticsTotalCache = nil
+	s.semanticSourceRetry = nil
+	s.mu.Unlock()
+}
+
+func semanticRetryDelay(attempts int) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	delay := semanticRetryBaseInterval
+	for step := 1; step < attempts && delay < semanticRetryMaxInterval; step++ {
+		if delay > semanticRetryMaxInterval/2 {
+			return semanticRetryMaxInterval
+		}
+		delay *= 2
+	}
+	return min(delay, semanticRetryMaxInterval)
+}
+
+func (s *Service) semanticSourceRetryTime() time.Time {
+	if s != nil && s.semanticSourceNow != nil {
+		return s.semanticSourceNow().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (s *Service) semanticSourceRetryDeadline(sourceKey string, now time.Time) (*time.Time, bool) {
+	if s == nil {
+		return nil, false
+	}
+	sourceKey = strings.TrimSpace(sourceKey)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.semanticSourceRetry[sourceKey]
+	if !ok || state.NotBefore.IsZero() || !state.NotBefore.After(now.UTC()) {
+		return nil, false
+	}
+	deadline := state.NotBefore.UTC()
+	return &deadline, true
+}
+
+func (s *Service) deferSemanticSourceRetry(sourceKey string, now time.Time) time.Time {
+	sourceKey = strings.TrimSpace(sourceKey)
+	if s == nil || sourceKey == "" {
+		return now.UTC().Add(semanticRetryBaseInterval)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.semanticSourceRetry == nil {
+		s.semanticSourceRetry = map[string]semanticSourceRetryState{}
+	}
+	state := s.semanticSourceRetry[sourceKey]
+	state.Attempts++
+	state.NotBefore = now.UTC().Add(semanticRetryDelay(state.Attempts))
+	s.semanticSourceRetry[sourceKey] = state
+	return state.NotBefore
+}
+
+func (s *Service) clearSemanticSourceRetry(sourceKey string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.semanticSourceRetry, strings.TrimSpace(sourceKey))
+	s.mu.Unlock()
+}
+
+func catalogGalleryReadinessForDatasources(datasources []config.DatasourceConfig) catalogGalleryReadiness {
+	readiness := catalogGalleryReadiness{}
+	for _, datasource := range datasources {
+		sourceKey := strings.TrimSpace(datasource.SourceKey)
+		if sourceKey == "" {
+			continue
+		}
+		switch datasource.Kind {
+		case config.DatasourceKindLocalFiles:
+			if config.LocalDatasourceImmichFallbackEnabled(datasource) {
+				readiness.localImmichFallbackSourceKeys = append(readiness.localImmichFallbackSourceKeys, sourceKey)
+			}
+		case config.DatasourceKindImmichIndexed:
+			readiness.immichSourceKeys = append(readiness.immichSourceKeys, sourceKey)
+		}
+	}
+	return readiness
+}
+
+func (s *Service) ensureStateWritesAvailable() error {
+	if s == nil || s.stateWriteCheck == nil {
+		return nil
+	}
+	return s.stateWriteCheck()
+}
+
+func (s *Service) LocalMediaRuntimeStatus() LocalMediaRuntimeStatus {
+	return s.LocalMediaRuntimeStatusWithContext(context.Background())
+}
+
+func (s *Service) LocalMediaRuntimeStatusWithContext(ctx context.Context) LocalMediaRuntimeStatus {
+	if s == nil {
+		return LocalMediaRuntimeStatus{Renderer: "unavailable"}
+	}
+	helperStatus := s.localMediaHelperCapabilityStatusWithContext(ctx)
+	ffmpegStatus := s.localFFmpegCapabilityStatusWithContext(ctx)
+	renderer := "unavailable"
+	if strings.TrimSpace(s.mediaHelperPath) != "" {
+		renderer = "media-helper"
+	}
+	base := LocalMediaRuntimeStatus{
+		Renderer:                     renderer,
+		MediaHelperPath:              strings.TrimSpace(s.mediaHelperPath),
+		MediaHelperAvailable:         strings.TrimSpace(s.mediaHelperPath) != "",
+		MediaHelperAuto:              s.mediaHelperAuto,
+		MediaHelperUsable:            helperStatus.Usable,
+		MediaHelperStatus:            helperStatus.Status,
+		MediaHelperVersion:           helperStatus.Version,
+		MediaHelperPlatform:          helperStatus.Platform,
+		MediaHelperRenderImage:       helperStatus.RenderImage,
+		MediaHelperRenderVideoPoster: helperStatus.RenderVideoPoster,
+		MediaHelperInspectImage:      helperStatus.InspectImage,
+		MediaHelperInspectVideo:      helperStatus.InspectVideo,
+		MediaHelperLastError:         helperStatus.LastError,
+		FFmpegPath:                   strings.TrimSpace(s.mediaFFmpegPath),
+		FFmpegAvailable:              strings.TrimSpace(s.mediaFFmpegPath) != "",
+		FFmpegAuto:                   s.mediaFFmpegAuto,
+		FFmpegUsable:                 ffmpegStatus.Usable,
+		FFmpegStatus:                 ffmpegStatus.Status,
+		FFmpegVersion:                ffmpegStatus.Version,
+		FFmpegDecoders:               strings.Join(ffmpegStatus.Decoders, ", "),
+		FFmpegLastError:              ffmpegStatus.LastError,
+	}
+	if strings.TrimSpace(s.mediaVipsPath) == "" {
+		return base
+	}
+	base.VipsPath = s.mediaVipsPath
+	base.VipsAvailable = true
+	base.VipsAutoDetected = s.mediaVipsAuto
+	base.VipsBundled = s.mediaVipsBundle
+	return base
+}
+
+// Close releases local catalog resources.
+func (s *Service) Close() error {
+	if s == nil || s.catalog == nil {
+		return nil
+	}
+	return s.catalog.Close()
+}
+
+// Ready reports whether a configured datasource can serve catalog requests.
+func (s *Service) Ready() bool {
+	state := s.datasourceStateSnapshot()
+	return state.ready()
+}
+
 // SearchAssets returns one paginated asset page from the configured datasource.
 func (s *Service) SearchAssets(searchRequest AssetSearchRequest) (AssetSearchPage, error) {
-	if !s.Ready() {
+	return s.SearchAssetsWithOptionsContext(context.Background(), searchRequest, AssetSearchOptions{})
+}
+
+// SearchAssetsWithContext returns one paginated asset page from the configured datasource.
+func (s *Service) SearchAssetsWithContext(ctx context.Context, searchRequest AssetSearchRequest) (AssetSearchPage, error) {
+	return s.SearchAssetsWithOptionsContext(ctx, searchRequest, AssetSearchOptions{})
+}
+
+// SearchAssetsWithOptions returns one asset page with optional diagnostics for Admin tooling.
+func (s *Service) SearchAssetsWithOptions(searchRequest AssetSearchRequest, options AssetSearchOptions) (AssetSearchPage, error) {
+	return s.SearchAssetsWithOptionsContext(context.Background(), searchRequest, options)
+}
+
+// SearchAssetsWithOptionsContext returns one asset page with optional diagnostics for Admin tooling.
+func (s *Service) SearchAssetsWithOptionsContext(ctx context.Context, searchRequest AssetSearchRequest, options AssetSearchOptions) (AssetSearchPage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	state := s.datasourceStateSnapshot()
+	if !state.ready() {
 		return AssetSearchPage{}, ErrNoDatasourceConfigured
 	}
 	normalized, err := normalizeAssetSearchRequest(searchRequest)
 	if err != nil {
 		return AssetSearchPage{}, err
 	}
-	if s.datasource.Kind == config.DatasourceKindStaticDemo {
-		if s.staticDemoErr != nil {
-			return AssetSearchPage{}, s.staticDemoErr
-		}
-		return s.staticDemo.SearchAssets(normalized)
+	if state.primary.Kind == config.DatasourceKindStaticDemo {
+		return state.staticDemo.SearchAssets(normalized)
 	}
+	if config.IsImmichPassthroughDatasourceKind(state.primary.Kind) {
+		return s.searchImmichPassthroughAssets(ctx, state, normalized)
+	}
+	if !s.catalogStoreEnabled() {
+		return AssetSearchPage{}, ErrCatalogNotConfigured
+	}
+	if normalized.Resolved.QueryMode == QueryModeSemantic {
+		profile := s.semanticSearchProfile(ctx, options)
+		if profile == nil {
+			return s.searchCatalogWithoutSemanticProfile(ctx, normalized)
+		}
+		return s.searchCatalogSemanticAssets(ctx, normalized, profile, options)
+	}
+	return s.catalog.SearchCatalogAssets(ctx, normalized)
+}
 
-	return s.searchImmichAssets(normalized)
+func (s *Service) semanticSearchProfile(ctx context.Context, options AssetSearchOptions) semanticEmbeddingProfile {
+	if profile := s.preferredSemanticSearchCandidateProfile(ctx, options); profile != nil {
+		return cachedSemanticTextProfileFor(profile, s.semanticText)
+	}
+	if profile := s.semanticSearchActiveProfile(ctx); semanticSearchableImageProfile(profile) {
+		return cachedSemanticTextProfileFor(profile, s.semanticText)
+	}
+	if profile := s.semanticSearchCandidateProfile(ctx, options); profile != nil {
+		return cachedSemanticTextProfileFor(profile, s.semanticText)
+	}
+	if profile := s.semanticSearchActiveProfile(ctx); profile != nil {
+		return cachedSemanticTextProfileFor(profile, s.semanticText)
+	}
+	return nil
+}
+
+func semanticSearchableImageProfile(profile semanticEmbeddingProfile) bool {
+	return profile != nil &&
+		profile.ProfileKind() == semanticProfileKindModelPack &&
+		profile.InputKind() == semanticInputKindImage
+}
+
+func (s *Service) semanticSearchCandidateProfile(ctx context.Context, options AssetSearchOptions) semanticEmbeddingProfile {
+	if s == nil || s.semanticModels == nil || !s.catalogStoreEnabled() {
+		return nil
+	}
+	if strings.TrimSpace(options.SemanticModelID) != "" || strings.TrimSpace(options.SemanticVectorSpaceID) != "" {
+		return nil
+	}
+	candidate, ok := s.semanticModels.InstalledCandidateProfile()
+	if !ok || candidate.Role != semanticModelRoleCandidate {
+		return nil
+	}
+	candidateStarted := time.Now()
+	profile, ok := s.semanticModels.CandidateEmbeddingProfileWithContext(ctx, candidate.ModelID, candidate.VectorSpaceID)
+	if !ok {
+		log.Printf(
+			"timich-agent semantic search candidate profile missing runtime model=%s vector_space=%s elapsed=%s",
+			candidate.ModelID,
+			candidate.VectorSpaceID,
+			time.Since(candidateStarted).Round(time.Millisecond),
+		)
+		return nil
+	}
+	status, err := s.SemanticModelBackfillStatus(ctx, candidate)
+	if err != nil || status == nil || status.IndexedVectorCount == 0 {
+		log.Printf(
+			"timich-agent semantic search candidate profile unavailable model=%s vector_space=%s elapsed=%s err=%v status=%s indexed=%d completed=%d",
+			candidate.ModelID,
+			candidate.VectorSpaceID,
+			time.Since(candidateStarted).Round(time.Millisecond),
+			err,
+			semanticBackfillStatusLogValue(status),
+			semanticBackfillIndexedLogValue(status),
+			semanticBackfillCompletedLogValue(status),
+		)
+		return nil
+	}
+	return profile
+}
+
+func (s *Service) semanticSearchActiveProfile(ctx context.Context) semanticEmbeddingProfile {
+	if s == nil || s.semanticModels == nil || !s.catalogStoreEnabled() {
+		return nil
+	}
+	started := time.Now()
+	log.Printf("timich-agent semantic search active profile store lookup started")
+	active, ok := s.semanticModels.ActiveProfileWithContext(ctx)
+	if !ok || active.Role != semanticModelRoleActive {
+		log.Printf(
+			"timich-agent semantic search active profile store lookup none elapsed=%s",
+			time.Since(started).Round(time.Millisecond),
+		)
+		return nil
+	}
+	log.Printf(
+		"timich-agent semantic search active profile backfill status started model=%s vector_space=%s input=%s elapsed=%s",
+		active.ModelID,
+		active.VectorSpaceID,
+		active.InputKind,
+		time.Since(started).Round(time.Millisecond),
+	)
+	status, err := s.SemanticModelBackfillStatus(ctx, active)
+	if err != nil || status == nil {
+		log.Printf(
+			"timich-agent semantic search active profile backfill status unavailable model=%s vector_space=%s elapsed=%s err=%v status=%s indexed=%d completed=%d",
+			active.ModelID,
+			active.VectorSpaceID,
+			time.Since(started).Round(time.Millisecond),
+			err,
+			semanticBackfillStatusLogValue(status),
+			semanticBackfillIndexedLogValue(status),
+			semanticBackfillCompletedLogValue(status),
+		)
+		return nil
+	}
+	profile, ok := s.semanticModels.ActiveEmbeddingProfileWithContext(ctx)
+	if !ok {
+		log.Printf(
+			"timich-agent semantic search active profile runtime missing model=%s vector_space=%s elapsed=%s",
+			active.ModelID,
+			active.VectorSpaceID,
+			time.Since(started).Round(time.Millisecond),
+		)
+		return nil
+	}
+	log.Printf(
+		"timich-agent semantic search active profile selected model=%s vector_space=%s status=%s indexed=%d completed=%d elapsed=%s",
+		active.ModelID,
+		active.VectorSpaceID,
+		semanticBackfillStatusLogValue(status),
+		semanticBackfillIndexedLogValue(status),
+		semanticBackfillCompletedLogValue(status),
+		time.Since(started).Round(time.Millisecond),
+	)
+	return profile
+}
+
+func semanticBackfillStatusLogValue(status *SemanticModelBackfillStatus) string {
+	if status == nil {
+		return ""
+	}
+	return status.Status
+}
+
+func semanticBackfillIndexedLogValue(status *SemanticModelBackfillStatus) int {
+	if status == nil {
+		return 0
+	}
+	return status.IndexedVectorCount
+}
+
+func semanticBackfillCompletedLogValue(status *SemanticModelBackfillStatus) int {
+	if status == nil {
+		return 0
+	}
+	return status.CompletedVectorCount
+}
+
+func semanticBackfillEligibleLogValue(status *SemanticModelBackfillStatus) int {
+	if status == nil {
+		return 0
+	}
+	return status.EligibleAssetCount
+}
+
+func (s *Service) preferredSemanticSearchCandidateProfile(ctx context.Context, options AssetSearchOptions) semanticEmbeddingProfile {
+	modelID := strings.TrimSpace(options.SemanticModelID)
+	vectorSpaceID := strings.TrimSpace(options.SemanticVectorSpaceID)
+	if modelID == "" && vectorSpaceID == "" {
+		return nil
+	}
+	candidate, ok := s.semanticModels.InstalledCandidateProfile()
+	if !ok || (modelID != "" && candidate.ModelID != modelID) ||
+		(vectorSpaceID != "" && candidate.VectorSpaceID != vectorSpaceID) {
+		return nil
+	}
+	profile, ok := s.semanticModels.CandidateEmbeddingProfileWithContext(ctx, candidate.ModelID, candidate.VectorSpaceID)
+	if !ok {
+		return nil
+	}
+	return profile
+}
+
+// Asset returns app-facing metadata for one asset from the primary datasource.
+func (s *Service) Asset(assetID string) (Asset, error) {
+	return s.AssetFromSource("", assetID)
+}
+
+// AssetFromSource returns app-facing metadata for one datasource asset.
+func (s *Service) AssetFromSource(sourceKey string, assetID string) (Asset, error) {
+	state, datasource, err := s.datasourceForMedia(sourceKey)
+	if err != nil {
+		return Asset{}, err
+	}
+	assetID = strings.TrimSpace(assetID)
+	if assetID == "" {
+		return Asset{}, ErrAssetNotFound
+	}
+	if datasource.Kind == config.DatasourceKindStaticDemo {
+		if state.staticDemoErr != nil {
+			return Asset{}, state.staticDemoErr
+		}
+		if state.staticDemo == nil {
+			return Asset{}, ErrNoDatasourceConfigured
+		}
+		return state.staticDemo.Asset(assetID)
+	}
+	if config.IsImmichPassthroughDatasourceKind(datasource.Kind) {
+		request, err := s.newRequestForDatasource(datasource, http.MethodGet, "/api/assets/"+url.PathEscape(assetID), nil)
+		if err != nil {
+			return Asset{}, err
+		}
+		response, err := s.client.Do(request)
+		if err != nil {
+			return Asset{}, fmt.Errorf("perform asset request: %w", err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode == http.StatusNotFound {
+			return Asset{}, ErrAssetNotFound
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return Asset{}, fmt.Errorf("asset request returned status %d", response.StatusCode)
+		}
+
+		var upstream immichAsset
+		if err := json.NewDecoder(response.Body).Decode(&upstream); err != nil {
+			return Asset{}, fmt.Errorf("decode asset response: %w", err)
+		}
+		if strings.TrimSpace(upstream.ID) == "" || upstream.FileCreatedAt.Time.IsZero() {
+			return Asset{}, fmt.Errorf("asset response is missing required metadata")
+		}
+		asset := appAsset(upstream)
+		asset.SourceKey = datasource.SourceKey
+		return asset, nil
+	}
+	if s.catalog == nil {
+		return Asset{}, ErrCatalogNotConfigured
+	}
+	_, asset, err := s.catalog.catalogCanonicalAssetForSource(context.Background(), datasource.SourceKey, assetID)
+	if err != nil {
+		return Asset{}, err
+	}
+	if strings.TrimSpace(asset.ID) == "" {
+		return Asset{}, ErrAssetNotFound
+	}
+	return asset, nil
+}
+
+func appAsset(asset immichAsset) Asset {
+	return Asset{
+		ID:         asset.ID,
+		Type:       normalizeAssetType(asset.Type),
+		Filename:   asset.OriginalFileName,
+		CapturedAt: asset.FileCreatedAt.Time.UTC(),
+		Duration:   asset.Duration,
+	}
 }
 
 // Probe verifies that the active datasource is reachable from the agent runtime.
 func (s *Service) Probe(ctx context.Context) error {
-	if !s.Ready() {
+	state := s.datasourceStateSnapshot()
+	if !state.ready() {
 		return ErrNoDatasourceConfigured
 	}
-	if s.datasource.Kind == config.DatasourceKindStaticDemo {
+	if state.primary.Kind == config.DatasourceKindStaticDemo {
 		return nil
 	}
 
-	request, err := s.newRequest(
+	request, err := s.newRequestForDatasource(
+		state.primary,
 		http.MethodPost,
 		"/api/search/metadata",
 		strings.NewReader(`{"page":1,"size":1,"order":"desc"}`),
@@ -323,106 +1038,1010 @@ func (s *Service) Probe(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) searchImmichAssets(normalized normalizedAssetSearch) (AssetSearchPage, error) {
-	body, endpoint, totalAccuracy, err := immichSearchRequest(normalized)
+// MirrorStatus returns the active datasource mirror status when configured.
+func (s *Service) MirrorStatus(ctx context.Context) (MirrorStatus, error) {
+	return s.MirrorStatusForDatasource(ctx, "")
+}
+
+// MirrorStatusForDatasource returns one configured Immich mirror status by source key.
+func (s *Service) MirrorStatusForDatasource(ctx context.Context, sourceKey string) (MirrorStatus, error) {
+	datasource, err := s.mirrorDatasource(sourceKey)
 	if err != nil {
-		return AssetSearchPage{}, err
+		return MirrorStatus{}, err
+	}
+	status, err := s.catalog.Status(ctx, datasource.SourceKey)
+	if err != nil {
+		return MirrorStatus{}, err
+	}
+	status.LatestAssetLimit = datasourceIndexingConfig(datasource).LatestAssetLimit
+	if status.Status == "" {
+		status.Status = "idle"
+	}
+	return status, nil
+}
+
+// SemanticModelBackfillStatus reports candidate semantic vector coverage for all indexed datasources.
+func (s *Service) SemanticModelBackfillStatus(ctx context.Context, candidate SemanticModelProfileStatus) (*SemanticModelBackfillStatus, error) {
+	if !s.catalogStoreEnabled() {
+		return nil, nil
+	}
+	if strings.TrimSpace(candidate.ModelID) == "" || strings.TrimSpace(candidate.VectorSpaceID) == "" {
+		return nil, nil
+	}
+	started := time.Now()
+	sourceKeys := s.semanticDatasourceSourceKeysFor(nil)
+	if len(sourceKeys) == 0 {
+		log.Printf(
+			"timich-agent semantic model backfill status skipped model=%s vector_space=%s reason=no_sources elapsed=%s",
+			candidate.ModelID,
+			candidate.VectorSpaceID,
+			time.Since(started).Round(time.Millisecond),
+		)
+		return nil, nil
+	}
+	log.Printf(
+		"timich-agent semantic model backfill status started model=%s vector_space=%s input=%s sources=%d",
+		candidate.ModelID,
+		candidate.VectorSpaceID,
+		candidate.InputKind,
+		len(sourceKeys),
+	)
+	status, err := s.semanticModelBackfillStatusForSourceKeys(ctx, sourceKeys, candidate)
+	log.Printf(
+		"timich-agent semantic model backfill status completed model=%s vector_space=%s sources=%d elapsed=%s err=%v status=%s indexed=%d completed=%d eligible=%d",
+		candidate.ModelID,
+		candidate.VectorSpaceID,
+		len(sourceKeys),
+		time.Since(started).Round(time.Millisecond),
+		err,
+		semanticBackfillStatusLogValue(status),
+		semanticBackfillIndexedLogValue(status),
+		semanticBackfillCompletedLogValue(status),
+		semanticBackfillEligibleLogValue(status),
+	)
+	return status, err
+}
+
+// SemanticModelBackfillStatusForDatasource reports semantic vector coverage for one datasource.
+func (s *Service) SemanticModelBackfillStatusForDatasource(ctx context.Context, sourceKey string, candidate SemanticModelProfileStatus) (*SemanticModelBackfillStatus, error) {
+	if !s.catalogStoreEnabled() {
+		return nil, nil
+	}
+	if strings.TrimSpace(candidate.ModelID) == "" || strings.TrimSpace(candidate.VectorSpaceID) == "" {
+		return nil, nil
+	}
+	sourceKeys := s.semanticDatasourceSourceKeysFor([]string{sourceKey})
+	if len(sourceKeys) == 0 {
+		return nil, nil
+	}
+	return s.semanticModelBackfillStatusForSourceKeys(ctx, sourceKeys, candidate)
+}
+
+func (s *Service) semanticModelBackfillStatusForSourceKeys(ctx context.Context, sourceKeys []string, candidate SemanticModelProfileStatus) (*SemanticModelBackfillStatus, error) {
+	status := SemanticModelBackfillStatus{
+		SourceKind:    "catalog",
+		ModelID:       strings.TrimSpace(candidate.ModelID),
+		VectorSpaceID: strings.TrimSpace(candidate.VectorSpaceID),
+		EmbeddingDim:  candidate.EmbeddingDim,
+	}
+	for _, sourceKey := range sourceKeys {
+		sourceStarted := time.Now()
+		log.Printf(
+			"timich-agent semantic model backfill source status started source_key=%s model=%s vector_space=%s",
+			sourceKey,
+			candidate.ModelID,
+			candidate.VectorSpaceID,
+		)
+		sourceStatus, err := s.catalog.SemanticBackfillStatus(ctx, sourceKey, candidate)
+		if err != nil {
+			log.Printf(
+				"timich-agent semantic model backfill source status failed source_key=%s model=%s vector_space=%s elapsed=%s error=%v",
+				sourceKey,
+				candidate.ModelID,
+				candidate.VectorSpaceID,
+				time.Since(sourceStarted).Round(time.Millisecond),
+				err,
+			)
+			return nil, err
+		}
+		if retryAt, deferred := s.semanticSourceRetryDeadline(sourceKey, s.semanticSourceRetryTime()); deferred {
+			sourceStatus.EligibleNowVectorCount = 0
+			if sourceStatus.NextEligibleAt == nil || retryAt.Before(*sourceStatus.NextEligibleAt) {
+				nextEligibleAt := retryAt.UTC()
+				sourceStatus.NextEligibleAt = &nextEligibleAt
+			}
+		}
+		log.Printf(
+			"timich-agent semantic model backfill source status completed source_key=%s model=%s vector_space=%s status=%s indexed=%d completed=%d eligible=%d pending_index=%d elapsed=%s",
+			sourceKey,
+			candidate.ModelID,
+			candidate.VectorSpaceID,
+			sourceStatus.Status,
+			sourceStatus.IndexedVectorCount,
+			sourceStatus.CompletedVectorCount,
+			sourceStatus.EligibleAssetCount,
+			sourceStatus.PendingIndexJobCount,
+			time.Since(sourceStarted).Round(time.Millisecond),
+		)
+		status.EligibleAssetCount += sourceStatus.EligibleAssetCount
+		status.EligibleNowVectorCount += sourceStatus.EligibleNowVectorCount
+		status.CompletedVectorCount += sourceStatus.CompletedVectorCount
+		status.IndexedVectorCount += sourceStatus.IndexedVectorCount
+		status.PendingIndexJobCount += sourceStatus.PendingIndexJobCount
+		status.FailedIndexJobCount += sourceStatus.FailedIndexJobCount
+		status.EligibleIndexJobCount += sourceStatus.EligibleIndexJobCount
+		if sourceStatus.AssetGeneration != sourceStatus.IndexedGeneration {
+			status.GenerationMismatchSourceCount++
+		}
+		if sourceStatus.LastPublishedAt != nil && (status.LastPublishedAt == nil || sourceStatus.LastPublishedAt.After(*status.LastPublishedAt)) {
+			lastPublishedAt := sourceStatus.LastPublishedAt.UTC()
+			status.LastPublishedAt = &lastPublishedAt
+		}
+		if sourceStatus.NextEligibleAt != nil && (status.NextEligibleAt == nil || sourceStatus.NextEligibleAt.Before(*status.NextEligibleAt)) {
+			nextEligibleAt := sourceStatus.NextEligibleAt.UTC()
+			status.NextEligibleAt = &nextEligibleAt
+		}
+	}
+	finalizeSemanticBackfillStatus(&status)
+	return &status, nil
+}
+
+func (s *Service) BackfillSemanticModelCandidateWithOptions(ctx context.Context, modelStore *SemanticModelPackStore, candidate SemanticModelProfileStatus, options SemanticModelBackfillOptions) (SemanticBackfillResult, error) {
+	if !s.catalogStoreEnabled() {
+		return SemanticBackfillResult{}, ErrCatalogNotConfigured
+	}
+	if modelStore == nil {
+		return SemanticBackfillResult{}, ErrSemanticModelPackInvalid
+	}
+	profile, ok := modelStore.CandidateEmbeddingProfileWithContext(ctx, candidate.ModelID, candidate.VectorSpaceID)
+	if !ok {
+		return SemanticBackfillResult{}, ErrSemanticModelPackInvalid
+	}
+	sourceKeys := s.semanticDatasourceSourceKeysFor(options.SourceKeys)
+	if len(sourceKeys) == 0 {
+		return SemanticBackfillResult{}, ErrCatalogNotConfigured
+	}
+	startedAt := time.Now().UTC()
+	sourceKeys = s.semanticBackfillSourceOrder(ctx, candidate, sourceKeys)
+	remaining := options.MaxAssets
+	if remaining < 0 {
+		remaining = 0
+	}
+	result := SemanticBackfillResult{StartedAt: startedAt}
+	var sourceErrors []error
+	upsertSourceStatus := func(sourceKey string, status SemanticModelBackfillStatus) {
+		for index := range result.SourceStatuses {
+			if result.SourceStatuses[index].SourceKey == sourceKey {
+				result.SourceStatuses[index].Status = status
+				return
+			}
+		}
+		result.SourceStatuses = append(result.SourceStatuses, SemanticBackfillSource{SourceKey: sourceKey, Status: status})
+	}
+	processSource := func(sourceKey string, maxAssets int) (int, bool, error) {
+		now := s.semanticSourceRetryTime()
+		if retryAt, deferred := s.semanticSourceRetryDeadline(sourceKey, now); deferred {
+			sourceErrors = append(sourceErrors, fmt.Errorf(
+				"semantic source %s: %w until %s",
+				sourceKey,
+				ErrSemanticSourceUnavailable,
+				retryAt.Format(time.RFC3339Nano),
+			))
+			return 0, false, nil
+		}
+		sourceResult, err := s.catalog.BackfillSemanticVectors(ctx, sourceKey, profile, startedAt, SemanticBackfillOptions{
+			ImageLoader: s,
+			MaxAssets:   maxAssets,
+			Workers:     options.Workers,
+		})
+		if err != nil {
+			if errors.Is(err, ErrSemanticSourceUnavailable) {
+				retryAt := s.deferSemanticSourceRetry(sourceKey, now)
+				log.Printf("timich-agent semantic source backfill deferred source_key=%s retry_at=%s error=%v", sourceKey, retryAt.Format(time.RFC3339Nano), err)
+				sourceErrors = append(sourceErrors, fmt.Errorf("semantic source %s: %w", sourceKey, err))
+				return 0, false, nil
+			}
+			return 0, false, err
+		}
+		s.clearSemanticSourceRetry(sourceKey)
+		result.ProcessedVectorCount += sourceResult.ProcessedVectorCount
+		result.CompletedAt = sourceResult.CompletedAt
+		if sourceResult.Status.ModelID != "" || sourceResult.Status.VectorSpaceID != "" {
+			upsertSourceStatus(sourceKey, sourceResult.Status)
+		}
+		return sourceResult.ProcessedVectorCount, maxAssets > 0 && sourceResult.ProcessedVectorCount >= maxAssets, nil
 	}
 
-	request, err := s.newRequest(
-		http.MethodPost,
-		endpoint,
-		bytes.NewReader(body),
+	sourceIndexes := make(map[string]int, len(sourceKeys))
+	for index, sourceKey := range sourceKeys {
+		sourceIndexes[sourceKey] = index
+	}
+	lastAttempted := -1
+	attemptedSources := make(map[string]struct{}, len(sourceKeys))
+	if options.MaxAssets <= 0 {
+		for index, sourceKey := range sourceKeys {
+			if _, _, err := processSource(sourceKey, 0); err != nil {
+				return SemanticBackfillResult{}, err
+			}
+			lastAttempted = index
+			attemptedSources[sourceKey] = struct{}{}
+		}
+	} else {
+		activeSources := append([]string(nil), sourceKeys...)
+		for remaining > 0 && len(activeSources) > 0 {
+			roundBudget := remaining
+			quotas := semanticBackfillRoundQuotas(roundBudget, len(activeSources))
+			nextRound := make([]string, 0, len(activeSources))
+			for index, sourceKey := range activeSources {
+				quota := quotas[index]
+				if quota <= 0 {
+					nextRound = append(nextRound, sourceKey)
+					continue
+				}
+				processed, canFill, err := processSource(sourceKey, quota)
+				if err != nil {
+					return SemanticBackfillResult{}, err
+				}
+				remaining -= processed
+				lastAttempted = sourceIndexes[sourceKey]
+				attemptedSources[sourceKey] = struct{}{}
+				if canFill {
+					nextRound = append(nextRound, sourceKey)
+				}
+			}
+			activeSources = nextRound
+		}
+	}
+	if lastAttempted >= 0 {
+		nextSource := nextSemanticBackfillSource(sourceKeys, lastAttempted)
+		if len(attemptedSources) == len(sourceKeys) && len(sourceKeys) > 1 {
+			nextSource = sourceKeys[1]
+		}
+		if err := s.rememberSemanticBackfillSource(ctx, candidate, nextSource); err != nil {
+			log.Printf("timich-agent semantic source cursor update failed model=%s source_key=%s error=%v", candidate.ModelID, nextSource, err)
+		}
+	}
+	if result.ProcessedVectorCount == 0 && len(sourceErrors) > 0 {
+		return result, errors.Join(sourceErrors...)
+	}
+	if _, err := s.catalog.ReconcileSemanticIndexJobs(ctx, sourceKeys, profile, options.AllowPartialIndexPublish, time.Now().UTC()); err != nil {
+		return SemanticBackfillResult{}, err
+	}
+	if options.DrainIndexJobs {
+		publish, err := s.catalog.PublishNextSemanticIndexJob(ctx, sourceKeys, profile, time.Now().UTC())
+		if err != nil {
+			return SemanticBackfillResult{}, err
+		}
+		if publish.Published {
+			result.CompletedAt = publish.CompletedAt
+		}
+	}
+	status, err := s.semanticModelBackfillStatusForSourceKeys(ctx, sourceKeys, candidate)
+	if err != nil {
+		return SemanticBackfillResult{}, err
+	}
+	if status != nil {
+		result.Status = *status
+		result.IndexedVectorCount = status.IndexedVectorCount
+	}
+	if result.CompletedAt.IsZero() {
+		result.CompletedAt = time.Now().UTC()
+	}
+	return result, nil
+}
+
+func semanticBackfillRoundQuotas(budget int, sourceCount int) []int {
+	if budget <= 0 || sourceCount <= 0 {
+		return nil
+	}
+	quotas := make([]int, sourceCount)
+	base := budget / sourceCount
+	extra := budget % sourceCount
+	for index := range quotas {
+		quotas[index] = base
+		if index < extra {
+			quotas[index]++
+		}
+	}
+	return quotas
+}
+
+func nextSemanticBackfillSource(sourceKeys []string, lastAttempted int) string {
+	if len(sourceKeys) == 0 || lastAttempted < 0 {
+		return ""
+	}
+	next := (lastAttempted + 1) % len(sourceKeys)
+	if next == 0 && len(sourceKeys) > 1 {
+		// When every source was visited, rotate the next batch's starting source
+		// instead of persisting the same start forever.
+		next = 1
+	}
+	return sourceKeys[next]
+}
+
+func (s *Service) PublishNextSemanticIndexJob(ctx context.Context, modelStore *SemanticModelPackStore, candidate SemanticModelProfileStatus, sourceKeys []string) (SemanticIndexPublishResult, error) {
+	if !s.catalogStoreEnabled() {
+		return SemanticIndexPublishResult{}, ErrCatalogNotConfigured
+	}
+	if modelStore == nil {
+		return SemanticIndexPublishResult{}, ErrSemanticModelPackInvalid
+	}
+	profile, ok := modelStore.CandidateEmbeddingProfileWithContext(ctx, candidate.ModelID, candidate.VectorSpaceID)
+	if !ok {
+		return SemanticIndexPublishResult{}, ErrSemanticModelPackInvalid
+	}
+	sourceKeys = s.semanticDatasourceSourceKeysFor(sourceKeys)
+	if len(sourceKeys) == 0 {
+		return SemanticIndexPublishResult{}, ErrCatalogNotConfigured
+	}
+	return s.catalog.PublishNextSemanticIndexJob(ctx, sourceKeys, profile, time.Now().UTC())
+}
+
+func (s *Service) ReconcileSemanticIndexJobs(ctx context.Context, modelStore *SemanticModelPackStore, candidate SemanticModelProfileStatus, sourceKeys []string, allowPartial bool) (int, error) {
+	if !s.catalogStoreEnabled() {
+		return 0, ErrCatalogNotConfigured
+	}
+	if modelStore == nil {
+		return 0, ErrSemanticModelPackInvalid
+	}
+	profile, ok := modelStore.CandidateEmbeddingProfileWithContext(ctx, candidate.ModelID, candidate.VectorSpaceID)
+	if !ok {
+		return 0, ErrSemanticModelPackInvalid
+	}
+	sourceKeys = s.semanticDatasourceSourceKeysFor(sourceKeys)
+	if len(sourceKeys) == 0 {
+		return 0, ErrCatalogNotConfigured
+	}
+	return s.catalog.ReconcileSemanticIndexJobs(ctx, sourceKeys, profile, allowPartial, time.Now().UTC())
+}
+
+func (s *Service) SemanticModelIndexPublishNeeded(ctx context.Context, modelStore *SemanticModelPackStore, candidate SemanticModelProfileStatus, sourceKeys []string, allowPartial bool) (bool, int, error) {
+	if !s.catalogStoreEnabled() {
+		return false, 0, ErrCatalogNotConfigured
+	}
+	if modelStore == nil {
+		return false, 0, ErrSemanticModelPackInvalid
+	}
+	profile, ok := modelStore.CandidateEmbeddingProfileWithContext(ctx, candidate.ModelID, candidate.VectorSpaceID)
+	if !ok {
+		return false, 0, ErrSemanticModelPackInvalid
+	}
+	sourceKeys = s.semanticDatasourceSourceKeysFor(sourceKeys)
+	if len(sourceKeys) == 0 {
+		return false, 0, ErrCatalogNotConfigured
+	}
+	return s.catalog.SemanticIndexPublishNeeded(ctx, sourceKeys, profile, allowPartial)
+}
+
+func (s *Service) ResetRunningSemanticIndexJobs(ctx context.Context) (int, error) {
+	if !s.catalogStoreEnabled() {
+		return 0, ErrCatalogNotConfigured
+	}
+	return s.catalog.ResetRunningSemanticIndexJobs(ctx, time.Now().UTC())
+}
+
+// PendingSemanticIndexJobs reports whether a durable HNSW publish job still
+// needs to be completed. It intentionally includes failed jobs because their
+// scheduled_at deadline is the durable retry policy used across restarts.
+func (s *Service) PendingSemanticIndexJobs(ctx context.Context) (bool, error) {
+	if !s.catalogStoreEnabled() {
+		return false, ErrCatalogNotConfigured
+	}
+	var pending int
+	err := s.catalog.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1
+		FROM semantic_index_jobs
+		WHERE status IN ('queued', 'running', 'failed')
+	)`).Scan(&pending)
+	return pending != 0, err
+}
+
+func (s *Service) semanticDatasourceSourceKeys() []string {
+	return s.semanticDatasourceSourceKeysFor(nil)
+}
+
+func (s *Service) semanticDatasourceSourceKeysFor(requested []string) []string {
+	if !s.catalogStoreEnabled() {
+		return nil
+	}
+	allSourceKeys := append([]string{}, s.MirrorDatasourceSourceKeys()...)
+	allSourceKeys = append(allSourceKeys, s.LocalDatasourceSourceKeys()...)
+	allowed := make(map[string]struct{}, len(allSourceKeys))
+	for _, sourceKey := range allSourceKeys {
+		allowed[sourceKey] = struct{}{}
+	}
+	if len(requested) == 0 {
+		sort.Strings(allSourceKeys)
+		return allSourceKeys
+	}
+	sourceKeys := make([]string, 0, len(requested))
+	seen := map[string]struct{}{}
+	for _, sourceKey := range requested {
+		sourceKey = strings.TrimSpace(sourceKey)
+		if sourceKey == "" {
+			continue
+		}
+		if _, ok := allowed[sourceKey]; !ok {
+			continue
+		}
+		if _, ok := seen[sourceKey]; ok {
+			continue
+		}
+		seen[sourceKey] = struct{}{}
+		sourceKeys = append(sourceKeys, sourceKey)
+	}
+	sort.Strings(sourceKeys)
+	return sourceKeys
+}
+
+func (s *Service) semanticBackfillSourceOrder(ctx context.Context, candidate SemanticModelProfileStatus, sourceKeys []string) []string {
+	ordered := append([]string(nil), sourceKeys...)
+	if s == nil || s.catalog == nil || len(ordered) < 2 {
+		return ordered
+	}
+	var nextSource string
+	err := s.catalog.queryDB().QueryRowContext(ctx, `SELECT next_source_key
+		FROM semantic_backfill_scheduler_state
+		WHERE model_id = ? AND vector_space_id = ?`,
+		strings.TrimSpace(candidate.ModelID), strings.TrimSpace(candidate.VectorSpaceID),
+	).Scan(&nextSource)
+	if err != nil {
+		return ordered
+	}
+	for index, sourceKey := range ordered {
+		if sourceKey == nextSource {
+			return append(ordered[index:], ordered[:index]...)
+		}
+	}
+	return ordered
+}
+
+func (s *Service) rememberSemanticBackfillSource(ctx context.Context, candidate SemanticModelProfileStatus, sourceKey string) error {
+	if s == nil || s.catalog == nil || strings.TrimSpace(sourceKey) == "" {
+		return nil
+	}
+	_, err := s.catalog.db.ExecContext(ctx, `INSERT INTO semantic_backfill_scheduler_state (
+			model_id, vector_space_id, next_source_key, updated_at
+		) VALUES (?, ?, ?, ?)
+		ON CONFLICT(model_id, vector_space_id) DO UPDATE SET
+			next_source_key = excluded.next_source_key,
+			updated_at = excluded.updated_at`,
+		strings.TrimSpace(candidate.ModelID),
+		strings.TrimSpace(candidate.VectorSpaceID),
+		strings.TrimSpace(sourceKey),
+		formatCatalogTime(time.Now().UTC()),
 	)
 	if err != nil {
-		return AssetSearchPage{}, err
+		return fmt.Errorf("remember semantic backfill source: %w", err)
 	}
-	request.Header.Set("Content-Type", "application/json")
+	return nil
+}
 
-	response, err := s.client.Do(request)
+func finalizeSemanticBackfillStatus(status *SemanticModelBackfillStatus) {
+	if status == nil {
+		return
+	}
+	status.RemainingVectorCount = status.EligibleAssetCount - status.CompletedVectorCount
+	if status.RemainingVectorCount < 0 {
+		status.RemainingVectorCount = 0
+	}
+	status.Status = semanticBackfillStatusReady
+	status.MessageCode = semanticBackfillMessageReady
+	switch {
+	case status.CompletedVectorCount == 0 && status.EligibleAssetCount > 0:
+		status.Status = semanticBackfillStatusPending
+		status.MessageCode = semanticBackfillMessagePending
+	case status.CompletedVectorCount < status.EligibleAssetCount:
+		status.Status = semanticBackfillStatusBackfilling
+		status.MessageCode = semanticBackfillMessageIncomplete
+	case status.GenerationMismatchSourceCount > 0 || status.IndexedVectorCount < status.CompletedVectorCount || status.PendingIndexJobCount > 0 || status.FailedIndexJobCount > 0:
+		status.Status = semanticBackfillStatusIndexing
+		status.MessageCode = semanticBackfillMessageIndexing
+	}
+}
+
+type immichMirrorFetchOptions struct {
+	LatestAssetLimit int
+	UpdatedAfter     *time.Time
+	DetailLimit      int
+}
+
+// SyncMirror refreshes the active Immich mirror.
+func (s *Service) SyncMirror(ctx context.Context, mode string) (MirrorSyncResult, error) {
+	datasource, err := s.mirrorDatasource("")
 	if err != nil {
-		return AssetSearchPage{}, fmt.Errorf("perform search request: %w", err)
+		return MirrorSyncResult{}, err
+	}
+	return s.syncMirrorDatasource(ctx, datasource, mode)
+}
+
+// SyncDatasourceMirror refreshes one configured Immich mirror by source key.
+func (s *Service) SyncDatasourceMirror(ctx context.Context, sourceKey string, mode string) (MirrorSyncResult, error) {
+	datasource, err := s.mirrorDatasource(sourceKey)
+	if err != nil {
+		return MirrorSyncResult{}, err
+	}
+	return s.syncMirrorDatasource(ctx, datasource, mode)
+}
+
+func (s *Service) syncMirrorDatasource(ctx context.Context, datasource *config.DatasourceConfig, mode string) (MirrorSyncResult, error) {
+	if !s.immichDatasourceIndexed(datasource) {
+		return MirrorSyncResult{}, ErrCatalogNotConfigured
+	}
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		mode = MirrorSyncModeFull
+	}
+	if mode != MirrorSyncModeFull && mode != MirrorSyncModeIncremental {
+		return MirrorSyncResult{}, ErrUnsupportedSearch
+	}
+	startedAt := time.Now().UTC()
+	sourceKey := strings.TrimSpace(datasource.SourceKey)
+	indexing := datasourceIndexingConfig(datasource)
+	limit := indexing.LatestAssetLimit
+	detailLimit := indexing.MetadataDetailLimit
+	var result MirrorSyncResult
+	var err error
+	switch mode {
+	case MirrorSyncModeFull:
+		assets, fetchErr := s.fetchImmichMirrorAssets(ctx, datasource, immichMirrorFetchOptions{
+			LatestAssetLimit: limit,
+			DetailLimit:      detailLimit,
+		})
+		if fetchErr != nil {
+			return MirrorSyncResult{}, fetchErr
+		}
+		result, err = s.catalog.ReplaceFull(ctx, sourceKey, assets, limit, startedAt)
+		if err != nil {
+			return MirrorSyncResult{}, err
+		}
+	case MirrorSyncModeIncremental:
+		needsFull, fullCheckErr := s.mirrorSyncNeedsFullForConfiguredLimit(ctx, sourceKey, limit)
+		if fullCheckErr != nil {
+			return MirrorSyncResult{}, fullCheckErr
+		}
+		if needsFull {
+			return s.syncMirrorDatasource(ctx, datasource, MirrorSyncModeFull)
+		}
+		updatedAfter, cursorErr := s.catalog.LatestSourceUpdatedAt(ctx, sourceKey)
+		if cursorErr != nil {
+			return MirrorSyncResult{}, cursorErr
+		}
+		if updatedAfter == nil {
+			return s.syncMirrorDatasource(ctx, datasource, MirrorSyncModeFull)
+		}
+		assets, fetchErr := s.fetchImmichMirrorAssets(ctx, datasource, immichMirrorFetchOptions{
+			UpdatedAfter: updatedAfter,
+			DetailLimit:  detailLimit,
+		})
+		if fetchErr != nil {
+			return MirrorSyncResult{}, fetchErr
+		}
+		result, err = s.catalog.MergeIncremental(ctx, sourceKey, assets, startedAt)
+		if err != nil {
+			return MirrorSyncResult{}, err
+		}
+	}
+	status, err := s.catalog.Status(ctx, sourceKey)
+	if err != nil {
+		return MirrorSyncResult{}, err
+	}
+	status.LatestAssetLimit = limit
+	result.Mirror = status
+	return result, nil
+}
+
+func (s *Service) mirrorSyncNeedsFullForConfiguredLimit(ctx context.Context, sourceKey string, configuredLimit int) (bool, error) {
+	status, err := s.catalog.Status(ctx, sourceKey)
+	if err != nil {
+		return false, err
+	}
+	if status.LastFullSyncAt == nil {
+		return true, nil
+	}
+	return status.LatestAssetLimit != configuredLimit, nil
+}
+
+func (s *Service) LoadSemanticImage(ctx context.Context, sourceKey string, upstreamAssetID string) (*semanticImageEmbeddingInput, error) {
+	_, datasource, err := s.datasourceForMedia(sourceKey)
+	if err != nil {
+		return nil, err
+	}
+	if datasource.Kind == config.DatasourceKindLocalFiles {
+		return s.loadLocalSemanticImage(ctx, datasource.SourceKey, upstreamAssetID)
+	}
+	if !s.immichDatasourceIndexed(datasource) {
+		return nil, ErrCatalogNotConfigured
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://timich-agent.local/internal/semantic-image", nil)
+	if err != nil {
+		return nil, err
+	}
+	response, err := s.profileImageForDatasource(request, datasource, upstreamAssetID, hostedImageProfile{
+		Name:           "semantic_embedding",
+		UpstreamSize:   detailPreviewSize,
+		MaxEdgePixels:  detailPreviewMaxEdgePixels,
+		MaxBytes:       detailPreviewMaxBytes,
+		JPEGQualities:  detailPreviewJPEGQualities,
+		FileNameBase:   "semantic_embedding",
+		FileNameSuffix: "_semantic_embedding",
+		ForceJPEG:      true,
+	})
+	if err != nil {
+		if errors.Is(err, ErrAssetNotFound) || errors.Is(err, ErrMediaTooLarge) || errors.Is(err, ErrMediaInvalid) {
+			return nil, fmt.Errorf("%w: %v", ErrSemanticAssetInput, err)
+		}
+		return nil, err
 	}
 	defer response.Body.Close()
-
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return AssetSearchPage{}, fmt.Errorf("search request returned status %d", response.StatusCode)
-	}
-
-	var envelope searchAssetsEnvelope
-	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
-		return AssetSearchPage{}, fmt.Errorf("decode search response: %w", err)
-	}
-
-	items := make([]Asset, 0, len(envelope.Assets.Items))
-	for _, asset := range envelope.Assets.Items {
-		items = append(items, Asset{
-			ID:         asset.ID,
-			Type:       normalizeAssetType(asset.Type),
-			Filename:   asset.OriginalFileName,
-			CapturedAt: asset.FileCreatedAt.Time.UTC(),
-			Duration:   asset.Duration,
-		})
-	}
-
-	var nextPageIndex *int
-	if envelope.Assets.NextPage != nil {
-		next := *envelope.Assets.NextPage - 1
-		if next >= 0 {
-			nextPageIndex = &next
+		if semanticImageStatusIsAssetSpecific(response.StatusCode) {
+			return nil, fmt.Errorf("%w: semantic image request returned status %d", ErrSemanticAssetInput, response.StatusCode)
 		}
+		return nil, fmt.Errorf("semantic image request returned status %d", response.StatusCode)
 	}
-
-	total := envelope.Assets.Total
-	if shouldUseTimelineStatisticsTotal(normalized) {
-		if statisticsTotal, err := s.timelineAssetTotal(); err == nil {
-			total = max(total, statisticsTotal)
-			totalAccuracy = TotalAccuracyExact
-		}
-	} else if shouldUseFilteredTimelineStatisticsTotal(normalized) {
-		if statisticsTotal, err := s.fetchTimelineStatisticsTotal(normalized.Request.Collection.Filters); err == nil {
-			total = max(total, statisticsTotal)
-			totalAccuracy = TotalAccuracyExact
-		}
+	body, err := readAtMost(response.Body, detailPreviewMaxBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read semantic image response: %w", err)
 	}
-	if total == 0 && len(items) > 0 {
-		total = normalized.Request.Page.Index*normalized.Request.Page.Size + len(items)
-		totalAccuracy = TotalAccuracyLowerBound
+	contentType := strings.TrimSpace(response.Header.Get("Content-Type"))
+	if contentType == "" {
+		contentType = "application/octet-stream"
 	}
-
-	boundary := searchBoundary(normalized.Request.Page, len(items))
-	return AssetSearchPage{
-		CollectionKey: normalized.CollectionKey,
-		Page:          normalized.Request.Page,
-		Items:         items,
-		Total:         total,
-		TotalAccuracy: totalAccuracy,
-		NextPageIndex: nextPageIndex,
-		Boundary:      boundary,
-		Resolved:      normalized.Resolved,
+	return &semanticImageEmbeddingInput{
+		Bytes:       body,
+		ContentType: contentType,
+		Source:      "immich_preview",
 	}, nil
 }
 
-func shouldUseTimelineStatisticsTotal(normalized normalizedAssetSearch) bool {
-	if normalized.Resolved.CollectionKind != CollectionKindTimeline || normalized.Resolved.QueryMode != QueryModeNone {
-		return false
-	}
-	return !hasAssetSearchFilters(normalized.Request.Collection.Filters)
-}
-
-func shouldUseFilteredTimelineStatisticsTotal(normalized normalizedAssetSearch) bool {
-	if normalized.Resolved.CollectionKind != CollectionKindTimeline || normalized.Resolved.QueryMode != QueryModeNone {
-		return false
-	}
-	return hasAssetSearchFilters(normalized.Request.Collection.Filters)
-}
-
-func hasAssetSearchFilters(filters AssetSearchFilters) bool {
-	if len(filters.MediaTypes) > 0 {
+func semanticImageStatusIsAssetSpecific(statusCode int) bool {
+	switch statusCode {
+	case http.StatusNotFound,
+		http.StatusGone,
+		http.StatusRequestEntityTooLarge,
+		http.StatusUnsupportedMediaType,
+		http.StatusUnprocessableEntity:
 		return true
+	default:
+		return false
 	}
-	return filters.CapturedAt != nil &&
-		(filters.CapturedAt.From != nil || filters.CapturedAt.To != nil)
+}
+
+func (s *Service) loadLocalSemanticImage(ctx context.Context, sourceKey string, assetID string) (*semanticImageEmbeddingInput, error) {
+	rendition, err := s.localReadySemanticRendition(ctx, sourceKey, assetID)
+	if err != nil {
+		if errors.Is(err, ErrAssetNotFound) {
+			return nil, fmt.Errorf("%w: %v", ErrSemanticAssetInput, err)
+		}
+		return nil, err
+	}
+	file, _, err := s.openVerifiedLocalRendition(ctx, rendition)
+	if err != nil {
+		if errors.Is(err, errLocalRenditionInvalid) {
+			if repairErr := s.markLocalRenditionsPending(ctx, sourceKey, assetID, err); repairErr != nil {
+				return nil, errors.Join(fmt.Errorf("%w: %v", ErrSemanticAssetInput, ErrAssetNotFound), repairErr)
+			}
+			return nil, fmt.Errorf("%w: %v", ErrSemanticAssetInput, ErrAssetNotFound)
+		}
+		return nil, fmt.Errorf("open local semantic image: %w", err)
+	}
+	defer file.Close()
+	body, err := readAtMost(file, detailPreviewMaxBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read local semantic image: %w", err)
+	}
+	return &semanticImageEmbeddingInput{
+		Bytes:       body,
+		ContentType: "image/jpeg",
+		Source:      "local_" + rendition.Kind,
+	}, nil
+}
+
+func (s *Service) localReadySemanticRendition(ctx context.Context, sourceKey string, assetID string) (localReadyRendition, error) {
+	if s == nil || s.catalog == nil || s.catalog.db == nil {
+		return localReadyRendition{}, ErrCatalogNotConfigured
+	}
+	rows, err := s.catalog.db.QueryContext(ctx, `SELECT kind, relative_path,
+			COALESCE(size_bytes, -1), COALESCE(content_sha256, '')
+		FROM local_renditions
+		WHERE source_key = ?
+			AND asset_id = ?
+			AND kind IN (?, ?)
+			AND status = 'ready'
+			AND relative_path IS NOT NULL
+		ORDER BY CASE kind WHEN ? THEN 0 ELSE 1 END
+		LIMIT 1`,
+		strings.TrimSpace(sourceKey),
+		strings.TrimSpace(assetID),
+		localRenditionKindDetailPreview,
+		localRenditionKindPreview,
+		localRenditionKindDetailPreview,
+	)
+	if err != nil {
+		return localReadyRendition{}, fmt.Errorf("query local semantic rendition: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return localReadyRendition{}, fmt.Errorf("iterate local semantic rendition: %w", err)
+		}
+		return localReadyRendition{}, ErrAssetNotFound
+	}
+	var rendition localReadyRendition
+	if err := rows.Scan(&rendition.Kind, &rendition.RelativePath, &rendition.SizeBytes, &rendition.SHA256); err != nil {
+		return localReadyRendition{}, fmt.Errorf("scan local semantic rendition: %w", err)
+	}
+	return rendition, rows.Err()
+}
+
+func (s *Service) primaryImmichIndexed() bool {
+	state := s.datasourceStateSnapshot()
+	if state == nil {
+		return false
+	}
+	return s.immichDatasourceIndexed(state.primary)
+}
+
+func (s *Service) immichCatalogEnabled() bool {
+	return len(s.MirrorDatasourceSourceKeys()) > 0
+}
+
+func (s *Service) catalogStoreEnabled() bool {
+	return s != nil && s.catalog != nil && (len(s.MirrorDatasourceSourceKeys()) > 0 || len(s.LocalDatasourceSourceKeys()) > 0)
+}
+
+func (s *Service) immichDatasourceIndexed(datasource *config.DatasourceConfig) bool {
+	return s != nil &&
+		datasource != nil &&
+		datasource.Kind == config.DatasourceKindImmichIndexed &&
+		strings.TrimSpace(datasource.SourceKey) != "" &&
+		s.catalog != nil
+}
+
+func datasourceIndexingConfig(datasource *config.DatasourceConfig) config.DatasourceIndexingConfig {
+	if datasource == nil || datasource.Indexing == nil {
+		return config.DatasourceIndexingConfig{}
+	}
+	return *datasource.Indexing
+}
+
+func (s *Service) mirrorDatasource(sourceKey string) (*config.DatasourceConfig, error) {
+	state := s.datasourceStateSnapshot()
+	sourceKey = strings.TrimSpace(sourceKey)
+	if sourceKey == "" {
+		if state != nil && s.immichDatasourceIndexed(state.primary) {
+			return state.primary, nil
+		}
+		return nil, ErrCatalogNotConfigured
+	}
+	if state == nil || state.datasources == nil {
+		return nil, ErrCatalogNotConfigured
+	}
+	datasource, ok := state.datasources[sourceKey]
+	if !ok || !s.immichDatasourceIndexed(&datasource) {
+		return nil, ErrCatalogNotConfigured
+	}
+	return &datasource, nil
+}
+
+// MirrorDatasourceSourceKeys returns configured Immich mirror source keys in stable order.
+func (s *Service) MirrorDatasourceSourceKeys() []string {
+	state := s.datasourceStateSnapshot()
+	if s == nil || s.catalog == nil || state == nil || len(state.datasources) == 0 {
+		return nil
+	}
+	sourceKeys := make([]string, 0, len(state.datasources))
+	for sourceKey, datasource := range state.datasources {
+		datasource.SourceKey = sourceKey
+		if s.immichDatasourceIndexed(&datasource) {
+			sourceKeys = append(sourceKeys, sourceKey)
+		}
+	}
+	sort.Strings(sourceKeys)
+	return sourceKeys
+}
+
+// LocalDatasourceSourceKeys returns configured local filesystem source keys in stable order.
+func (s *Service) LocalDatasourceSourceKeys() []string {
+	state := s.datasourceStateSnapshot()
+	if s == nil || s.catalog == nil || state == nil || len(state.datasources) == 0 {
+		return nil
+	}
+	sourceKeys := make([]string, 0, len(state.datasources))
+	for sourceKey, datasource := range state.datasources {
+		if datasource.Kind == config.DatasourceKindLocalFiles && strings.TrimSpace(datasource.RootKey) != "" {
+			sourceKeys = append(sourceKeys, sourceKey)
+		}
+	}
+	sort.Strings(sourceKeys)
+	return sourceKeys
+}
+
+func (s *Service) fetchImmichMirrorAssets(ctx context.Context, datasource *config.DatasourceConfig, options immichMirrorFetchOptions) ([]ImmichMirrorAsset, error) {
+	latestAssetLimit := options.LatestAssetLimit
+	if latestAssetLimit < 0 {
+		latestAssetLimit = 0
+	}
+	detailLimit := options.DetailLimit
+	if detailLimit < 0 {
+		detailLimit = 0
+	}
+	const pageSize = maxPageSize
+	assets := []ImmichMirrorAsset{}
+	for page := 1; ; page++ {
+		body := map[string]any{
+			"page":  page,
+			"size":  pageSize,
+			"order": SortDirectionDesc,
+		}
+		if options.UpdatedAfter != nil && !options.UpdatedAfter.IsZero() {
+			body["updatedAfter"] = options.UpdatedAfter.UTC().Format(time.RFC3339Nano)
+		}
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("marshal immich mirror sync request: %w", err)
+		}
+		request, err := s.newRequestForDatasource(datasource, http.MethodPost, "/api/search/metadata", bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		request = request.WithContext(ctx)
+		request.Header.Set("Content-Type", "application/json")
+		response, err := s.client.Do(request)
+		if err != nil {
+			return nil, fmt.Errorf("perform immich mirror sync request: %w", err)
+		}
+		var envelope searchAssetsEnvelope
+		decodeErr := func() error {
+			defer response.Body.Close()
+			if response.StatusCode < 200 || response.StatusCode >= 300 {
+				return fmt.Errorf("immich mirror sync returned status %d", response.StatusCode)
+			}
+			if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+				return fmt.Errorf("decode immich mirror sync response: %w", err)
+			}
+			return nil
+		}()
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		for _, asset := range envelope.Assets.Items {
+			if !asset.ShouldMirror() || strings.TrimSpace(asset.ID) == "" || asset.FileCreatedAt.IsZero() {
+				continue
+			}
+			var updatedAt *time.Time
+			if asset.UpdatedAt != nil && !asset.UpdatedAt.IsZero() {
+				value := asset.UpdatedAt.Time.UTC()
+				updatedAt = &value
+			}
+			city, state, country, description := asset.LocationMetadata()
+			contentSHA1Hex, contentSizeBytes := asset.ContentIdentity()
+			assets = append(assets, ImmichMirrorAsset{
+				UpstreamAssetID:  asset.ID,
+				MediaType:        normalizeAssetType(asset.Type),
+				Filename:         asset.OriginalFileName,
+				CapturedAt:       asset.FileCreatedAt.Time.UTC(),
+				Duration:         asset.Duration,
+				SourceUpdatedAt:  updatedAt,
+				ContentSHA1Hex:   contentSHA1Hex,
+				ContentSizeBytes: contentSizeBytes,
+				IsFavorite:       asset.IsFavorite,
+				City:             city,
+				State:            state,
+				Country:          country,
+				PlaceLabel:       mirrorPlaceLabel(city, state, country),
+				Description:      description,
+			})
+			if detailLimit > 0 && !mirrorAssetHasRichMetadata(assets[len(assets)-1]) {
+				detail, detailErr := s.fetchImmichMirrorAssetDetail(ctx, datasource, asset.ID)
+				if detailErr != nil {
+					return nil, detailErr
+				}
+				detailLimit--
+				if !detail.ShouldMirror() {
+					assets = assets[:len(assets)-1]
+					continue
+				}
+				enrichMirrorAssetFromImmichAsset(&assets[len(assets)-1], detail)
+			}
+			if latestAssetLimit > 0 && len(assets) >= latestAssetLimit {
+				return assets, nil
+			}
+		}
+		if envelope.Assets.NextPage == nil {
+			return assets, nil
+		}
+		if *envelope.Assets.NextPage <= page {
+			return assets, nil
+		}
+	}
+}
+
+func (s *Service) fetchImmichMirrorAssetDetail(ctx context.Context, datasource *config.DatasourceConfig, upstreamAssetID string) (immichAsset, error) {
+	upstreamAssetID = strings.TrimSpace(upstreamAssetID)
+	if upstreamAssetID == "" {
+		return immichAsset{}, ErrInvalidSearchRequest
+	}
+	request, err := s.newRequestForDatasource(datasource, http.MethodGet, "/api/assets/"+url.PathEscape(upstreamAssetID), nil)
+	if err != nil {
+		return immichAsset{}, err
+	}
+	request = request.WithContext(ctx)
+	response, err := s.client.Do(request)
+	if err != nil {
+		return immichAsset{}, fmt.Errorf("perform immich asset detail request: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return immichAsset{}, fmt.Errorf("immich asset detail returned status %d", response.StatusCode)
+	}
+	var asset immichAsset
+	if err := json.NewDecoder(response.Body).Decode(&asset); err != nil {
+		return immichAsset{}, fmt.Errorf("decode immich asset detail response: %w", err)
+	}
+	return asset, nil
+}
+
+func mirrorAssetHasRichMetadata(asset ImmichMirrorAsset) bool {
+	hasContentIdentity := strings.TrimSpace(asset.ContentSHA1Hex) != "" && asset.ContentSizeBytes > 0
+	hasRichMetadata := asset.IsFavorite ||
+		strings.TrimSpace(asset.City) != "" ||
+		strings.TrimSpace(asset.State) != "" ||
+		strings.TrimSpace(asset.Country) != "" ||
+		strings.TrimSpace(asset.Description) != ""
+	return hasContentIdentity && hasRichMetadata
+}
+
+func enrichMirrorAssetFromImmichAsset(target *ImmichMirrorAsset, asset immichAsset) {
+	if target == nil {
+		return
+	}
+	if mediaType := normalizeAssetType(asset.Type); mediaType != "" {
+		target.MediaType = mediaType
+	}
+	if filename := strings.TrimSpace(asset.OriginalFileName); filename != "" {
+		target.Filename = filename
+	}
+	if !asset.FileCreatedAt.IsZero() {
+		target.CapturedAt = asset.FileCreatedAt.Time.UTC()
+	}
+	if asset.Duration != nil {
+		target.Duration = asset.Duration
+	}
+	if asset.UpdatedAt != nil && !asset.UpdatedAt.IsZero() {
+		value := asset.UpdatedAt.Time.UTC()
+		target.SourceUpdatedAt = &value
+	}
+	if contentSHA1Hex, contentSizeBytes := asset.ContentIdentity(); contentSHA1Hex != "" && contentSizeBytes > 0 {
+		target.ContentSHA1Hex = contentSHA1Hex
+		target.ContentSizeBytes = contentSizeBytes
+	}
+	target.IsFavorite = asset.IsFavorite
+	city, state, country, description := asset.LocationMetadata()
+	target.City = city
+	target.State = state
+	target.Country = country
+	target.PlaceLabel = mirrorPlaceLabel(city, state, country)
+	target.Description = description
+}
+
+func mirrorPlaceLabel(parts ...string) string {
+	values := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key := strings.ToLower(part)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		values = append(values, part)
+	}
+	return strings.Join(values, ", ")
 }
 
 // CatalogPage preserves internal callers while the public API moves to SearchAssets.
@@ -441,57 +2060,6 @@ func searchBoundary(page AssetSearchPageRequest, itemCount int) *AssetSearchBoun
 		return nil
 	}
 	return &AssetSearchBoundary{Kind: BoundaryPastEnd}
-}
-
-func immichSearchRequest(normalized normalizedAssetSearch) ([]byte, string, string, error) {
-	body := map[string]any{
-		"page": normalized.Request.Page.Index + 1,
-		"size": normalized.Request.Page.Size,
-	}
-	applyImmichSearchFilters(body, normalized.Request.Collection.Filters)
-
-	switch normalized.Resolved.QueryMode {
-	case QueryModeSemantic:
-		if normalized.Request.Collection.Query == nil {
-			return nil, "", "", ErrInvalidSearchRequest
-		}
-		body["query"] = normalized.Request.Collection.Query.Text
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return nil, "", "", fmt.Errorf("marshal smart search request: %w", err)
-		}
-		return raw, "/api/search/smart", TotalAccuracyEstimated, nil
-	case QueryModeFilename:
-		if normalized.Request.Collection.Query == nil {
-			return nil, "", "", ErrInvalidSearchRequest
-		}
-		body["originalFileName"] = normalized.Request.Collection.Query.Text
-		fallthrough
-	case QueryModeNone:
-		body["order"] = SortDirectionDesc
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return nil, "", "", fmt.Errorf("marshal metadata search request: %w", err)
-		}
-		return raw, "/api/search/metadata", TotalAccuracyExact, nil
-	default:
-		return nil, "", "", ErrUnsupportedSearch
-	}
-}
-
-func applyImmichSearchFilters(body map[string]any, filters AssetSearchFilters) {
-	if len(filters.MediaTypes) == 1 {
-		body["type"] = immichAssetType(filters.MediaTypes[0])
-	}
-	if filters.CapturedAt == nil {
-		return
-	}
-	if filters.CapturedAt.From != nil {
-		body["takenAfter"] = filters.CapturedAt.From.UTC().Format(time.RFC3339Nano)
-	}
-	if filters.CapturedAt.To != nil {
-		body["takenBefore"] = filters.CapturedAt.To.UTC().Format(time.RFC3339Nano)
-	}
 }
 
 func normalizeAssetSearchRequest(searchRequest AssetSearchRequest) (normalizedAssetSearch, error) {
@@ -515,6 +2083,9 @@ func normalizeAssetSearchRequest(searchRequest AssetSearchRequest) (normalizedAs
 	}
 	if request.Page.Size > maxPageSize {
 		request.Page.Size = maxPageSize
+	}
+	if request.Page.Index > (math.MaxInt-request.Page.Size)/request.Page.Size {
+		return normalizedAssetSearch{}, fmt.Errorf("%w: page offset is too large", ErrInvalidSearchRequest)
 	}
 
 	mediaTypes, err := normalizeMediaTypes(request.Collection.Filters.MediaTypes)
@@ -663,15 +2234,6 @@ func normalizeAssetType(value string) string {
 	}
 }
 
-func immichAssetType(value string) string {
-	switch value {
-	case "video":
-		return "VIDEO"
-	default:
-		return "IMAGE"
-	}
-}
-
 // SearchCapabilities returns the search features supported by the active datasource.
 func (s *Service) SearchCapabilities() AssetSearchCapabilities {
 	queryModes := []string{}
@@ -679,13 +2241,45 @@ func (s *Service) SearchCapabilities() AssetSearchCapabilities {
 		{Field: SortFieldCapturedAt, Directions: []string{SortDirectionDesc}},
 	}
 	totalAccuracy := []string{TotalAccuracyExact}
-	if s.datasource != nil && s.datasource.Kind != config.DatasourceKindStaticDemo {
+	state := s.datasourceStateSnapshot()
+	if state != nil && state.primary != nil && config.IsImmichPassthroughDatasourceKind(state.primary.Kind) {
 		queryModes = []string{QueryModeAuto, QueryModeSemantic, QueryModeFilename}
 		sorts = append(sorts, AssetSearchSortCapability{
 			Field:      SortFieldRelevance,
 			Directions: []string{SortDirectionDesc},
 		})
 		totalAccuracy = []string{TotalAccuracyExact, TotalAccuracyEstimated, TotalAccuracyLowerBound}
+		return AssetSearchCapabilities{
+			QueryModes: queryModes,
+			Filters: AssetSearchFilterCapabilities{
+				MediaTypes: []string{"image", "video"},
+				CapturedAt: true,
+			},
+			Sorts:         sorts,
+			TotalAccuracy: totalAccuracy,
+			Page:          AssetSearchPageCapabilities{MaxSize: maxPageSize},
+		}
+	}
+	if s.catalogStoreEnabled() {
+		ctx := context.Background()
+		profile := s.semanticSearchProfile(ctx, AssetSearchOptions{})
+		queryModes = []string{QueryModeAuto, QueryModeSemantic, QueryModeFilename}
+		sorts = append(sorts, AssetSearchSortCapability{
+			Field:      SortFieldRelevance,
+			Directions: []string{SortDirectionDesc},
+		})
+		totalAccuracy = []string{TotalAccuracyExact, TotalAccuracyEstimated, TotalAccuracyLowerBound}
+		return AssetSearchCapabilities{
+			QueryModes: queryModes,
+			Filters: AssetSearchFilterCapabilities{
+				MediaTypes: []string{"image", "video"},
+				CapturedAt: true,
+			},
+			Sorts:         sorts,
+			TotalAccuracy: totalAccuracy,
+			Page:          AssetSearchPageCapabilities{MaxSize: maxPageSize},
+			Semantic:      s.catalogSemanticCapabilities(ctx, profile),
+		}
 	}
 	return AssetSearchCapabilities{
 		QueryModes: queryModes,
@@ -699,84 +2293,27 @@ func (s *Service) SearchCapabilities() AssetSearchCapabilities {
 	}
 }
 
-func (s *Service) timelineAssetTotal() (int, error) {
-	now := time.Now()
-	s.mu.Lock()
-	if !s.cachedTotalAt.IsZero() && now.Sub(s.cachedTotalAt) < statisticsTotalCacheTTL {
-		total := s.cachedTotal
-		s.mu.Unlock()
-		return total, nil
-	}
-	s.mu.Unlock()
-
-	total, err := s.fetchTimelineAssetTotal()
-	if err != nil {
-		return 0, err
-	}
-
-	s.mu.Lock()
-	s.cachedTotal = total
-	s.cachedTotalAt = now
-	s.mu.Unlock()
-	return total, nil
-}
-
-func (s *Service) fetchTimelineAssetTotal() (int, error) {
-	return s.fetchTimelineStatisticsTotal(AssetSearchFilters{})
-}
-
-func (s *Service) fetchTimelineStatisticsTotal(filters AssetSearchFilters) (int, error) {
-	body := map[string]any{}
-	applyImmichSearchFilters(body, filters)
-	rawBody, err := json.Marshal(body)
-	if err != nil {
-		return 0, fmt.Errorf("marshal statistics request: %w", err)
-	}
-
-	request, err := s.newRequest(
-		http.MethodPost,
-		"/api/search/statistics",
-		bytes.NewReader(rawBody),
-	)
-	if err != nil {
-		return 0, err
-	}
-	request.Header.Set("Content-Type", "application/json")
-
-	response, err := s.client.Do(request)
-	if err != nil {
-		return 0, fmt.Errorf("perform statistics request: %w", err)
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return 0, fmt.Errorf("statistics request returned status %d", response.StatusCode)
-	}
-
-	var payload map[string]any
-	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
-		return 0, fmt.Errorf("decode statistics response: %w", err)
-	}
-
-	total, ok := parseStatisticsTotal(payload)
-	if !ok {
-		return 0, fmt.Errorf("statistics response missing total")
-	}
-	return max(0, total), nil
-}
-
 // Preview returns the lightweight image profile from the configured datasource.
 func (s *Service) Preview(clientRequest *http.Request, assetID string) (*UpstreamMediaResponse, error) {
-	if !s.Ready() {
-		return nil, ErrNoDatasourceConfigured
+	return s.PreviewFromSource(clientRequest, "", assetID)
+}
+
+// PreviewFromSource returns the lightweight image profile for one datasource asset.
+func (s *Service) PreviewFromSource(clientRequest *http.Request, sourceKey string, assetID string) (*UpstreamMediaResponse, error) {
+	state, datasource, err := s.datasourceForMedia(sourceKey)
+	if err != nil {
+		return nil, err
 	}
-	if s.datasource.Kind == config.DatasourceKindStaticDemo {
-		if s.staticDemoErr != nil {
-			return nil, s.staticDemoErr
+	if datasource.Kind == config.DatasourceKindStaticDemo {
+		if state.staticDemoErr != nil {
+			return nil, state.staticDemoErr
 		}
-		return s.staticDemo.MediaResponse(clientRequest, assetID, "preview")
+		if state.staticDemo == nil {
+			return nil, ErrNoDatasourceConfigured
+		}
+		return state.staticDemo.MediaResponse(clientRequest, assetID, "preview")
 	}
-	return s.profileImage(clientRequest, assetID, hostedImageProfile{
+	profile := hostedImageProfile{
 		Name:           "preview",
 		UpstreamSize:   previewSize,
 		MaxEdgePixels:  previewMaxEdgePixels,
@@ -784,21 +2321,34 @@ func (s *Service) Preview(clientRequest *http.Request, assetID string) (*Upstrea
 		JPEGQualities:  previewJPEGQualities,
 		FileNameBase:   "preview",
 		FileNameSuffix: "_preview",
-	})
+	}
+	if datasource.Kind == config.DatasourceKindLocalFiles {
+		return s.localRenditionMediaResponseWithImmichFallback(clientRequest, datasource, assetID, localRenditionKindPreview, profile)
+	}
+	return s.profileImageForDatasource(clientRequest, datasource, assetID, profile)
 }
 
 // DetailPreview returns the detail-preview image profile from the configured datasource.
 func (s *Service) DetailPreview(clientRequest *http.Request, assetID string) (*UpstreamMediaResponse, error) {
-	if !s.Ready() {
-		return nil, ErrNoDatasourceConfigured
+	return s.DetailPreviewFromSource(clientRequest, "", assetID)
+}
+
+// DetailPreviewFromSource returns the detail-preview image profile for one datasource asset.
+func (s *Service) DetailPreviewFromSource(clientRequest *http.Request, sourceKey string, assetID string) (*UpstreamMediaResponse, error) {
+	state, datasource, err := s.datasourceForMedia(sourceKey)
+	if err != nil {
+		return nil, err
 	}
-	if s.datasource.Kind == config.DatasourceKindStaticDemo {
-		if s.staticDemoErr != nil {
-			return nil, s.staticDemoErr
+	if datasource.Kind == config.DatasourceKindStaticDemo {
+		if state.staticDemoErr != nil {
+			return nil, state.staticDemoErr
 		}
-		return s.staticDemo.MediaResponse(clientRequest, assetID, "detail_preview")
+		if state.staticDemo == nil {
+			return nil, ErrNoDatasourceConfigured
+		}
+		return state.staticDemo.MediaResponse(clientRequest, assetID, "detail_preview")
 	}
-	return s.profileImage(clientRequest, assetID, hostedImageProfile{
+	profile := hostedImageProfile{
 		Name:           "detail_preview",
 		UpstreamSize:   detailPreviewSize,
 		MaxEdgePixels:  detailPreviewMaxEdgePixels,
@@ -806,7 +2356,157 @@ func (s *Service) DetailPreview(clientRequest *http.Request, assetID string) (*U
 		JPEGQualities:  detailPreviewJPEGQualities,
 		FileNameBase:   "detail_preview",
 		FileNameSuffix: "_detail_preview",
-	})
+	}
+	if datasource.Kind == config.DatasourceKindLocalFiles {
+		return s.localRenditionMediaResponseWithImmichFallback(clientRequest, datasource, assetID, localRenditionKindDetailPreview, profile)
+	}
+	return s.profileImageForDatasource(clientRequest, datasource, assetID, profile)
+}
+
+func (s *Service) localRenditionMediaResponseWithImmichFallback(
+	clientRequest *http.Request,
+	datasource *config.DatasourceConfig,
+	assetID string,
+	kind string,
+	profile hostedImageProfile,
+) (*UpstreamMediaResponse, error) {
+	response, err := s.localRenditionMediaResponse(clientRequest, datasource, assetID, kind)
+	if err == nil || !errors.Is(err, ErrAssetNotFound) {
+		return response, err
+	}
+	if !config.LocalDatasourceImmichFallbackEnabled(*datasource) {
+		return nil, err
+	}
+	fallback, ok, fallbackErr := s.immichDuplicateProfileImageFallback(clientRequest, datasource.SourceKey, assetID, profile)
+	if fallbackErr != nil {
+		return nil, fallbackErr
+	}
+	if ok {
+		return fallback, nil
+	}
+	return nil, err
+}
+
+func (s *Service) immichDuplicateProfileImageFallback(
+	clientRequest *http.Request,
+	localSourceKey string,
+	assetID string,
+	profile hostedImageProfile,
+) (*UpstreamMediaResponse, bool, error) {
+	if s == nil || s.catalog == nil {
+		return nil, false, nil
+	}
+	sources, err := s.catalog.activeImmichSourcesForCanonicalAsset(contextFromRequest(clientRequest), localSourceKey, assetID)
+	if err != nil {
+		return nil, false, err
+	}
+	sources, deferredSources := s.eligibleImmichMediaFallbackSources(sources, time.Now().UTC())
+	if len(sources) == 0 && deferredSources > 0 {
+		return nil, false, fmt.Errorf("%w: duplicate media sources are in retry backoff", ErrDatasourceUnavailable)
+	}
+	var sourceErr error
+	failedSources := map[string]struct{}{}
+	for _, source := range sources {
+		if _, failed := failedSources[source.SourceKey]; failed {
+			continue
+		}
+		_, datasource, err := s.datasourceForMedia(source.SourceKey)
+		if err != nil {
+			if errors.Is(err, ErrAssetNotFound) || errors.Is(err, ErrNoDatasourceConfigured) {
+				failedSources[source.SourceKey] = struct{}{}
+				continue
+			}
+			return nil, false, err
+		}
+		if !config.IsImmichDatasourceKind(datasource.Kind) {
+			continue
+		}
+		parentCtx := contextFromRequest(clientRequest)
+		sourceCtx, cancel := context.WithTimeout(parentCtx, mediaFallbackSourceTimeout)
+		sourceRequest := requestWithContext(clientRequest, sourceCtx)
+		response, err := s.profileImageForDatasource(sourceRequest, datasource, source.UpstreamAssetID, profile)
+		cancel()
+		if err != nil {
+			if ctxErr := parentCtx.Err(); ctxErr != nil {
+				return nil, false, ctxErr
+			}
+			if !errors.Is(err, ErrAssetNotFound) {
+				sourceErr = err
+				if immichMediaFallbackSourceFailure(err) {
+					failedSources[source.SourceKey] = struct{}{}
+					s.markImmichMediaFallbackFailure(source.SourceKey, time.Now().UTC())
+				}
+			}
+			continue
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			response.Body.Close()
+			sourceErr = fmt.Errorf("%w: unexpected profile status %d", ErrDatasourceUnavailable, response.StatusCode)
+			failedSources[source.SourceKey] = struct{}{}
+			s.markImmichMediaFallbackFailure(source.SourceKey, time.Now().UTC())
+			continue
+		}
+		s.clearImmichMediaFallbackFailure(source.SourceKey)
+		return response, true, nil
+	}
+	if sourceErr != nil {
+		return nil, false, sourceErr
+	}
+	return nil, false, nil
+}
+
+func immichMediaFallbackSourceFailure(err error) bool {
+	return errors.Is(err, ErrDatasourceUnavailable)
+}
+
+func requestWithContext(request *http.Request, ctx context.Context) *http.Request {
+	if request != nil {
+		return request.Clone(ctx)
+	}
+	return (&http.Request{Header: http.Header{}}).WithContext(ctx)
+}
+
+func (s *Service) eligibleImmichMediaFallbackSources(sources []catalogMediaSource, now time.Time) ([]catalogMediaSource, int) {
+	if s == nil || len(sources) == 0 {
+		return append([]catalogMediaSource(nil), sources...), 0
+	}
+	s.mu.Lock()
+	retry := make(map[string]time.Time, len(s.mediaSourceRetry))
+	for sourceKey, notBefore := range s.mediaSourceRetry {
+		retry[sourceKey] = notBefore
+	}
+	s.mu.Unlock()
+	eligible := make([]catalogMediaSource, 0, len(sources))
+	deferred := 0
+	for _, source := range sources {
+		if retry[source.SourceKey].After(now) {
+			deferred++
+			continue
+		}
+		eligible = append(eligible, source)
+	}
+	return eligible, deferred
+}
+
+func (s *Service) markImmichMediaFallbackFailure(sourceKey string, now time.Time) {
+	if s == nil || strings.TrimSpace(sourceKey) == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.mediaSourceRetry == nil {
+		s.mediaSourceRetry = map[string]time.Time{}
+	}
+	s.mediaSourceRetry[sourceKey] = now.UTC().Add(mediaFallbackSourceBackoff)
+	s.mu.Unlock()
+}
+
+func (s *Service) clearImmichMediaFallbackFailure(sourceKey string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.mediaSourceRetry, sourceKey)
+	s.mu.Unlock()
 }
 
 func (s *Service) profileImage(
@@ -814,13 +2514,29 @@ func (s *Service) profileImage(
 	assetID string,
 	profile hostedImageProfile,
 ) (*UpstreamMediaResponse, error) {
+	state := s.datasourceStateSnapshot()
+	if state == nil {
+		return nil, ErrNoDatasourceConfigured
+	}
+	return s.profileImageForDatasource(clientRequest, state.primary, assetID, profile)
+}
+
+func (s *Service) profileImageForDatasource(
+	clientRequest *http.Request,
+	datasource *config.DatasourceConfig,
+	assetID string,
+	profile hostedImageProfile,
+) (*UpstreamMediaResponse, error) {
+	if datasource == nil {
+		return nil, ErrNoDatasourceConfigured
+	}
 	totalStartedAt := time.Now()
 	upstreamStartedAt := time.Now()
 	upstreamSize := profile.UpstreamSize
 	if upstreamSize == "" {
 		upstreamSize = detailPreviewSize
 	}
-	upstream, err := s.proxyMedia(profileUpstreamRequest(clientRequest), "/api/assets/"+url.PathEscape(assetID)+"/thumbnail?size="+upstreamSize, nil)
+	upstream, err := s.proxyMediaForDatasource(datasource, profileUpstreamRequest(clientRequest), "/api/assets/"+url.PathEscape(assetID)+"/thumbnail?size="+upstreamSize, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -830,9 +2546,13 @@ func (s *Service) profileImage(
 	}
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 		timing.Total = time.Since(totalStartedAt)
-		upstream.Header.Set("Server-Timing", photoDetailServerTiming(timing))
 		logPhotoDetailTiming(clientRequest, upstream.StatusCode, false, timing)
-		return upstream, nil
+		status := upstream.StatusCode
+		upstream.Body.Close()
+		if status == http.StatusNotFound {
+			return nil, ErrAssetNotFound
+		}
+		return nil, fmt.Errorf("%w: profile upstream status %d", ErrDatasourceUnavailable, status)
 	}
 	if contentLengthExceeds(upstream.Header.Get("Content-Length"), detailPreviewMaxSource) {
 		upstream.Body.Close()
@@ -843,7 +2563,10 @@ func (s *Service) profileImage(
 	body, err := readAtMost(upstream.Body, detailPreviewMaxSource)
 	upstream.Body.Close()
 	if err != nil {
-		return nil, fmt.Errorf("read hosted media response: %w", err)
+		if errors.Is(err, ErrMediaTooLarge) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: read hosted media response: %w", ErrDatasourceUnavailable, err)
 	}
 	timing.ReadOriginal = time.Since(readStartedAt)
 	timing.OriginalBytes = len(body)
@@ -859,12 +2582,13 @@ func (s *Service) profileImage(
 	timing.OutputBytes = resizeTiming.OutputBytes
 	timing.Format = resizeTiming.Format
 	if err != nil {
-		return nil, fmt.Errorf("render hosted media: %w", err)
+		return nil, fmt.Errorf("%w: render hosted media: %v", ErrMediaInvalid, err)
 	}
 	timing.Total = time.Since(totalStartedAt)
 	if !ok {
 		upstream.Body = io.NopCloser(bytes.NewReader(body))
 		upstream.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		upstream.Header.Set("Content-Disposition", hostedImageContentDisposition(profile))
 		upstream.Header.Set("Server-Timing", photoDetailServerTiming(timing))
 		logPhotoDetailTiming(clientRequest, upstream.StatusCode, false, timing)
 		return upstream, nil
@@ -872,15 +2596,10 @@ func (s *Service) profileImage(
 	timing.OutputBytes = len(encodedBody)
 
 	header := make(http.Header)
-	if cacheControl := upstream.Header.Get("Cache-Control"); cacheControl != "" {
-		header.Set("Cache-Control", cacheControl)
-	}
 	if lastModified := upstream.Header.Get("Last-Modified"); lastModified != "" {
 		header.Set("Last-Modified", lastModified)
 	}
-	if fileName := hostedImageFileName(upstream.Header.Get("Content-Disposition"), assetID, profile); fileName != "" {
-		header.Set("Content-Disposition", "inline; filename*=UTF-8''"+url.PathEscape(fileName))
-	}
+	header.Set("Content-Disposition", hostedImageContentDisposition(profile))
 	header.Set("Content-Type", "image/jpeg")
 	header.Set("Content-Length", strconv.Itoa(len(encodedBody)))
 	header.Set("Server-Timing", photoDetailServerTiming(timing))
@@ -895,20 +2614,67 @@ func (s *Service) profileImage(
 
 // Original proxies an original asset request from the configured datasource.
 func (s *Service) Original(clientRequest *http.Request, assetID string) (*UpstreamMediaResponse, error) {
-	if !s.Ready() {
-		return nil, ErrNoDatasourceConfigured
+	return s.OriginalFromSource(clientRequest, "", assetID)
+}
+
+// OriginalFromSource proxies an original asset request from one datasource.
+func (s *Service) OriginalFromSource(clientRequest *http.Request, sourceKey string, assetID string) (*UpstreamMediaResponse, error) {
+	state, datasource, err := s.datasourceForMedia(sourceKey)
+	if err != nil {
+		return nil, err
 	}
-	if s.datasource.Kind == config.DatasourceKindStaticDemo {
-		if s.staticDemoErr != nil {
-			return nil, s.staticDemoErr
+	if datasource.Kind == config.DatasourceKindStaticDemo {
+		if state.staticDemoErr != nil {
+			return nil, state.staticDemoErr
 		}
-		return s.staticDemo.MediaResponse(clientRequest, assetID, "original")
+		if state.staticDemo == nil {
+			return nil, ErrNoDatasourceConfigured
+		}
+		return state.staticDemo.MediaResponse(clientRequest, assetID, "original")
 	}
-	return s.proxyMedia(clientRequest, "/api/assets/"+url.PathEscape(assetID)+"/original", nil)
+	if datasource.Kind == config.DatasourceKindLocalFiles {
+		return s.localOriginalMediaResponse(clientRequest, datasource, assetID)
+	}
+	response, err := s.proxyMediaForDatasource(datasource, clientRequest, "/api/assets/"+url.PathEscape(assetID)+"/original", nil)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeOriginalUpstreamResponse(response)
+}
+
+func normalizeOriginalUpstreamResponse(response *UpstreamMediaResponse) (*UpstreamMediaResponse, error) {
+	if response == nil {
+		return nil, fmt.Errorf("%w: original upstream response is missing", ErrDatasourceUnavailable)
+	}
+	switch {
+	case response.StatusCode >= 200 && response.StatusCode < 300:
+		return response, nil
+	case response.StatusCode == http.StatusNotModified,
+		response.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+		return response, nil
+	case response.StatusCode == http.StatusNotFound:
+		response.Body.Close()
+		return nil, ErrAssetNotFound
+	default:
+		status := response.StatusCode
+		response.Body.Close()
+		return nil, fmt.Errorf("%w: original upstream status %d", ErrDatasourceUnavailable, status)
+	}
 }
 
 func (s *Service) proxyMedia(clientRequest *http.Request, path string, body io.Reader) (*UpstreamMediaResponse, error) {
+	state := s.datasourceStateSnapshot()
+	if state == nil {
+		return nil, ErrNoDatasourceConfigured
+	}
+	return s.proxyMediaForDatasource(state.primary, clientRequest, path, body)
+}
+
+func (s *Service) proxyMediaForDatasource(datasource *config.DatasourceConfig, clientRequest *http.Request, path string, body io.Reader) (*UpstreamMediaResponse, error) {
 	if !s.Ready() {
+		return nil, ErrNoDatasourceConfigured
+	}
+	if datasource == nil {
 		return nil, ErrNoDatasourceConfigured
 	}
 
@@ -917,7 +2683,7 @@ func (s *Service) proxyMedia(clientRequest *http.Request, path string, body io.R
 		method = clientRequest.Method
 	}
 
-	request, err := s.newRequest(method, path, body)
+	request, err := s.newRequestForDatasource(datasource, method, path, body)
 	if err != nil {
 		return nil, err
 	}
@@ -927,7 +2693,7 @@ func (s *Service) proxyMedia(clientRequest *http.Request, path string, body io.R
 	applyProxyRequestHeaders(request, clientRequest)
 	response, err := s.client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("perform media request: %w", err)
+		return nil, fmt.Errorf("%w: perform media request: %w", ErrDatasourceUnavailable, err)
 	}
 	return &UpstreamMediaResponse{
 		StatusCode: response.StatusCode,
@@ -936,17 +2702,62 @@ func (s *Service) proxyMedia(clientRequest *http.Request, path string, body io.R
 	}, nil
 }
 
+func (s *Service) datasourceForMedia(sourceKey string) (*serviceDatasourceState, *config.DatasourceConfig, error) {
+	state := s.datasourceStateSnapshot()
+	if !state.ready() {
+		return nil, nil, ErrNoDatasourceConfigured
+	}
+	sourceKey = strings.TrimSpace(sourceKey)
+	if sourceKey == "" {
+		if state.primary == nil {
+			return nil, nil, ErrNoDatasourceConfigured
+		}
+		return state, state.primary, nil
+	}
+	if state.datasources != nil {
+		if datasource, ok := state.datasources[sourceKey]; ok {
+			return state, &datasource, nil
+		}
+	}
+	return state, nil, ErrAssetNotFound
+}
+
 func profileUpstreamRequest(clientRequest *http.Request) *http.Request {
-	if clientRequest == nil || clientRequest.Method != http.MethodHead {
-		return clientRequest
+	if clientRequest == nil {
+		return nil
 	}
 	upstreamRequest := clientRequest.Clone(clientRequest.Context())
-	upstreamRequest.Method = http.MethodGet
+	if upstreamRequest.Method == http.MethodHead {
+		upstreamRequest.Method = http.MethodGet
+	}
+	// Profile responses are new Agent-owned representations. Byte ranges,
+	// validators, and content encodings for that representation cannot be
+	// applied to the Immich source object before decode and transformation.
+	for _, headerName := range []string{
+		"Range",
+		"If-Range",
+		"If-None-Match",
+		"If-Modified-Since",
+		"Accept-Encoding",
+	} {
+		upstreamRequest.Header.Del(headerName)
+	}
 	return upstreamRequest
 }
 
 func (s *Service) newRequest(method string, path string, body io.Reader) (*http.Request, error) {
-	baseURL, err := url.Parse(s.datasource.URL)
+	state := s.datasourceStateSnapshot()
+	if state == nil {
+		return nil, ErrNoDatasourceConfigured
+	}
+	return s.newRequestForDatasource(state.primary, method, path, body)
+}
+
+func (s *Service) newRequestForDatasource(datasource *config.DatasourceConfig, method string, path string, body io.Reader) (*http.Request, error) {
+	if datasource == nil {
+		return nil, ErrNoDatasourceConfigured
+	}
+	baseURL, err := url.Parse(datasource.URL)
 	if err != nil {
 		return nil, fmt.Errorf("parse datasource URL: %w", err)
 	}
@@ -958,7 +2769,7 @@ func (s *Service) newRequest(method string, path string, body io.Reader) (*http.
 	if err != nil {
 		return nil, fmt.Errorf("create upstream request: %w", err)
 	}
-	applyDatasourceAuth(request, s.datasource.AccessToken)
+	applyDatasourceAuth(request, datasource.AccessToken)
 	return request, nil
 }
 
@@ -1084,6 +2895,9 @@ func renderHostedImage(body []byte, profile hostedImageProfile) ([]byte, bool, p
 	timing.Decode = time.Since(decodeStartedAt)
 	timing.Format = format
 	if err != nil {
+		if profile.ForceJPEG {
+			return nil, false, timing, fmt.Errorf("decode image: %w", err)
+		}
 		if len(body) <= profile.MaxBytes {
 			timing.OutputBytes = len(body)
 			return body, false, timing, nil
@@ -1091,6 +2905,9 @@ func renderHostedImage(body []byte, profile hostedImageProfile) ([]byte, bool, p
 		return nil, false, timing, ErrMediaTooLarge
 	}
 	if !supportsHostedImageFormat(format) {
+		if profile.ForceJPEG {
+			return nil, false, timing, fmt.Errorf("unsupported image format %q", format)
+		}
 		if len(body) <= profile.MaxBytes {
 			timing.OutputBytes = len(body)
 			return body, false, timing, nil
@@ -1359,45 +3176,12 @@ func photoDetailTransform(dstWidth int, dstHeight int, scale float64, orientatio
 	}
 }
 
-func hostedImageFileName(contentDisposition string, assetID string, profile hostedImageProfile) string {
-	name := strings.TrimSpace(assetID)
-	if contentDisposition != "" {
-		if filename := contentDispositionFilename(contentDisposition); filename != "" {
-			name = filename
-		}
-	}
-	base := strings.TrimSuffix(filepath.Base(name), filepath.Ext(name))
-	if base == "" || base == "." || base == string(filepath.Separator) {
-		base = strings.TrimSpace(assetID)
-	}
-	if base == "" {
-		base = strings.TrimSpace(profile.FileNameBase)
-	}
+func hostedImageContentDisposition(profile hostedImageProfile) string {
+	base := strings.ReplaceAll(strings.TrimSpace(profile.FileNameBase), "_", "-")
 	if base == "" {
 		base = "image"
 	}
-	return base + profile.FileNameSuffix + ".jpg"
-}
-
-func contentDispositionFilename(contentDisposition string) string {
-	lowerValue := strings.ToLower(contentDisposition)
-	if index := strings.Index(lowerValue, "filename*=utf-8''"); index >= 0 {
-		rawValue := strings.TrimSpace(contentDisposition[index+len("filename*=UTF-8''"):])
-		if separator := strings.Index(rawValue, ";"); separator >= 0 {
-			rawValue = rawValue[:separator]
-		}
-		if decodedValue, err := url.PathUnescape(strings.Trim(rawValue, "\"")); err == nil {
-			return decodedValue
-		}
-	}
-	if index := strings.Index(lowerValue, "filename="); index >= 0 {
-		rawValue := strings.TrimSpace(contentDisposition[index+len("filename="):])
-		if separator := strings.Index(rawValue, ";"); separator >= 0 {
-			rawValue = rawValue[:separator]
-		}
-		return strings.Trim(rawValue, "\"")
-	}
-	return ""
+	return "inline; filename*=UTF-8''" + url.PathEscape(base+".jpg")
 }
 
 type searchAssetsEnvelope struct {
@@ -1443,11 +3227,62 @@ func (s *searchAssetsItems) UnmarshalJSON(data []byte) error {
 }
 
 type immichAsset struct {
-	ID               string       `json:"id"`
-	Type             string       `json:"type"`
-	OriginalFileName string       `json:"originalFileName"`
-	FileCreatedAt    flexibleTime `json:"fileCreatedAt"`
-	Duration         *string      `json:"duration,omitempty"`
+	ID               string          `json:"id"`
+	Type             string          `json:"type"`
+	OriginalFileName string          `json:"originalFileName"`
+	FileCreatedAt    flexibleTime    `json:"fileCreatedAt"`
+	UpdatedAt        *flexibleTime   `json:"updatedAt,omitempty"`
+	Duration         *string         `json:"duration,omitempty"`
+	IsArchived       bool            `json:"isArchived,omitempty"`
+	IsTrashed        bool            `json:"isTrashed,omitempty"`
+	IsFavorite       bool            `json:"isFavorite,omitempty"`
+	Checksum         string          `json:"checksum,omitempty"`
+	FileSizeInByte   json.RawMessage `json:"fileSizeInByte,omitempty"`
+	FileSize         json.RawMessage `json:"fileSize,omitempty"`
+	Visibility       string          `json:"visibility,omitempty"`
+	DeletedAt        *flexibleTime   `json:"deletedAt,omitempty"`
+	TrashedAt        *flexibleTime   `json:"trashedAt,omitempty"`
+	ExifInfo         *immichExif     `json:"exifInfo,omitempty"`
+}
+
+func (a immichAsset) ShouldMirror() bool {
+	if a.IsArchived || a.IsTrashed {
+		return false
+	}
+	visibility := strings.TrimSpace(strings.ToLower(a.Visibility))
+	if visibility != "" && visibility != "timeline" {
+		return false
+	}
+	if a.DeletedAt != nil && !a.DeletedAt.IsZero() {
+		return false
+	}
+	return a.TrashedAt == nil || a.TrashedAt.IsZero()
+}
+
+func (a immichAsset) LocationMetadata() (string, string, string, string) {
+	if a.ExifInfo == nil {
+		return "", "", "", ""
+	}
+	return strings.TrimSpace(a.ExifInfo.City),
+		strings.TrimSpace(a.ExifInfo.State),
+		strings.TrimSpace(a.ExifInfo.Country),
+		strings.TrimSpace(a.ExifInfo.Description)
+}
+
+func (a immichAsset) ContentIdentity() (string, int64) {
+	sha1Hex := normalizeImmichSHA1Checksum(a.Checksum)
+	sizeBytes := decodeFlexibleInt64Raw(a.FileSizeInByte)
+	if sizeBytes <= 0 {
+		sizeBytes = decodeFlexibleInt64Raw(a.FileSize)
+	}
+	return sha1Hex, sizeBytes
+}
+
+type immichExif struct {
+	City        string `json:"city,omitempty"`
+	State       string `json:"state,omitempty"`
+	Country     string `json:"country,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 type flexibleTime struct {
@@ -1493,45 +3328,48 @@ func decodeFlexibleInt(data json.RawMessage) (int, error) {
 	return 0, fmt.Errorf("unsupported integer payload: %s", string(data))
 }
 
-func parseStatisticsTotal(payload map[string]any) (int, bool) {
-	if total := decodeFlexibleAnyInt(payload["total"]); total != nil {
-		return *total, true
+func decodeFlexibleInt64Raw(data json.RawMessage) int64 {
+	if len(data) == 0 || string(data) == "null" {
+		return 0
 	}
-	if assets, ok := payload["assets"].(map[string]any); ok {
-		if total := decodeFlexibleAnyInt(assets["total"]); total != nil {
-			return *total, true
+	var intValue int64
+	if err := json.Unmarshal(data, &intValue); err == nil {
+		return intValue
+	}
+	var floatValue float64
+	if err := json.Unmarshal(data, &floatValue); err == nil {
+		return int64(floatValue)
+	}
+	var stringValue string
+	if err := json.Unmarshal(data, &stringValue); err == nil {
+		parsed, err := strconv.ParseInt(strings.TrimSpace(stringValue), 10, 64)
+		if err == nil {
+			return parsed
 		}
 	}
-	if photos := decodeFlexibleAnyInt(payload["photos"]); photos != nil {
-		if videos := decodeFlexibleAnyInt(payload["videos"]); videos != nil {
-			return max(0, *photos+*videos), true
-		}
-	}
-	if images := decodeFlexibleAnyInt(payload["images"]); images != nil {
-		if videos := decodeFlexibleAnyInt(payload["videos"]); videos != nil {
-			return max(0, *images+*videos), true
-		}
-	}
-	return 0, false
+	return 0
 }
 
-func decodeFlexibleAnyInt(value any) *int {
-	switch typedValue := value.(type) {
-	case int:
-		return &typedValue
-	case float64:
-		converted := int(typedValue)
-		return &converted
-	case string:
-		converted, err := strconv.Atoi(typedValue)
-		if err == nil {
-			return &converted
-		}
-	case json.Number:
-		if converted, err := typedValue.Int64(); err == nil {
-			intValue := int(converted)
-			return &intValue
-		}
+func normalizeImmichSHA1Checksum(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
 	}
-	return nil
+	if normalized := normalizeCatalogSHA1Hex(value); normalized != "" {
+		return normalized
+	}
+	decoders := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	}
+	for _, decoder := range decoders {
+		decoded, err := decoder.DecodeString(value)
+		if err != nil || len(decoded) != 20 {
+			continue
+		}
+		return hex.EncodeToString(decoded)
+	}
+	return ""
 }

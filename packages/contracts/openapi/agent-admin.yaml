@@ -1,0 +1,1220 @@
+openapi: 3.1.0
+info:
+  title: Timich Agent Admin API
+  version: 0.1.0
+  description: LAN-scoped authenticated admin API and web management surface for setup, diagnostics, and pairing-session creation. It is not encrypted by default and should only be used on trusted local networks. Do not expose this surface to the public internet.
+servers:
+  - url: http://{agentHost}:8081
+    variables:
+      agentHost:
+        default: 127.0.0.1
+        description: Agent host address. Use a trusted LAN host/IP only.
+paths:
+  /healthz:
+    get:
+      operationId: getAgentAdminHealth
+      summary: Check timich-agent admin API liveness.
+      responses:
+        "200":
+          description: Agent admin API is healthy.
+  /readyz:
+    get:
+      operationId: getAgentAdminReady
+      summary: Check whether the local agent runtime is ready.
+      responses:
+        "200":
+          description: Agent runtime is ready.
+  /version:
+    get:
+      operationId: getAgentAdminVersion
+      summary: Return the timich-agent admin API version.
+      responses:
+        "200":
+          description: Current version metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionResponse"
+  /status:
+    get:
+      operationId: getAgentAdminStatus
+      summary: Return the local runtime status summary.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          description: Redacted local agent status.
+        "401":
+          description: Admin authentication is required.
+  /config:
+    get:
+      operationId: getAgentAdminConfig
+      summary: Return the redacted active local config.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          description: Redacted local agent config.
+        "401":
+          description: Admin authentication is required.
+  /setup-admin-token:
+    post:
+      operationId: setupAgentAdminToken
+      summary: Create the initial admin token when no admin token is configured.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - token
+                - confirmToken
+              properties:
+                token:
+                  type: string
+                  minLength: 16
+                confirmToken:
+                  type: string
+                  minLength: 16
+      responses:
+        "303":
+          description: Admin token created and browser session cookie set.
+        "400":
+          description: Submitted token was invalid.
+        "409":
+          description: Admin token is already configured.
+  /v1/datasource/primary:
+    get:
+      operationId: getPrimaryDatasource
+      summary: Return the primary datasource used by the local media proxy.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          description: Primary datasource summary returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PrimaryDatasource"
+        "401":
+          description: Admin authentication is required.
+    put:
+      operationId: updatePrimaryDatasource
+      summary: Update the primary Immich datasource used by the local media proxy.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PrimaryDatasourceUpdate"
+      responses:
+        "200":
+          description: Primary datasource saved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PrimaryDatasource"
+        "400":
+          description: Datasource request was invalid.
+        "401":
+          description: Admin authentication is required.
+  /v1/datasource/primary/check:
+    post:
+      operationId: checkPrimaryDatasource
+      summary: Probe the primary datasource from the local agent runtime.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          description: Datasource reachability check returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompatibilityCheck"
+        "401":
+          description: Admin authentication is required.
+  /v1/datasources/local/immich-fallback:
+    put:
+      operationId: updateLocalDatasourceImmichFallback
+      summary: Enable or disable Immich duplicate fallback for one local datasource.
+      description: The change is persisted and applied immediately to Gallery readiness and local preview/detail-preview delivery.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LocalDatasourceImmichFallbackUpdate"
+      responses:
+        "200":
+          description: Updated local datasource summary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatasourceSummary"
+        "400":
+          description: The request was invalid.
+        "401":
+          description: Admin authentication is required.
+        "404":
+          description: Local datasource not found.
+  /v1/datasources:
+    get:
+      operationId: listAgentDatasources
+      summary: List configured datasources.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/DatasourceListJSONResponse"
+    post:
+      operationId: createAgentDatasource
+      summary: Create a datasource.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/DatasourceCreateJSONRequest"
+      responses:
+        "201":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/datasources/indexing:
+    get:
+      operationId: getDatasourceIndexingStatus
+      summary: Return datasource indexing status.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/datasources/indexing/run:
+    post:
+      operationId: runDatasourceIndexing
+      summary: Start datasource indexing.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/DatasourceIndexingRunJSONRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+        "202":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/catalog/dedup/status:
+    get:
+      operationId: getCatalogDedupStatus
+      summary: Return catalog deduplication status.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/catalog/dedup/repair:
+    post:
+      operationId: repairCatalogDeduplication
+      summary: Repair catalog deduplication state.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/datasources/local/scan:
+    get:
+      operationId: getLocalDatasourceScanStatus
+      summary: Return local datasource scan status.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+    post:
+      operationId: runLocalDatasourceScan
+      summary: Start a local datasource scan.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+        "202":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/datasources/local/root/accept:
+    post:
+      operationId: acceptLocalMediaRoot
+      summary: Explicitly accept a changed local media root and run reconciliation.
+      description: The observed identity must match the currently pinned root. Ordinary scans never accept a changed root automatically.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LocalMediaRootAcceptanceRequest"
+      responses:
+        "200":
+          description: The root acceptance was committed; scanStatus reports the separate reconciliation outcome.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LocalMediaRootAcceptanceResponse"
+        "400":
+          description: The datasource or request was invalid.
+        "401":
+          description: Admin authentication is required.
+        "409":
+          description: The observed identity is stale or acceptance is no longer required.
+  /v1/datasources/local/phase0-diagnostics.csv:
+    get:
+      operationId: exportLocalDatasourcePhase0Diagnostics
+      summary: Export local datasource Phase 0 diagnostics as CSV.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminCSVResponse"
+  /v1/datasources/local/failure-diagnostics.csv:
+    get:
+      operationId: exportLocalDatasourceFailureDiagnostics
+      summary: Export local datasource failure diagnostics as CSV.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminCSVResponse"
+  /v1/datasources/local/metadata/repair:
+    post:
+      operationId: repairLocalDatasourceMetadata
+      summary: Requeue local datasource metadata work.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/datasources/local/thumbnails/repair:
+    post:
+      operationId: repairLocalDatasourceThumbnails
+      summary: Requeue local datasource thumbnail work.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/datasources/local/embeddings/repair:
+    post:
+      operationId: repairLocalDatasourceEmbeddings
+      summary: Requeue local datasource semantic embedding work.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/workers:
+    get:
+      operationId: getAgentWorkers
+      summary: Return effective worker configuration and status.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+    put:
+      operationId: updateAgentWorkers
+      summary: Update worker configuration.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/WorkerRuntimeJSONRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/system/resources:
+    get:
+      operationId: getAgentSystemResources
+      summary: Return current system resource observations.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/semantic-models:
+    get:
+      operationId: listSemanticModels
+      summary: List semantic models and runtime readiness.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/semantic-install-job:
+    get:
+      operationId: getSemanticInstallJob
+      summary: Return the current semantic install job.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/semantic-models/install:
+    post:
+      operationId: installSemanticModel
+      summary: Install a semantic model pack.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/SemanticModelActionJSONRequest"
+      responses:
+        "202":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/semantic-models/activate:
+    post:
+      operationId: activateSemanticModel
+      summary: Activate an installed semantic model.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/SemanticModelActionJSONRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/semantic-models/uninstall:
+    post:
+      operationId: uninstallSemanticModel
+      summary: Uninstall a semantic model pack.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/SemanticModelActionJSONRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/semantic-models/recommended/install:
+    post:
+      operationId: installRecommendedSemanticModel
+      summary: Install the recommended semantic model pack.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "202":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/semantic-runtime-packs/recommended/install:
+    post:
+      operationId: installRecommendedSemanticRuntimePack
+      summary: Install the recommended semantic runtime pack.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "202":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/semantic-models/search/enable:
+    post:
+      operationId: enableSemanticSearch
+      summary: Enable semantic search and its indexing schedule.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/SemanticSearchEnableJSONRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/semantic-indexing/run:
+    post:
+      operationId: runSemanticIndexing
+      summary: Run semantic indexing work.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/SemanticIndexingRunJSONRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+        "202":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/assets/search-preview:
+    post:
+      operationId: searchAssetsForAdminPreview
+      summary: Run an authenticated asset search preview.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/AssetSearchPreviewJSONRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/assets/{assetId}/preview:
+    parameters:
+      - name: assetId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getAssetAdminPreview
+      summary: Return authenticated asset preview content.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminBinaryResponse"
+    head:
+      operationId: headAssetAdminPreview
+      summary: Return authenticated asset preview headers.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          description: Asset preview headers returned.
+  /v1/nearby-links:
+    get:
+      operationId: listNearbyLinks
+      summary: List pending Nearby Link requests.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/nearby-links/approve:
+    post:
+      operationId: approveNearbyLink
+      summary: Approve a Nearby Link request.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/NearbyLinkApprovalJSONRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/nearby-links/{linkId}/deny:
+    parameters:
+      - name: linkId
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: denyNearbyLink
+      summary: Deny a Nearby Link request.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/update-check:
+    get:
+      operationId: checkForAgentUpdate
+      summary: Check the configured update source for a newer Agent release.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/uploads/roots:
+    get:
+      operationId: listAgentUploadRoots
+      summary: List configured device upload roots.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/pairing-sessions:
+    post:
+      operationId: createPairingSession
+      summary: Create a short-lived local pairing code for one app device.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "201":
+          description: Pairing session created. QR/link generation is a separate explicit step.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingSession"
+        "401":
+          description: Admin authentication is required.
+        "409":
+          description: The local agent has reached its paired-device limit.
+  /v1/pairing-links:
+    post:
+      operationId: createPairingLink
+      summary: Create a Universal Link and QR code for a selected Media API URL.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PairingLinkRequest"
+      responses:
+        "200":
+          description: Pairing link and QR code generated for the selected phone-reachable Media API URL.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingLink"
+        "400":
+          description: The selected Media API URL or pairing material was invalid.
+        "401":
+          description: Admin authentication is required.
+  /v1/compatibility-check:
+    post:
+      operationId: runRemoteBrowsingCheck
+      summary: Run remote browsing readiness probes from the local agent runtime.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          description: Compatibility report returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompatibilityReport"
+        "401":
+          description: Admin authentication is required.
+  /v1/restart:
+    post:
+      operationId: restartAgent
+      summary: Request a graceful agent restart through the surrounding process supervisor.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "202":
+          description: Restart was requested.
+        "401":
+          description: Admin authentication is required.
+        "503":
+          description: Restart is unavailable in this runtime.
+  /v1/devices:
+    get:
+      operationId: listPairedDevices
+      summary: List paired app devices registered with the local agent.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          description: Paired devices returned.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - devices
+                properties:
+                  devices:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PairedDevice"
+        "401":
+          description: Admin authentication is required.
+  /v1/devices/{deviceId}:
+    put:
+      operationId: updatePairedDevice
+      summary: Update administrator-owned paired-device metadata.
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: deviceId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        $ref: "#/components/requestBodies/DeviceUpdateJSONRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+        "401":
+          description: Admin authentication is required.
+        "404":
+          description: Paired device not found.
+    delete:
+      operationId: revokePairedDevice
+      summary: Revoke a paired app device from the local agent.
+      security:
+        - AdminBearerAuth: []
+      parameters:
+        - name: deviceId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Paired device revoked.
+        "401":
+          description: Admin authentication is required.
+        "404":
+          description: Paired device not found.
+  /v1/devices/{deviceId}/upload-policy:
+    parameters:
+      - name: deviceId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getPairedDeviceUploadPolicy
+      summary: Return one paired device upload policy.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+    put:
+      operationId: updatePairedDeviceUploadPolicy
+      summary: Update one paired device upload policy.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/DeviceUploadPolicyJSONRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+  /v1/devices/{deviceId}/upload-reset:
+    parameters:
+      - name: deviceId
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: resetPairedDeviceUploadState
+      summary: Reset upload state for one paired device within a required half-open capture-date range.
+      security:
+        - AdminBearerAuth: []
+      requestBody:
+        $ref: "#/components/requestBodies/DeviceUploadResetJSONRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
+components:
+  securitySchemes:
+    AdminBearerAuth:
+      type: http
+      scheme: bearer
+  requestBodies:
+    DatasourceCreateJSONRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DatasourceCreateRequest"
+    DatasourceIndexingRunJSONRequest:
+      required: false
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DatasourceIndexingRunRequest"
+    WorkerRuntimeJSONRequest:
+      required: false
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/WorkerRuntimeUpdate"
+    SemanticModelActionJSONRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SemanticModelActionRequest"
+    SemanticSearchEnableJSONRequest:
+      required: false
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SemanticSearchEnableRequest"
+    SemanticIndexingRunJSONRequest:
+      required: false
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SemanticIndexingRunRequest"
+    AssetSearchPreviewJSONRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetSearchPreviewRequest"
+    NearbyLinkApprovalJSONRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/NearbyLinkApprovalRequest"
+    DeviceUpdateJSONRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DeviceUpdateRequest"
+    DeviceUploadPolicyJSONRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DeviceUploadPolicyUpdate"
+    DeviceUploadResetJSONRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/DeviceUploadResetRequest"
+  responses:
+    DatasourceListJSONResponse:
+      description: Configured datasource summaries.
+      content:
+        application/json:
+          schema:
+            type: array
+            items:
+              $ref: "#/components/schemas/DatasourceSummary"
+    AdminJSONResponse:
+      description: Admin operation response.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminPayload"
+    AdminCSVResponse:
+      description: CSV diagnostics export.
+      content:
+        text/csv:
+          schema:
+            type: string
+    AdminBinaryResponse:
+      description: Binary asset preview content.
+      content:
+        "image/*":
+          schema:
+            type: string
+            format: binary
+  schemas:
+    AdminPayload:
+      type: object
+      additionalProperties: true
+    DatasourceCreateRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Optional display name; the Agent derives a kind-appropriate name when omitted.
+        kind:
+          type: string
+          default: immich
+          enum: [immich, immich_indexed, local_filesystem]
+        url:
+          type: string
+        accessToken:
+          type: string
+        rootKey:
+          type: string
+      additionalProperties: false
+    DatasourceIndexingRunRequest:
+      type: object
+      properties:
+        sourceKey:
+          type: string
+        kind:
+          type: string
+        mode:
+          type: string
+      additionalProperties: false
+    LocalMediaRootAcceptanceRequest:
+      type: object
+      required: [sourceKey, rootKey, observedIdentity]
+      properties:
+        sourceKey:
+          type: string
+          minLength: 1
+        rootKey:
+          type: string
+          minLength: 1
+        observedIdentity:
+          type: string
+          minLength: 1
+          description: Opaque identity reported by the current authenticated Admin status response.
+      additionalProperties: false
+    LocalMediaRootAcceptanceResponse:
+      type: object
+      required: [acceptance, phase0, scanStatus]
+      properties:
+        acceptance:
+          type: object
+          required: [sourceKey, rootKey, accepted]
+          properties:
+            sourceKey:
+              type: string
+            rootKey:
+              type: string
+            accepted:
+              type: boolean
+              const: true
+          additionalProperties: false
+        phase0:
+          type: object
+          additionalProperties: true
+        scanStatus:
+          type: string
+          enum: [completed, failed, blocked]
+        scanError:
+          type: string
+      additionalProperties: false
+    WorkerRuntimeUpdate:
+      type: object
+      properties:
+        heavyTaskWorkers:
+          type: [integer, "null"]
+          minimum: 0
+      additionalProperties: false
+    SemanticModelActionRequest:
+      type: object
+      required: [modelId]
+      properties:
+        modelId:
+          type: string
+          minLength: 1
+        vectorSpaceId:
+          type: string
+      additionalProperties: false
+    SemanticSearchEnableRequest:
+      type: object
+      properties:
+        interval:
+          type: string
+        batchSize:
+          type: integer
+          minimum: 0
+        targetCompletedVectors:
+          type: integer
+          minimum: 0
+        initialIndexingAssets:
+          type: integer
+          minimum: 0
+        initialBackfillAssets:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+    SemanticIndexingRunRequest:
+      type: object
+      properties:
+        maxAssets:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+    AssetSearchPreviewRequest:
+      type: object
+      required: [collection, page]
+      properties:
+        collection:
+          type: object
+          additionalProperties: true
+        page:
+          type: object
+          required: [index, size]
+          properties:
+            index:
+              type: integer
+              minimum: 0
+            size:
+              type: integer
+              minimum: 1
+          additionalProperties: false
+        semanticModelId:
+          type: string
+        semanticVectorSpaceId:
+          type: string
+      additionalProperties: false
+    NearbyLinkApprovalRequest:
+      type: object
+      required: [linkCode]
+      properties:
+        linkCode:
+          type: string
+          minLength: 1
+      additionalProperties: false
+    DeviceUpdateRequest:
+      type: object
+      required: [deviceName]
+      properties:
+        deviceName:
+          type: string
+      additionalProperties: false
+    DeviceUploadPolicyUpdate:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        rootKey:
+          type: string
+        pathPattern:
+          type: string
+        capturedAfter:
+          type: string
+          format: date-time
+      additionalProperties: false
+    DeviceUploadResetRequest:
+      type: object
+      required: [capturedAfter, capturedBefore]
+      description: Reset only the half-open capture interval where capturedAfter is earlier than capturedBefore; invalid or reversed ranges return HTTP 400.
+      properties:
+        capturedAfter:
+          type: string
+          format: date-time
+        capturedBefore:
+          type: string
+          format: date-time
+        reason:
+          type: string
+      additionalProperties: false
+    VersionResponse:
+      type: object
+      required:
+        - service
+        - version
+        - mode
+      properties:
+        service:
+          type: string
+        version:
+          type: string
+        commit:
+          type: string
+          description: Build commit identifier when available.
+        builtAt:
+          type: string
+          format: date-time
+          description: UTC build timestamp when available.
+        releaseTag:
+          type: string
+          description: Immutable release tag stamped into published bundles when available.
+        mode:
+          type: string
+    PrimaryDatasource:
+      type: object
+      required:
+        - configured
+        - name
+        - kind
+        - url
+        - hasAccessToken
+        - additionalCount
+      properties:
+        configured:
+          type: boolean
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [immich, immich_indexed, local_filesystem, static_demo]
+        url:
+          type: string
+        hasAccessToken:
+          type: boolean
+        additionalCount:
+          type: integer
+          minimum: 0
+          description: Count of additional configured datasources not used by the current media proxy.
+    PrimaryDatasourceUpdate:
+      type: object
+      required:
+        - url
+      properties:
+        name:
+          type: string
+          default: Immich
+        kind:
+          type: string
+          enum: [immich, immich_indexed, static_demo]
+          default: immich
+        url:
+          type: string
+        accessToken:
+          type: string
+          description: New Immich API key. Omit or leave empty to keep the existing key.
+    LocalDatasourceImmichFallbackUpdate:
+      type: object
+      required:
+        - sourceKey
+        - enabled
+      properties:
+        sourceKey:
+          type: string
+        enabled:
+          type: boolean
+    DatasourceSummary:
+      type: object
+      required:
+        - sourceKey
+        - name
+        - kind
+        - hasAccessToken
+        - immichFallbackEnabled
+      properties:
+        sourceKey:
+          type: string
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [immich, immich_indexed, local_filesystem, static_demo]
+        url:
+          type: string
+        hasAccessToken:
+          type: boolean
+        rootKey:
+          type: string
+        rootPath:
+          type: string
+        indexingEnabled:
+          type: boolean
+        immichFallbackEnabled:
+          type: boolean
+          description: Effective setting; omitted local config defaults to true.
+    PairingSession:
+      type: object
+      required:
+        - pairingCode
+        - expiresAt
+      properties:
+        pairingCode:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+        agentBaseURLChoices:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentBaseURLChoice"
+          description: Candidate Media API base URLs derived only from the current Admin UI host, an explicitly configured media host, or an explicitly configured published media host. Docker/container interface addresses are not listed; host-side published media port hints are reflected when available.
+    AgentBaseURLChoice:
+      type: object
+      required:
+        - label
+        - url
+      properties:
+        label:
+          type: string
+        url:
+          type: string
+          format: uri
+          description: Candidate phone-reachable Media API base URL.
+        description:
+          type: string
+    PairingLinkRequest:
+      type: object
+      required:
+        - agentBaseURL
+        - pairingCode
+      properties:
+        agentBaseURL:
+          type: string
+          format: uri
+          description: Phone-reachable LAN media API base URL selected by the operator.
+        pairingCode:
+          type: string
+    PairingLink:
+      type: object
+      required:
+        - pairingPayload
+        - pairingURL
+        - pairingQRCodeDataURL
+      properties:
+        pairingPayload:
+          $ref: "#/components/schemas/PairingPayload"
+        pairingURL:
+          type: string
+          format: uri
+          description: Universal Link URL for opening the Timich app with the pairing payload.
+        pairingQRCodeDataURL:
+          type: string
+          description: PNG QR code as a data URL for the Universal Link.
+    PairingPayload:
+      type: object
+      required:
+        - version
+        - kind
+        - agentBaseURL
+        - pairingCode
+        - expiresAt
+      properties:
+        version:
+          type: integer
+          enum: [1]
+        kind:
+          type: string
+          enum: [timich.agent.pairing]
+        agentBaseURL:
+          type: string
+          format: uri
+          description: Phone-reachable LAN media API base URL the Timich app should redeem against.
+        pairingCode:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+    PairedDevice:
+      type: object
+      required:
+        - deviceId
+        - deviceName
+        - createdAt
+        - lastRefreshedAt
+        - refreshTokenExpiresAt
+      properties:
+        deviceId:
+          type: string
+        deviceName:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        lastRefreshedAt:
+          type: string
+          format: date-time
+        refreshTokenExpiresAt:
+          type: string
+          format: date-time
+    CompatibilityCheck:
+      type: object
+      required:
+        - name
+        - status
+        - summary
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+          enum: [ok, warning, failed]
+        summary:
+          type: string
+        remediation:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+    CompatibilityReport:
+      type: object
+      required:
+        - service
+        - agentId
+        - checkedAt
+        - status
+        - checks
+      properties:
+        service:
+          type: string
+        agentId:
+          type: string
+        checkedAt:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [ok, warning, failed]
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/CompatibilityCheck"

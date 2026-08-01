@@ -12,11 +12,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/rsahara/timich-agent/internal/adminapi"
+	"github.com/rsahara/timich-agent/internal/catalog"
 	"github.com/rsahara/timich-agent/internal/config"
 	"github.com/rsahara/timich-agent/internal/controlplane"
 	"github.com/rsahara/timich-agent/internal/mediaapi"
@@ -25,10 +27,12 @@ import (
 )
 
 var (
-	version           = "dev"
-	commit            = "unknown"
-	builtAt           = "unknown"
-	updateManifestURL = ""
+	version                  = "dev"
+	commit                   = "unknown"
+	builtAt                  = "unknown"
+	releaseTag               = ""
+	updateManifestURL        = ""
+	semanticModelManifestURL = ""
 )
 
 func main() {
@@ -52,6 +56,8 @@ func runCLI(args []string, stdout io.Writer, stderr io.Writer) error {
 		return writeVersionJSON(stdout)
 	case "init":
 		return initConfig(args[1:], stdout, stderr)
+	case "semantic-index-check":
+		return semanticIndexCheck(args[1:], stdout, stderr)
 	default:
 		return serve(args, stderr)
 	}
@@ -75,15 +81,75 @@ func initConfig(args []string, stdout io.Writer, stderr io.Writer) error {
 	return nil
 }
 
+func semanticIndexCheck(args []string, stdout io.Writer, stderr io.Writer) error {
+	flags := flag.NewFlagSet("timich-agent semantic-index-check", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+
+	configPath := flags.String("config", "", "path to the JSON config file")
+	dataDir := flags.String("data-dir", "", "override the agent data directory")
+	sourceKey := flags.String("source-key", "", "optional datasource source key to check")
+	modelID := flags.String("model-id", "", "optional semantic model ID to check")
+	vectorSpaceID := flags.String("vector-space-id", "", "optional semantic vector space ID to check")
+	deep := flags.Bool("deep", false, "read each vector payload range in addition to count/header checks")
+	timeout := flags.Duration("timeout", 0, "optional timeout for the check; 0 disables the timeout")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err = config.ApplyRuntimeOverrides(cfg, "", "", *dataDir)
+	if err != nil {
+		return err
+	}
+	if _, err := configureRuntimeTempDir(cfg.DataDir); err != nil {
+		return err
+	}
+	catalogStore, err := catalog.LoadOrCreateCatalogStore(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer catalogStore.Close()
+
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if *timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, *timeout)
+		defer cancel()
+	}
+	result, err := catalogStore.CheckSemanticIndex(ctx, catalog.SemanticIndexCheckOptions{
+		SourceKey:     *sourceKey,
+		ModelID:       *modelID,
+		VectorSpaceID: *vectorSpaceID,
+		Deep:          *deep,
+	})
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	if encodeErr := encoder.Encode(result); encodeErr != nil {
+		return encodeErr
+	}
+	if err != nil {
+		return err
+	}
+	if result.ErrorCount > 0 {
+		return fmt.Errorf("semantic index consistency check found %d errors", result.ErrorCount)
+	}
+	return nil
+}
+
 func writeVersionJSON(stdout io.Writer) error {
 	payload := struct {
-		Version string `json:"version"`
-		Commit  string `json:"commit"`
-		BuiltAt string `json:"builtAt"`
+		Version    string `json:"version"`
+		Commit     string `json:"commit"`
+		BuiltAt    string `json:"builtAt"`
+		ReleaseTag string `json:"releaseTag,omitempty"`
 	}{
-		Version: version,
-		Commit:  commit,
-		BuiltAt: builtAt,
+		Version:    version,
+		Commit:     commit,
+		BuiltAt:    builtAt,
+		ReleaseTag: strings.TrimSpace(releaseTag),
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -98,6 +164,9 @@ func serve(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if _, err := configureRuntimeTempDir(cfg.DataDir); err != nil {
+		return err
+	}
 
 	loadedState, err := store.LoadOrCreate(cfg.DataDir)
 	if err != nil {
@@ -106,9 +175,10 @@ func serve(args []string, stderr io.Writer) error {
 
 	startedAt := time.Now().UTC()
 	runtime, err := runtimestate.NewAgentRuntime(runtimestate.BuildInfo{
-		Version: version,
-		Commit:  commit,
-		BuiltAt: builtAt,
+		Version:    version,
+		Commit:     commit,
+		BuiltAt:    builtAt,
+		ReleaseTag: releaseTag,
 	}, cfg, loadedState, startedAt)
 	if err != nil {
 		return err
@@ -119,12 +189,18 @@ func serve(args []string, stderr io.Writer) error {
 		}
 	}()
 	runtime.StartUploadMaintenance()
+	runtime.StartDatasourceMirrorSync()
+	runtime.StartLocalDatasourceScan()
+	runtime.StartSemanticModelRuntime()
+	runtime.StartBackgroundWorkerScheduler()
+	runtime.StartDatasourceIndexingStatusRefresh()
 
 	restartCh := make(chan struct{}, 1)
 	adminServer := &http.Server{
 		Addr: cfg.AdminListenAddress,
 		Handler: adminapi.NewMuxWithOptions(runtime, adminapi.Options{
-			UpdateManifestURL: resolveUpdateManifestURL(),
+			UpdateManifestURL:        resolveUpdateManifestURL(),
+			SemanticModelManifestURL: resolveSemanticModelManifestURL(),
 			Restart: func(context.Context) error {
 				scheduleRestart(restartCh)
 				return nil
@@ -181,6 +257,47 @@ func resolveUpdateManifestURL() string {
 		return value
 	}
 	return strings.TrimSpace(updateManifestURL)
+}
+
+func resolveSemanticModelManifestURL() string {
+	if value := strings.TrimSpace(os.Getenv("TIMICH_AGENT_SEMANTIC_MODEL_MANIFEST_URL")); value != "" {
+		return value
+	}
+	return strings.TrimSpace(semanticModelManifestURL)
+}
+
+func configureRuntimeTempDir(dataDir string) (string, error) {
+	root := strings.TrimSpace(dataDir)
+	if root == "" {
+		return "", errors.New("data directory must not be empty")
+	}
+	tempDir := filepath.Join(root, "tmp")
+	if err := os.MkdirAll(tempDir, 0o700); err != nil {
+		return "", fmt.Errorf("create runtime temp directory: %w", err)
+	}
+	probe, err := os.CreateTemp(tempDir, ".timich-temp-check-*")
+	if err != nil {
+		return "", fmt.Errorf("probe runtime temp directory: %w", err)
+	}
+	probePath := probe.Name()
+	if err := probe.Close(); err != nil {
+		_ = os.Remove(probePath)
+		return "", fmt.Errorf("close runtime temp probe: %w", err)
+	}
+	if err := os.Remove(probePath); err != nil {
+		return "", fmt.Errorf("remove runtime temp probe: %w", err)
+	}
+	if strings.TrimSpace(os.Getenv("SQLITE_TMPDIR")) == "" {
+		if err := os.Setenv("SQLITE_TMPDIR", tempDir); err != nil {
+			return "", fmt.Errorf("set SQLITE_TMPDIR: %w", err)
+		}
+	}
+	if strings.TrimSpace(os.Getenv("TMPDIR")) == "" {
+		if err := os.Setenv("TMPDIR", tempDir); err != nil {
+			return "", fmt.Errorf("set TMPDIR: %w", err)
+		}
+	}
+	return tempDir, nil
 }
 
 func logFirstRunAdminSetupPrompt(runtime *runtimestate.AgentRuntime, cfg config.ResolvedConfig, statePath string) {

@@ -1,0 +1,5 @@
+numpy>=1.26
+onnxruntime>=1.19
+pillow>=10.0
+tokenizers>=0.19
+transformers>=4.53

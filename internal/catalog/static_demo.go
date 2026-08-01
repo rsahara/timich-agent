@@ -236,6 +236,20 @@ func (s *staticDemoSource) filteredAssets(filters AssetSearchFilters) []staticDe
 	return result
 }
 
+func (s *staticDemoSource) Asset(assetID string) (Asset, error) {
+	asset, ok := s.byID[strings.TrimSpace(assetID)]
+	if !ok {
+		return Asset{}, ErrAssetNotFound
+	}
+	return Asset{
+		ID:         asset.ID,
+		Type:       normalizeAssetType(asset.Type),
+		Filename:   asset.OriginalFileName,
+		CapturedAt: asset.FileCreatedAt.UTC(),
+		Duration:   asset.Duration,
+	}, nil
+}
+
 func (s *staticDemoSource) MediaResponse(clientRequest *http.Request, assetID string, variant string) (*UpstreamMediaResponse, error) {
 	asset, ok := s.byID[strings.TrimSpace(assetID)]
 	if !ok {
@@ -287,7 +301,7 @@ func (s *staticDemoSource) MediaResponse(clientRequest *http.Request, assetID st
 
 	if clientRequest != nil {
 		if rangeHeader := strings.TrimSpace(clientRequest.Header.Get("Range")); rangeHeader != "" {
-			rangeStart, rangeEnd, ok := parseStaticDemoRange(rangeHeader, info.Size())
+			rangeStart, rangeEnd, ok := parseSingleByteRange(rangeHeader, info.Size())
 			if !ok {
 				file.Close()
 				header.Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size()))
@@ -306,14 +320,22 @@ func (s *staticDemoSource) MediaResponse(clientRequest *http.Request, assetID st
 	}
 
 	header.Set("Content-Length", strconv.FormatInt(length, 10))
+	if clientRequest != nil && clientRequest.Method == http.MethodHead {
+		file.Close()
+		return &UpstreamMediaResponse{
+			StatusCode: statusCode,
+			Header:     header,
+			Body:       io.NopCloser(bytes.NewReader(nil)),
+		}, nil
+	}
 	return &UpstreamMediaResponse{
 		StatusCode: statusCode,
 		Header:     header,
-		Body:       &staticDemoSectionReadCloser{SectionReader: io.NewSectionReader(file, offset, length), closer: file},
+		Body:       &fileSectionReadCloser{SectionReader: io.NewSectionReader(file, offset, length), closer: file},
 	}, nil
 }
 
-func parseStaticDemoRange(header string, size int64) (int64, int64, bool) {
+func parseSingleByteRange(header string, size int64) (int64, int64, bool) {
 	if size <= 0 || !strings.HasPrefix(header, "bytes=") || strings.Contains(header, ",") {
 		return 0, 0, false
 	}
@@ -374,11 +396,11 @@ func staticDemoFileName(asset staticDemoAsset, variant string, path string) stri
 	return base + "_" + variant + ".jpg"
 }
 
-type staticDemoSectionReadCloser struct {
+type fileSectionReadCloser struct {
 	*io.SectionReader
 	closer io.Closer
 }
 
-func (r *staticDemoSectionReadCloser) Close() error {
+func (r *fileSectionReadCloser) Close() error {
 	return r.closer.Close()
 }

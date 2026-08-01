@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -76,6 +77,23 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	t.Setenv("TIMICH_AGENT_CONTROL_PLANE_SERVER_NAME", "control.example")
 	t.Setenv("TIMICH_AGENT_REMOTE_BROWSING_SERVER_URL", "https://relay.example")
 	t.Setenv("TIMICH_AGENT_REMOTE_BROWSING_ENABLED", "yes")
+	helperPath := filepath.Join(tempDir, "timich-semantic-helper")
+	t.Setenv("TIMICH_AGENT_SEMANTIC_RUNTIME_HELPER", helperPath)
+	onnxServerPath := filepath.Join(tempDir, "semantic-runtime", "siglip2-onnx", "server.py")
+	t.Setenv("TIMICH_AGENT_SEMANTIC_ONNX_SERVER_PATH", onnxServerPath)
+	t.Setenv("TIMICH_AGENT_SEMANTIC_ONNX_PYTHON", "python3")
+	t.Setenv("TIMICH_AGENT_SEMANTIC_ONNX_HOST", "127.0.0.1")
+	t.Setenv("TIMICH_AGENT_SEMANTIC_ONNX_PORT", "19188")
+	t.Setenv("TIMICH_AGENT_SEMANTIC_ONNX_PROVIDER", "cpu")
+	t.Setenv("TIMICH_AGENT_SEMANTIC_ONNX_TEXT_PROVIDER", "openvino:CPU")
+	t.Setenv("TIMICH_AGENT_SEMANTIC_ONNX_IMAGE_PROVIDER", "openvino:GPU")
+	t.Setenv("TIMICH_AGENT_SEMANTIC_ONNX_TEXT_TEMPLATE", "query: {query}")
+	mediaHelperPath := filepath.Join(tempDir, "timich-media-helper")
+	t.Setenv("TIMICH_AGENT_MEDIA_HELPER_PATH", mediaHelperPath)
+	vipsPath := filepath.Join(tempDir, "vips")
+	t.Setenv("TIMICH_AGENT_VIPS_PATH", vipsPath)
+	ffmpegPath := filepath.Join(tempDir, "ffmpeg")
+	t.Setenv("TIMICH_AGENT_FFMPEG_PATH", ffmpegPath)
 
 	resolved, err := Load(configPath)
 	if err != nil {
@@ -111,6 +129,636 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	}
 	if resolved.Hosted.ServerURL != "https://relay.example" {
 		t.Fatalf("relay server URL = %q, want remote browsing env override", resolved.Hosted.ServerURL)
+	}
+	if resolved.SemanticRuntime.HelperPath != helperPath {
+		t.Fatalf("SemanticRuntime.HelperPath = %q, want env override", resolved.SemanticRuntime.HelperPath)
+	}
+	if resolved.SemanticRuntime.ONNXRuntime.ServerPath != onnxServerPath {
+		t.Fatalf("SemanticRuntime.ONNXRuntime.ServerPath = %q, want env override", resolved.SemanticRuntime.ONNXRuntime.ServerPath)
+	}
+	if resolved.SemanticRuntime.ONNXRuntime.PythonPath != "python3" ||
+		resolved.SemanticRuntime.ONNXRuntime.Host != "127.0.0.1" ||
+		resolved.SemanticRuntime.ONNXRuntime.Port != 19188 ||
+		resolved.SemanticRuntime.ONNXRuntime.Provider != "cpu" ||
+		resolved.SemanticRuntime.ONNXRuntime.TextProvider != "openvino:CPU" ||
+		resolved.SemanticRuntime.ONNXRuntime.ImageProvider != "openvino:GPU" ||
+		resolved.SemanticRuntime.ONNXRuntime.TextTemplate != "query: {query}" {
+		t.Fatalf("SemanticRuntime.ONNXRuntime = %+v, want env overrides", resolved.SemanticRuntime.ONNXRuntime)
+	}
+	if resolved.MediaRuntime.VipsPath != vipsPath {
+		t.Fatalf("MediaRuntime.VipsPath = %q, want env override", resolved.MediaRuntime.VipsPath)
+	}
+	if resolved.MediaRuntime.HelperPath != mediaHelperPath {
+		t.Fatalf("MediaRuntime.HelperPath = %q, want env override", resolved.MediaRuntime.HelperPath)
+	}
+	if resolved.MediaRuntime.FFmpegPath != ffmpegPath {
+		t.Fatalf("MediaRuntime.FFmpegPath = %q, want env override", resolved.MediaRuntime.FFmpegPath)
+	}
+}
+
+func TestLoadAutoDetectsBundledSemanticRuntimeHelper(t *testing.T) {
+	tempDir := t.TempDir()
+	executablePath := filepath.Join(tempDir, "timich-agent")
+	helperPath := filepath.Join(tempDir, "timich-semantic-helper")
+	if err := os.WriteFile(executablePath, []byte("agent"), 0o700); err != nil {
+		t.Fatalf("WriteFile(agent) error = %v", err)
+	}
+	if err := os.WriteFile(helperPath, []byte("helper"), 0o700); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	previousExecutablePath := currentExecutablePath
+	currentExecutablePath = func() (string, error) {
+		return executablePath, nil
+	}
+	t.Cleanup(func() {
+		currentExecutablePath = previousExecutablePath
+	})
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.SemanticRuntime.HelperPath != helperPath {
+		t.Fatalf("SemanticRuntime.HelperPath = %q, want bundled helper %q", resolved.SemanticRuntime.HelperPath, helperPath)
+	}
+}
+
+func TestLoadKeepsExplicitSemanticRuntimeHelperOverBundledHelper(t *testing.T) {
+	tempDir := t.TempDir()
+	executablePath := filepath.Join(tempDir, "timich-agent")
+	bundledHelperPath := filepath.Join(tempDir, "timich-semantic-helper")
+	explicitHelperPath := filepath.Join(tempDir, "explicit-helper")
+	for _, path := range []string{executablePath, bundledHelperPath, explicitHelperPath} {
+		if err := os.WriteFile(path, []byte("binary"), 0o700); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+	previousExecutablePath := currentExecutablePath
+	currentExecutablePath = func() (string, error) {
+		return executablePath, nil
+	}
+	t.Cleanup(func() {
+		currentExecutablePath = previousExecutablePath
+	})
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	raw := []byte(`{"semanticRuntime":{"helperPath":"` + filepath.ToSlash(explicitHelperPath) + `"}}` + "\n")
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.SemanticRuntime.HelperPath != explicitHelperPath {
+		t.Fatalf("SemanticRuntime.HelperPath = %q, want explicit helper %q", resolved.SemanticRuntime.HelperPath, explicitHelperPath)
+	}
+}
+
+func TestLoadAutoDetectsBundledSemanticONNXRuntime(t *testing.T) {
+	tempDir := t.TempDir()
+	executablePath := filepath.Join(tempDir, "timich-agent")
+	serverPath := filepath.Join(tempDir, "semantic-runtime", "siglip2-onnx", "server.py")
+	pythonPath := filepath.Join(tempDir, "semantic-runtime", "siglip2-onnx", ".venv", "bin", "python")
+	if err := os.WriteFile(executablePath, []byte("agent"), 0o700); err != nil {
+		t.Fatalf("WriteFile(agent) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(serverPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(server dir) error = %v", err)
+	}
+	if err := os.WriteFile(serverPath, []byte("server"), 0o600); err != nil {
+		t.Fatalf("WriteFile(server) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(pythonPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(python dir) error = %v", err)
+	}
+	if err := os.WriteFile(pythonPath, []byte("python"), 0o700); err != nil {
+		t.Fatalf("WriteFile(python) error = %v", err)
+	}
+	previousExecutablePath := currentExecutablePath
+	currentExecutablePath = func() (string, error) {
+		return executablePath, nil
+	}
+	t.Cleanup(func() {
+		currentExecutablePath = previousExecutablePath
+	})
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.SemanticRuntime.ONNXRuntime.ServerPath != serverPath {
+		t.Fatalf("SemanticRuntime.ONNXRuntime.ServerPath = %q, want bundled server %q", resolved.SemanticRuntime.ONNXRuntime.ServerPath, serverPath)
+	}
+	if resolved.SemanticRuntime.ONNXRuntime.PythonPath != pythonPath {
+		t.Fatalf("SemanticRuntime.ONNXRuntime.PythonPath = %q, want bundled python %q", resolved.SemanticRuntime.ONNXRuntime.PythonPath, pythonPath)
+	}
+}
+
+func TestLoadAutoDetectsBundledMediaRuntimeVips(t *testing.T) {
+	tempDir := t.TempDir()
+	executablePath := filepath.Join(tempDir, "timich-agent")
+	vipsPath := filepath.Join(tempDir, "media-runtime", "libvips", "bin", mediaRuntimeVipsBinaryName())
+	if err := os.WriteFile(executablePath, []byte("agent"), 0o700); err != nil {
+		t.Fatalf("WriteFile(agent) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(vipsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(vips dir) error = %v", err)
+	}
+	if err := os.WriteFile(vipsPath, []byte("vips"), 0o700); err != nil {
+		t.Fatalf("WriteFile(vips) error = %v", err)
+	}
+	previousExecutablePath := currentExecutablePath
+	currentExecutablePath = func() (string, error) {
+		return executablePath, nil
+	}
+	t.Cleanup(func() {
+		currentExecutablePath = previousExecutablePath
+	})
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.MediaRuntime.VipsPath != vipsPath {
+		t.Fatalf("MediaRuntime.VipsPath = %q, want bundled vips %q", resolved.MediaRuntime.VipsPath, vipsPath)
+	}
+}
+
+func TestLoadAutoDetectsBundledMediaRuntimeHelper(t *testing.T) {
+	tempDir := t.TempDir()
+	executablePath := filepath.Join(tempDir, "timich-agent")
+	helperPath := filepath.Join(tempDir, mediaRuntimeHelperBinaryName())
+	if err := os.WriteFile(executablePath, []byte("agent"), 0o700); err != nil {
+		t.Fatalf("WriteFile(agent) error = %v", err)
+	}
+	if err := os.WriteFile(helperPath, []byte("helper"), 0o700); err != nil {
+		t.Fatalf("WriteFile(helper) error = %v", err)
+	}
+	previousExecutablePath := currentExecutablePath
+	currentExecutablePath = func() (string, error) {
+		return executablePath, nil
+	}
+	t.Cleanup(func() {
+		currentExecutablePath = previousExecutablePath
+	})
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.MediaRuntime.HelperPath != helperPath {
+		t.Fatalf("MediaRuntime.HelperPath = %q, want bundled helper %q", resolved.MediaRuntime.HelperPath, helperPath)
+	}
+}
+
+func TestLoadAutoDetectsBundledMediaRuntimeFFmpeg(t *testing.T) {
+	tempDir := t.TempDir()
+	executablePath := filepath.Join(tempDir, "timich-agent")
+	ffmpegPath := filepath.Join(tempDir, "media-runtime", "ffmpeg", "bin", mediaRuntimeFFmpegBinaryName())
+	if err := os.WriteFile(executablePath, []byte("agent"), 0o700); err != nil {
+		t.Fatalf("WriteFile(agent) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(ffmpegPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(ffmpeg dir) error = %v", err)
+	}
+	if err := os.WriteFile(ffmpegPath, []byte("ffmpeg"), 0o700); err != nil {
+		t.Fatalf("WriteFile(ffmpeg) error = %v", err)
+	}
+	previousExecutablePath := currentExecutablePath
+	currentExecutablePath = func() (string, error) {
+		return executablePath, nil
+	}
+	t.Cleanup(func() {
+		currentExecutablePath = previousExecutablePath
+	})
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.MediaRuntime.FFmpegPath != ffmpegPath {
+		t.Fatalf("MediaRuntime.FFmpegPath = %q, want bundled ffmpeg %q", resolved.MediaRuntime.FFmpegPath, ffmpegPath)
+	}
+}
+
+func TestLoadKeepsExplicitMediaRuntimeHelperOverBundledHelper(t *testing.T) {
+	tempDir := t.TempDir()
+	executablePath := filepath.Join(tempDir, "timich-agent")
+	bundledHelperPath := filepath.Join(tempDir, mediaRuntimeHelperBinaryName())
+	explicitHelperPath := filepath.Join(tempDir, "custom-media-helper")
+	if err := os.WriteFile(executablePath, []byte("agent"), 0o700); err != nil {
+		t.Fatalf("WriteFile(agent) error = %v", err)
+	}
+	for _, path := range []string{bundledHelperPath, explicitHelperPath} {
+		if err := os.WriteFile(path, []byte("helper"), 0o700); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+	previousExecutablePath := currentExecutablePath
+	currentExecutablePath = func() (string, error) {
+		return executablePath, nil
+	}
+	t.Cleanup(func() {
+		currentExecutablePath = previousExecutablePath
+	})
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	raw := []byte(`{"mediaRuntime":{"helperPath":"` + filepath.ToSlash(explicitHelperPath) + `"}}` + "\n")
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.MediaRuntime.HelperPath != explicitHelperPath {
+		t.Fatalf("MediaRuntime.HelperPath = %q, want explicit helper %q", resolved.MediaRuntime.HelperPath, explicitHelperPath)
+	}
+}
+
+func TestLoadKeepsExplicitMediaRuntimeVipsOverBundledVips(t *testing.T) {
+	tempDir := t.TempDir()
+	executablePath := filepath.Join(tempDir, "timich-agent")
+	bundledVipsPath := filepath.Join(tempDir, "media-runtime", "libvips", "bin", mediaRuntimeVipsBinaryName())
+	explicitVipsPath := filepath.Join(tempDir, "custom-vips")
+	if err := os.WriteFile(executablePath, []byte("agent"), 0o700); err != nil {
+		t.Fatalf("WriteFile(agent) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(bundledVipsPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(bundled vips dir) error = %v", err)
+	}
+	for _, path := range []string{bundledVipsPath, explicitVipsPath} {
+		if err := os.WriteFile(path, []byte("vips"), 0o700); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+	previousExecutablePath := currentExecutablePath
+	currentExecutablePath = func() (string, error) {
+		return executablePath, nil
+	}
+	t.Cleanup(func() {
+		currentExecutablePath = previousExecutablePath
+	})
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	raw := []byte(`{"mediaRuntime":{"vipsPath":"` + filepath.ToSlash(explicitVipsPath) + `"}}` + "\n")
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.MediaRuntime.VipsPath != explicitVipsPath {
+		t.Fatalf("MediaRuntime.VipsPath = %q, want explicit vips %q", resolved.MediaRuntime.VipsPath, explicitVipsPath)
+	}
+}
+
+func TestLoadKeepsExplicitMediaRuntimeFFmpegOverBundledFFmpeg(t *testing.T) {
+	tempDir := t.TempDir()
+	executablePath := filepath.Join(tempDir, "timich-agent")
+	bundledFFmpegPath := filepath.Join(tempDir, "media-runtime", "ffmpeg", "bin", mediaRuntimeFFmpegBinaryName())
+	explicitFFmpegPath := filepath.Join(tempDir, "custom-ffmpeg")
+	if err := os.WriteFile(executablePath, []byte("agent"), 0o700); err != nil {
+		t.Fatalf("WriteFile(agent) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(bundledFFmpegPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll(bundled ffmpeg dir) error = %v", err)
+	}
+	for _, path := range []string{bundledFFmpegPath, explicitFFmpegPath} {
+		if err := os.WriteFile(path, []byte("ffmpeg"), 0o700); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", path, err)
+		}
+	}
+	previousExecutablePath := currentExecutablePath
+	currentExecutablePath = func() (string, error) {
+		return executablePath, nil
+	}
+	t.Cleanup(func() {
+		currentExecutablePath = previousExecutablePath
+	})
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	raw := []byte(`{"mediaRuntime":{"ffmpegPath":"` + filepath.ToSlash(explicitFFmpegPath) + `"}}` + "\n")
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile(config) error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.MediaRuntime.FFmpegPath != explicitFFmpegPath {
+		t.Fatalf("MediaRuntime.FFmpegPath = %q, want explicit ffmpeg %q", resolved.MediaRuntime.FFmpegPath, explicitFFmpegPath)
+	}
+}
+
+func TestLoadRejectsRelativeSemanticRuntimeHelperPath(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{"semanticRuntime":{"helperPath":"bin/timich-semantic-helper"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("Load() error = nil, want invalid semantic runtime helper path error")
+	}
+}
+
+func TestLoadRejectsRelativeMediaRuntimeVipsPath(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{"mediaRuntime":{"vipsPath":"bin/vips"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("Load() error = nil, want invalid media runtime vips path error")
+	}
+}
+
+func TestLoadRejectsRelativeMediaRuntimeHelperPath(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{"mediaRuntime":{"helperPath":"bin/timich-media-helper"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("Load() error = nil, want invalid media runtime helper path error")
+	}
+}
+
+func TestLoadRejectsRelativeMediaRuntimeFFmpegPath(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{"mediaRuntime":{"ffmpegPath":"bin/ffmpeg"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("Load() error = nil, want invalid media runtime ffmpeg path error")
+	}
+}
+
+func TestLoadAcceptsSemanticIndexingConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+  "semanticRuntime": {
+    "indexing": {
+      "enabled": true,
+      "interval": "45s",
+      "batchSize": 25,
+	  "targetCompletedVectors": 10000
+    }
+  }
+}
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	backfill := resolved.SemanticRuntime.Indexing
+	if !backfill.Enabled || backfill.Interval != "45s" || backfill.BatchSize != 25 || backfill.TargetCompletedVectors != 10000 {
+		t.Fatalf("Indexing = %+v, want enabled interval/batch/target", backfill)
+	}
+}
+
+func TestLoadRejectsInvalidSemanticIndexingConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "interval",
+			raw:  `{"semanticRuntime":{"indexing":{"interval":"soon"}}}`,
+		},
+		{
+			name: "batchSize",
+			raw:  `{"semanticRuntime":{"indexing":{"batchSize":-1}}}`,
+		},
+		{
+			name: "targetCompletedVectors",
+			raw:  `{"semanticRuntime":{"indexing":{"targetCompletedVectors":-1}}}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "agent.json")
+			if err := os.WriteFile(configPath, []byte(test.raw+"\n"), 0o600); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			if _, err := Load(configPath); err == nil {
+				t.Fatal("Load() error = nil, want invalid semantic indexing config error")
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsWorkerRuntimeConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{"workerRuntime":{"heavyTaskWorkers":3}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.WorkerRuntime.HeavyTaskWorkers == nil || *resolved.WorkerRuntime.HeavyTaskWorkers != 3 {
+		t.Fatalf("WorkerRuntime.HeavyTaskWorkers = %v, want 3", resolved.WorkerRuntime.HeavyTaskWorkers)
+	}
+}
+
+func TestLoadTreatsEmptyWorkerRuntimeEnvAsAuto(t *testing.T) {
+	t.Setenv("TIMICH_AGENT_HEAVY_TASK_WORKERS", "")
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if resolved.WorkerRuntime.HeavyTaskWorkers != nil {
+		t.Fatalf("WorkerRuntime.HeavyTaskWorkers = %v, want nil auto", resolved.WorkerRuntime.HeavyTaskWorkers)
+	}
+}
+
+func TestLoadRejectsInvalidWorkerRuntimeConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{"workerRuntime":{"heavyTaskWorkers":-1}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("Load() error = nil, want invalid worker runtime config error")
+	}
+}
+
+func TestDatasourceKindPolicies(t *testing.T) {
+	t.Parallel()
+
+	if !IsImmichDatasourceKind(DatasourceKindImmich) || !IsImmichDatasourceKind(DatasourceKindImmichIndexed) {
+		t.Fatal("both Immich datasource kinds must share the Immich connector family")
+	}
+	if IsIndexedDatasourceKind(DatasourceKindImmich) {
+		t.Fatal("passthrough Immich must not be indexed")
+	}
+	if !IsIndexedDatasourceKind(DatasourceKindImmichIndexed) || !IsIndexedDatasourceKind(DatasourceKindLocalFiles) {
+		t.Fatal("indexed Immich and local filesystem must contribute to the catalog")
+	}
+}
+
+func TestValidateDoesNotMutateSharedConfiguration(t *testing.T) {
+	t.Parallel()
+
+	fallbackEnabled := true
+	heavyTaskWorkers := 2
+	cfg := Default()
+	cfg.WorkerRuntime.HeavyTaskWorkers = &heavyTaskWorkers
+	cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: " nas-photos ", Path: " /photos "}}
+	cfg.UploadRoots = []UploadRootConfig{{Key: " uploads ", Path: " /uploads ", TempPath: " staging "}}
+	cfg.Datasources = []DatasourceConfig{
+		{
+			SourceKey:   "1111111111111111",
+			Name:        "Home Immich",
+			Kind:        DatasourceKindImmichIndexed,
+			URL:         "http://immich.local:2283",
+			AccessToken: "token",
+			Indexing: &DatasourceIndexingConfig{
+				Phase0SyncInterval:   " 30m ",
+				DailyFullSweepWindow: " 02:00 ",
+			},
+		},
+		{
+			SourceKey: "2222222222222222",
+			Name:      "NAS Photos",
+			Kind:      DatasourceKindLocalFiles,
+			RootKey:   " nas-photos ",
+			Scan: &LocalDatasourceScanConfig{
+				ImmichFallbackEnabled: &fallbackEnabled,
+				QuickScanInterval:     " 15m ",
+			},
+		},
+	}
+
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if cfg.LocalMediaRoots[0].Key != " nas-photos " || cfg.LocalMediaRoots[0].Path != " /photos " {
+		t.Fatalf("Validate() mutated LocalMediaRoots: %+v", cfg.LocalMediaRoots)
+	}
+	if cfg.UploadRoots[0].Key != " uploads " || cfg.UploadRoots[0].TempPath != " staging " {
+		t.Fatalf("Validate() mutated UploadRoots: %+v", cfg.UploadRoots)
+	}
+	if cfg.Datasources[0].Indexing.Phase0SyncInterval != " 30m " || cfg.Datasources[0].Indexing.DailyFullSweepWindow != " 02:00 " {
+		t.Fatalf("Validate() mutated datasource Indexing: %+v", cfg.Datasources[0].Indexing)
+	}
+	if cfg.Datasources[1].RootKey != " nas-photos " || cfg.Datasources[1].Scan.QuickScanInterval != " 15m " {
+		t.Fatalf("Validate() mutated datasource Scan: %+v", cfg.Datasources[1])
+	}
+}
+
+func TestWriteFileRejectsPassthroughImmichWithAdditionalDatasource(t *testing.T) {
+	t.Parallel()
+
+	cfg := Default()
+	cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: t.TempDir()}}
+	cfg.Datasources = []DatasourceConfig{
+		{
+			SourceKey:   "1111111111111111",
+			Name:        "Home Immich",
+			Kind:        DatasourceKindImmich,
+			URL:         "http://immich.local:2283",
+			AccessToken: "token",
+		},
+		{
+			SourceKey: "2222222222222222",
+			Name:      "NAS Photos",
+			Kind:      DatasourceKindLocalFiles,
+			RootKey:   "nas-photos",
+		},
+	}
+
+	err := WriteFile(filepath.Join(t.TempDir(), "agent.json"), cfg)
+	if !errors.Is(err, ErrImmichPassthroughRequiresSingleDatasource) {
+		t.Fatalf("WriteFile() error = %v, want passthrough topology error", err)
+	}
+}
+
+func TestWriteFileAcceptsIndexedImmichWithAdditionalDatasource(t *testing.T) {
+	t.Parallel()
+
+	cfg := Default()
+	cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: t.TempDir()}}
+	cfg.Datasources = []DatasourceConfig{
+		{
+			SourceKey:   "1111111111111111",
+			Name:        "Home Immich",
+			Kind:        DatasourceKindImmichIndexed,
+			URL:         "http://immich.local:2283",
+			AccessToken: "token",
+		},
+		{
+			SourceKey: "2222222222222222",
+			Name:      "NAS Photos",
+			Kind:      DatasourceKindLocalFiles,
+			RootKey:   "nas-photos",
+		},
+	}
+
+	if err := WriteFile(filepath.Join(t.TempDir(), "agent.json"), cfg); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+}
+
+func TestWriteFileAcceptsUploadRootsWithPassthroughImmich(t *testing.T) {
+	t.Parallel()
+
+	cfg := Default()
+	cfg.UploadRoots = []UploadRootConfig{{Key: "camera-uploads", Path: t.TempDir()}}
+	cfg.Datasources = []DatasourceConfig{{
+		SourceKey:   "1111111111111111",
+		Name:        "Home Immich",
+		Kind:        DatasourceKindImmich,
+		URL:         "http://immich.local:2283",
+		AccessToken: "token",
+	}}
+
+	if err := WriteFile(filepath.Join(t.TempDir(), "agent.json"), cfg); err != nil {
+		t.Fatalf("WriteFile() error = %v, want uploads independent of passthrough mode", err)
 	}
 }
 
@@ -176,6 +824,296 @@ func TestWriteFileNormalizesUploadConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsLocalMediaRootAndDatasource(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	rootPath := filepath.Join(t.TempDir(), "photos")
+	raw := []byte(`{
+  "localMediaRoots": [
+    {"key": " nas-photos ", "path": " ` + filepath.ToSlash(rootPath) + ` "}
+  ],
+  "datasources": [
+    {
+      "name": "NAS Photos",
+      "kind": "local_filesystem",
+      "rootKey": " nas-photos ",
+      "scan": {
+        "firstViewThumbnailCount": 60,
+        "quickScanInterval": " 5m ",
+        "reconciliationTime": " 04:00 ",
+        "contentVerificationTime": " 04:30 ",
+        "contentVerificationDuration": " 30m ",
+        "settlingDuration": " 2m ",
+        "includeHiddenDirectories": true
+      }
+    }
+  ]
+}
+`)
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(resolved.LocalMediaRoots) != 1 {
+		t.Fatalf("LocalMediaRoots length = %d, want 1", len(resolved.LocalMediaRoots))
+	}
+	if resolved.LocalMediaRoots[0].Key != "nas-photos" || resolved.LocalMediaRoots[0].Path != rootPath {
+		t.Fatalf("LocalMediaRoots[0] = %+v, want normalized local root", resolved.LocalMediaRoots[0])
+	}
+	if len(resolved.Datasources) != 1 {
+		t.Fatalf("Datasources length = %d, want 1", len(resolved.Datasources))
+	}
+	datasource := resolved.Datasources[0]
+	if datasource.Kind != DatasourceKindLocalFiles || datasource.RootKey != "nas-photos" {
+		t.Fatalf("Datasource = %+v, want local filesystem datasource", datasource)
+	}
+	if datasource.Scan == nil ||
+		datasource.Scan.QuickScanInterval != "5m" ||
+		datasource.Scan.ReconciliationTime != "04:00" ||
+		datasource.Scan.ContentVerificationTime != "04:30" ||
+		datasource.Scan.ContentVerificationDuration != "30m" ||
+		datasource.Scan.SettlingDuration != "2m" {
+		t.Fatalf("Datasource.Scan = %+v, want normalized quick/reconciliation/verification/settling settings", datasource.Scan)
+	}
+	if err := ValidateDatasourceSourceKey(datasource.SourceKey); err != nil {
+		t.Fatalf("generated SourceKey = %q: %v", datasource.SourceKey, err)
+	}
+	if datasource.Scan == nil ||
+		datasource.Scan.FirstViewThumbnailCount != 60 ||
+		datasource.Scan.QuickScanInterval != "5m" ||
+		datasource.Scan.ReconciliationTime != "04:00" ||
+		datasource.Scan.ContentVerificationTime != "04:30" ||
+		datasource.Scan.ContentVerificationDuration != "30m" ||
+		datasource.Scan.SettlingDuration != "2m" ||
+		!datasource.Scan.IncludeHiddenDirs {
+		t.Fatalf("Scan = %+v, want normalized scan config", datasource.Scan)
+	}
+}
+
+func TestLoadAcceptsZeroContentVerificationDurationAsDisabled(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	rootPath := t.TempDir()
+	raw := []byte(`{
+  "localMediaRoots": [
+    {"key": "nas-photos", "path": "` + filepath.ToSlash(rootPath) + `"}
+  ],
+  "datasources": [
+    {
+      "name": "NAS Photos",
+      "kind": "local_filesystem",
+      "rootKey": "nas-photos",
+      "scan": {"contentVerificationDuration": "0"}
+    }
+  ]
+}`)
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	resolved, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want zero duration accepted", err)
+	}
+	if len(resolved.Datasources) != 1 ||
+		resolved.Datasources[0].Scan == nil ||
+		resolved.Datasources[0].Scan.ContentVerificationDuration != "0" {
+		t.Fatalf("loaded datasource = %+v, want explicit disabled duration retained", resolved.Datasources)
+	}
+}
+
+func TestLocalDatasourceImmichFallbackDefaultsEnabledAndPersistsDisabled(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	rootPath := t.TempDir()
+	cfg := Default()
+	cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: rootPath}}
+	cfg.Datasources = []DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "NAS Photos",
+		Kind:      DatasourceKindLocalFiles,
+		RootKey:   "nas-photos",
+	}}
+	if err := WriteFile(configPath, cfg); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !LocalDatasourceImmichFallbackEnabled(loaded.Datasources[0]) {
+		t.Fatal("LocalDatasourceImmichFallbackEnabled() = false for omitted setting, want true")
+	}
+
+	if _, err := UpdateLocalDatasourceImmichFallbackFile(configPath, "1111111111111111", false); err != nil {
+		t.Fatalf("UpdateLocalDatasourceImmichFallbackFile() error = %v", err)
+	}
+	loaded, err = Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() after update error = %v", err)
+	}
+	if LocalDatasourceImmichFallbackEnabled(loaded.Datasources[0]) {
+		t.Fatal("LocalDatasourceImmichFallbackEnabled() = true after disabling, want false")
+	}
+	if loaded.Datasources[0].Scan == nil || loaded.Datasources[0].Scan.ImmichFallbackEnabled == nil || *loaded.Datasources[0].Scan.ImmichFallbackEnabled {
+		t.Fatalf("persisted scan = %#v, want explicit disabled fallback", loaded.Datasources[0].Scan)
+	}
+}
+
+func TestAddDatasourceFileAppendsDatasource(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	rootPath := t.TempDir()
+	cfg := Default()
+	cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: rootPath}}
+	cfg.Datasources = []DatasourceConfig{{
+		Name:        "Home Immich",
+		Kind:        DatasourceKindImmichIndexed,
+		URL:         "http://immich.local:2283",
+		AccessToken: "immich-api-key",
+		SourceKey:   "1111111111111111",
+	}}
+	if err := WriteFile(configPath, cfg); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	added := DatasourceConfig{
+		Name:    "NAS Photos",
+		Kind:    DatasourceKindLocalFiles,
+		RootKey: "nas-photos",
+	}
+	persisted, err := AddDatasourceFile(configPath, added)
+	if err != nil {
+		t.Fatalf("AddDatasourceFile() error = %v", err)
+	}
+	if len(persisted.Datasources) != 2 {
+		t.Fatalf("persisted datasource length = %d, want 2", len(persisted.Datasources))
+	}
+	if persisted.Datasources[0].SourceKey != "1111111111111111" || persisted.Datasources[0].AccessToken != "immich-api-key" {
+		t.Fatalf("first datasource changed: %+v", persisted.Datasources[0])
+	}
+	if persisted.Datasources[1].Kind != DatasourceKindLocalFiles ||
+		persisted.Datasources[1].RootKey != "nas-photos" ||
+		strings.TrimSpace(persisted.Datasources[1].SourceKey) == "" {
+		t.Fatalf("added datasource = %+v", persisted.Datasources[1])
+	}
+}
+
+func TestWriteFileRejectsInvalidLocalDatasourceConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		configure func(*Config, string)
+	}{
+		{
+			name: "relative root path",
+			configure: func(cfg *Config, rootPath string) {
+				cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: "relative"}}
+			},
+		},
+		{
+			name: "unknown datasource root",
+			configure: func(cfg *Config, rootPath string) {
+				cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: rootPath}}
+				cfg.Datasources = []DatasourceConfig{{
+					Name:    "NAS Photos",
+					Kind:    DatasourceKindLocalFiles,
+					RootKey: "other-root",
+				}}
+			},
+		},
+		{
+			name: "negative first view thumbnails",
+			configure: func(cfg *Config, rootPath string) {
+				cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: rootPath}}
+				cfg.Datasources = []DatasourceConfig{{
+					Name:    "NAS Photos",
+					Kind:    DatasourceKindLocalFiles,
+					RootKey: "nas-photos",
+					Scan: &LocalDatasourceScanConfig{
+						FirstViewThumbnailCount: -1,
+					},
+				}}
+			},
+		},
+		{
+			name: "invalid scan interval",
+			configure: func(cfg *Config, rootPath string) {
+				cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: rootPath}}
+				cfg.Datasources = []DatasourceConfig{{
+					Name:    "NAS Photos",
+					Kind:    DatasourceKindLocalFiles,
+					RootKey: "nas-photos",
+					Scan: &LocalDatasourceScanConfig{
+						QuickScanInterval: "soon",
+					},
+				}}
+			},
+		},
+		{
+			name: "invalid reconciliation time",
+			configure: func(cfg *Config, rootPath string) {
+				cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: rootPath}}
+				cfg.Datasources = []DatasourceConfig{{
+					Name:    "NAS Photos",
+					Kind:    DatasourceKindLocalFiles,
+					RootKey: "nas-photos",
+					Scan: &LocalDatasourceScanConfig{
+						ReconciliationTime: "25:00",
+					},
+				}}
+			},
+		},
+		{
+			name: "negative content verification duration",
+			configure: func(cfg *Config, rootPath string) {
+				cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: rootPath}}
+				cfg.Datasources = []DatasourceConfig{{
+					Name:    "NAS Photos",
+					Kind:    DatasourceKindLocalFiles,
+					RootKey: "nas-photos",
+					Scan: &LocalDatasourceScanConfig{
+						ContentVerificationDuration: "-1s",
+					},
+				}}
+			},
+		},
+		{
+			name: "invalid content verification time",
+			configure: func(cfg *Config, rootPath string) {
+				cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: rootPath}}
+				cfg.Datasources = []DatasourceConfig{{
+					Name:    "NAS Photos",
+					Kind:    DatasourceKindLocalFiles,
+					RootKey: "nas-photos",
+					Scan: &LocalDatasourceScanConfig{
+						ContentVerificationTime: "25:00",
+					},
+				}}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := Default()
+			cfg.DataDir = filepath.Join(t.TempDir(), "state")
+			tc.configure(&cfg, filepath.Join(t.TempDir(), "photos"))
+			if err := WriteFile(filepath.Join(t.TempDir(), "agent.json"), cfg); err == nil {
+				t.Fatal("WriteFile() error = nil, want invalid local datasource config")
+			}
+		})
+	}
+}
+
 func TestLoadRejectsInvalidTimezone(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "agent.json")
 	if err := os.WriteFile(configPath, []byte("{\"timezone\":\"Mars/Olympus\"}\n"), 0o600); err != nil {
@@ -208,6 +1146,16 @@ func TestLoadRejectsInvalidUploadRootTempPath(t *testing.T) {
 
 	if _, err := Load(configPath); err == nil {
 		t.Fatal("Load() error = nil, want invalid upload root temp path error")
+	}
+}
+
+func TestValidateUploadRootTempPathRejectsBackslashTraversal(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{`..\outside`, `working\..\outside`, `working\temp`} {
+		if _, err := ValidateUploadRootTempPath(value); err == nil {
+			t.Fatalf("ValidateUploadRootTempPath(%q) error = nil, want rejection", value)
+		}
 	}
 }
 
@@ -386,6 +1334,46 @@ func TestWriteFileAcceptsStaticDemoDatasource(t *testing.T) {
 	}
 }
 
+func TestWriteFileRejectsInvalidDatasourceIndexingSchedule(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		indexing DatasourceIndexingConfig
+	}{
+		{
+			name: "invalid interval",
+			indexing: DatasourceIndexingConfig{
+				Phase0SyncInterval: "soon",
+			},
+		},
+		{
+			name: "invalid daily window",
+			indexing: DatasourceIndexingConfig{
+				DailyFullSweepWindow: "25:00",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := Default()
+			cfg.DataDir = filepath.Join(t.TempDir(), "state")
+			cfg.Datasources = []DatasourceConfig{{
+				Name:     "Immich",
+				Kind:     DatasourceKindImmichIndexed,
+				URL:      "http://immich.local:2283",
+				Indexing: &tc.indexing,
+			}}
+			if err := WriteFile(filepath.Join(t.TempDir(), "agent.json"), cfg); err == nil {
+				t.Fatal("WriteFile() error = nil, want invalid datasource indexing schedule")
+			}
+		})
+	}
+}
+
 func TestUpdatePrimaryDatasourceFilePreservesFileBackedSettingsOnly(t *testing.T) {
 	t.Setenv("TIMICH_AGENT_NAME", "env-agent")
 
@@ -396,13 +1384,16 @@ func TestUpdatePrimaryDatasourceFilePreservesFileBackedSettingsOnly(t *testing.T
 	cfg.Datasources = []DatasourceConfig{
 		{
 			Name:        "Old",
-			Kind:        "immich",
+			Kind:        "immich_indexed",
 			URL:         "http://old-immich.local:2283",
 			AccessToken: "existing-api-key",
+			Indexing: &DatasourceIndexingConfig{
+				LatestAssetLimit: 600,
+			},
 		},
 		{
 			Name:        "Extra",
-			Kind:        "immich",
+			Kind:        "immich_indexed",
 			URL:         "http://extra-immich.local:2283",
 			AccessToken: "extra-api-key",
 		},
@@ -421,7 +1412,7 @@ func TestUpdatePrimaryDatasourceFilePreservesFileBackedSettingsOnly(t *testing.T
 
 	updated, err := UpdatePrimaryDatasourceFile(configPath, DatasourceConfig{
 		Name: "Home Immich",
-		Kind: "immich",
+		Kind: "immich_indexed",
 		URL:  "http://immich.local:2283",
 	})
 	if err != nil {
@@ -442,12 +1433,147 @@ func TestUpdatePrimaryDatasourceFilePreservesFileBackedSettingsOnly(t *testing.T
 	if updated.Datasources[0].AccessToken != "existing-api-key" {
 		t.Fatalf("AccessToken = %q, want preserved primary API key", updated.Datasources[0].AccessToken)
 	}
+	if updated.Datasources[0].Indexing == nil || updated.Datasources[0].Indexing.LatestAssetLimit != 600 {
+		t.Fatalf("Indexing = %#v, want preserved datasource indexing settings", updated.Datasources[0].Indexing)
+	}
 
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
 	}
 	if strings.Contains(string(raw), "env-agent") {
+		t.Fatalf("config file persisted env override: %s", string(raw))
+	}
+}
+
+func TestUpdatePrimaryDatasourceFileClearsIndexingWhenSwitchingToPassthrough(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	cfg := Default()
+	cfg.Datasources = []DatasourceConfig{{
+		Name:        "Home Immich",
+		Kind:        DatasourceKindImmichIndexed,
+		URL:         "http://immich.local:2283",
+		AccessToken: "existing-api-key",
+		Indexing:    &DatasourceIndexingConfig{LatestAssetLimit: 600},
+	}}
+	if err := WriteFile(configPath, cfg); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	updated, err := UpdatePrimaryDatasourceFile(configPath, DatasourceConfig{
+		Name: "Home Immich",
+		Kind: DatasourceKindImmich,
+		URL:  "http://immich.local:2283",
+	})
+	if err != nil {
+		t.Fatalf("UpdatePrimaryDatasourceFile() error = %v", err)
+	}
+	if updated.Datasources[0].Kind != DatasourceKindImmich || updated.Datasources[0].Indexing != nil {
+		t.Fatalf("updated datasource = %+v, want passthrough without indexing tuning", updated.Datasources[0])
+	}
+	if updated.Datasources[0].AccessToken != "existing-api-key" {
+		t.Fatalf("AccessToken = %q, want preserved API key", updated.Datasources[0].AccessToken)
+	}
+}
+
+func TestUpdateSemanticIndexingFilePreservesFileBackedSettingsOnly(t *testing.T) {
+	t.Setenv("TIMICH_AGENT_NAME", "env-agent")
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	cfg := Default()
+	cfg.AgentName = "file-agent"
+	cfg.AdminListenAddress = "127.0.0.1:8081"
+	cfg.DataDir = "state"
+	cfg.Datasources = []DatasourceConfig{{
+		Name:        "Home Immich",
+		Kind:        "immich",
+		URL:         "http://immich.local:2283",
+		AccessToken: "existing-api-key",
+	}}
+	if err := WriteFile(configPath, cfg); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.AgentName != "env-agent" {
+		t.Fatal("test setup did not apply env override")
+	}
+
+	updated, err := UpdateSemanticIndexingFile(configPath, SemanticIndexingConfig{
+		Enabled:                true,
+		Interval:               "30s",
+		BatchSize:              100,
+		TargetCompletedVectors: 10000,
+	})
+	if err != nil {
+		t.Fatalf("UpdateSemanticIndexingFile() error = %v", err)
+	}
+	if updated.AgentName != "file-agent" {
+		t.Fatalf("AgentName = %q, want file-backed value", updated.AgentName)
+	}
+	if len(updated.Datasources) != 1 || updated.Datasources[0].AccessToken != "existing-api-key" {
+		t.Fatalf("Datasources = %#v, want preserved datasource", updated.Datasources)
+	}
+	backfill := updated.SemanticRuntime.Indexing
+	if !backfill.Enabled || backfill.Interval != "30s" || backfill.BatchSize != 100 || backfill.TargetCompletedVectors != 10000 {
+		t.Fatalf("Indexing = %+v, want enabled settings", backfill)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if strings.Contains(string(raw), "env-agent") {
+		t.Fatalf("config file persisted env override: %s", string(raw))
+	}
+}
+
+func TestUpdateWorkerRuntimeFilePreservesFileBackedSettingsOnly(t *testing.T) {
+	t.Setenv("TIMICH_AGENT_HEAVY_TASK_WORKERS", "9")
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	cfg := Default()
+	cfg.AgentName = "file-agent"
+	cfg.AdminListenAddress = "127.0.0.1:8081"
+	cfg.DataDir = "state"
+	cfg.WorkerRuntime.HeavyTaskWorkers = testIntPtr(2)
+	cfg.Datasources = []DatasourceConfig{{
+		Name:        "Home Immich",
+		Kind:        "immich",
+		URL:         "http://immich.local:2283",
+		AccessToken: "existing-api-key",
+	}}
+	if err := WriteFile(configPath, cfg); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded.WorkerRuntime.HeavyTaskWorkers == nil || *loaded.WorkerRuntime.HeavyTaskWorkers != 9 {
+		t.Fatal("test setup did not apply worker env override")
+	}
+
+	updated, err := UpdateWorkerRuntimeFile(configPath, WorkerRuntimeConfig{HeavyTaskWorkers: testIntPtr(3)})
+	if err != nil {
+		t.Fatalf("UpdateWorkerRuntimeFile() error = %v", err)
+	}
+	if updated.WorkerRuntime.HeavyTaskWorkers == nil || *updated.WorkerRuntime.HeavyTaskWorkers != 3 {
+		t.Fatalf("HeavyTaskWorkers = %v, want 3", updated.WorkerRuntime.HeavyTaskWorkers)
+	}
+	if len(updated.Datasources) != 1 || updated.Datasources[0].AccessToken != "existing-api-key" {
+		t.Fatalf("Datasources = %#v, want preserved datasource", updated.Datasources)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if strings.Contains(string(raw), `"heavyTaskWorkers": 9`) {
 		t.Fatalf("config file persisted env override: %s", string(raw))
 	}
 }
@@ -496,4 +1622,8 @@ func TestLoadAllowsLoopbackAdminListenAddressOptOut(t *testing.T) {
 	if resolved.AdminListenAddress != "127.0.0.1:8081" {
 		t.Fatalf("AdminListenAddress = %q, want loopback opt-out", resolved.AdminListenAddress)
 	}
+}
+
+func testIntPtr(value int) *int {
+	return &value
 }
