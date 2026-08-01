@@ -16,9 +16,15 @@ RUN go build -o /out/timich-agent ./cmd/timich-agent && \
 	RUSTFLAGS="-C target-feature=+crt-static" CARGO_TARGET_DIR=/tmp/timich-media-helper-target cargo build --manifest-path media-helper/Cargo.toml --release && \
 	cp /tmp/timich-media-helper-target/release/timich-media-helper /out/timich-media-helper
 
-FROM alpine:3.22
+FROM debian:bookworm-slim
 
-RUN apk add --no-cache ca-certificates ffmpeg vips-tools vips-heif
+RUN apt-get update && \
+	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+		ca-certificates \
+		ffmpeg \
+		libvips-tools \
+		wget && \
+	rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

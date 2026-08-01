@@ -102,9 +102,11 @@ a bundle-local README.
 When platform media runtimes are included, direct native runs auto-detect the
 bundle-local `media-runtime/libvips/bin/vips` and
 `media-runtime/ffmpeg/bin/ffmpeg` executables for local filesystem thumbnails.
-Docker images built from the bundle install `ffmpeg`, `vips-tools`, and
-`vips-heif` for local filesystem thumbnail generation, including MP4/MOV poster
-frames and HEIC/HEIF inputs.
+Docker images built from the bundle use a glibc-based Debian runtime and install
+`ffmpeg` and `libvips-tools` for local filesystem thumbnail generation,
+including MP4/MOV poster frames and HEIC/HEIF inputs. The glibc runtime also
+allows the Linux semantic runtime pack published with the release to execute
+inside the container.
 
 ## First Run
 
