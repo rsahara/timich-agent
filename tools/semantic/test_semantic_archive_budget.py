@@ -217,7 +217,11 @@ class SemanticArchiveBudgetTests(unittest.TestCase):
             with zipfile.ZipFile(path, "w") as archive:
                 archive.writestr(info, b"1")
 
-            stats = inspect_semantic_archive(path)
+            # Python 3.12's ZipFile misclassifies these valid trailing bytes as
+            # a Zip64 locator. This regression targets our bounded footer
+            # preflight, which must distinguish the central-entry comment
+            # without depending on the later standard-library parser.
+            stats = preflight_semantic_archive_directory(path)
             self.assertEqual(stats.entry_count, 1)
 
     def test_archive_uncompressed_limit_is_checked_without_extraction(self) -> None:
