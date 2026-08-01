@@ -9,19 +9,22 @@ trap 'rm -rf "$test_root"' EXIT
 
 fake_bin="$test_root/bin"
 state_dir="$test_root/state"
+download_call_dir="$state_dir/download-calls"
 public_source="$test_root/public-source"
 assets_dir="$test_root/assets"
-mkdir -p "$fake_bin" "$state_dir" "$public_source" "$assets_dir"
+mkdir -p "$fake_bin" "$state_dir" "$download_call_dir" "$public_source" "$assets_dir"
 mkdir -p "$test_root/go-cache"
 
 cat > "$fake_bin/gh" <<'FAKE_GH'
 #!/usr/bin/env bash
 set -euo pipefail
 
-printf '%s\n' "$*" >> "$FAKE_GH_STATE/log"
 command=${1:-}
 subcommand=${2:-}
 shift 2
+if [ "$subcommand" != "download" ]; then
+  printf '%s\n' "$command $subcommand $*" >> "$FAKE_GH_STATE/log"
+fi
 
 release_ref=${1:-}
 state_file="$FAKE_GH_STATE/release-state"
@@ -121,13 +124,19 @@ case "$subcommand" in
     if [ -z "$pattern" ] || [ -z "$output_dir" ] || [ ! -f "$FAKE_GH_DOWNLOAD_DIR/$pattern" ]; then
       exit 1
     fi
+    # Record the call without growing the shared log while RLIMIT_FSIZE is
+    # active around the fake download process.
+    : > "$FAKE_GH_STATE/download-calls/$pattern"
     cp "$FAKE_GH_DOWNLOAD_DIR/$pattern" "$output_dir/$pattern"
     if [ "${FAKE_GH_OVERSIZE_DOWNLOAD:-}" = "$pattern" ]; then
       current_size=$(wc -c < "$output_dir/$pattern" | tr -d '[:space:]')
       first_disallowed_size=$(( ((current_size + 1023) / 1024) * 1024 + 1 ))
       append_size=$((first_disallowed_size - current_size))
       dd if=/dev/zero bs=1 count="$append_size" >> "$output_dir/$pattern" 2>/dev/null
-      printf 'oversize download completed %s\n' "$pattern" >> "$FAKE_GH_STATE/log"
+      downloaded_size=$(wc -c < "$output_dir/$pattern" | tr -d '[:space:]')
+      if [ "$downloaded_size" -ge "$first_disallowed_size" ]; then
+        : > "$FAKE_GH_STATE/download-calls/oversize-$pattern"
+      fi
     fi
     ;;
   edit)
@@ -187,6 +196,15 @@ reset_state() {
   printf '%s\n' "${2:-$public_sha}" > "$state_dir/release-target"
   printf '%s\n' "${3:-[]}" > "$state_dir/assets.json"
   : > "$state_dir/log"
+  find "$download_call_dir" -mindepth 1 -maxdepth 1 -type f -delete
+}
+
+download_was_called() {
+  [ -f "$download_call_dir/$1" ]
+}
+
+any_download_was_called() {
+  find "$download_call_dir" -mindepth 1 -maxdepth 1 -type f ! -name 'oversize-*' -print -quit | grep -q .
 }
 
 reset_staging() {
@@ -518,7 +536,7 @@ if run_publisher true true >/dev/null 2>&1; then
   echo "expected same-owner platform alias to fail before artifact downloads" >&2
   exit 1
 fi
-if grep -Eq '^release download .*--pattern (model|runtime)\.zip' "$state_dir/log"; then
+if download_was_called model.zip || download_was_called runtime.zip; then
   echo "same-owner platform alias triggered an artifact download" >&2
   exit 1
 fi
@@ -532,7 +550,7 @@ if run_publisher true true >/dev/null 2>&1; then
   exit 1
 fi
 unset FAKE_GH_OVERSIZE_DOWNLOAD
-if grep -q '^oversize download completed semantic-models.json$' "$state_dir/log"; then
+if download_was_called oversize-semantic-models.json; then
   echo "overlong registry exceeded the declared GNU Bash file limit" >&2
   exit 1
 fi
@@ -547,7 +565,7 @@ if run_publisher true true >/dev/null 2>&1; then
   echo "expected oversized staging asset metadata to fail before download" >&2
   exit 1
 fi
-if grep -q '^release download ' "$state_dir/log"; then
+if any_download_was_called; then
   echo "oversized staging asset triggered a download" >&2
   exit 1
 fi
@@ -562,7 +580,7 @@ if run_publisher true true >/dev/null 2>&1; then
   echo "expected excessive staging asset count to fail before download" >&2
   exit 1
 fi
-if grep -q '^release download ' "$state_dir/log"; then
+if any_download_was_called; then
   echo "excessive staging asset count triggered a download" >&2
   exit 1
 fi
@@ -577,7 +595,7 @@ if run_publisher true true >/dev/null 2>&1; then
   echo "expected staging total-size budget to fail before download" >&2
   exit 1
 fi
-if grep -q '^release download ' "$state_dir/log"; then
+if any_download_was_called; then
   echo "over-budget staging assets triggered a download" >&2
   exit 1
 fi
@@ -646,7 +664,7 @@ if [ "$(cat "$state_dir/release-state")" != "published" ]; then
   echo "complete semantic release assets were not published" >&2
   exit 1
 fi
-grep -q '^release download ' "$state_dir/log"
+download_was_called semantic-models.json
 
 cp "$state_dir/semantic-smoke-attestation.json" "$state_dir/semantic-smoke-attestation.valid.json"
 jq '.registrySha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
