@@ -2,5 +2,7 @@
 .env
 .local/
 compose.immich-network.yaml
+compose.local-media.yaml
 build/
 dist/
+media-helper/target/

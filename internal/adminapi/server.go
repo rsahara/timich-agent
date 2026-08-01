@@ -3,12 +3,16 @@ package adminapi
 import (
 	"context"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/rsahara/timich-agent/internal/catalog"
 	"github.com/rsahara/timich-agent/internal/config"
 	runtimestate "github.com/rsahara/timich-agent/internal/runtime"
 	"github.com/rsahara/timich-agent/internal/store"
@@ -20,15 +24,20 @@ const (
 )
 
 const (
-	maxFormBodyBytes = 64 << 10
-	maxJSONBodyBytes = 1 << 20
+	maxFormBodyBytes          = 64 << 10
+	maxJSONBodyBytes          = 1 << 20
+	assetSearchPreviewTimeout = 25 * time.Second
 )
+
+const initialDatasourceIndexingStatusScript = `<script id="initialDatasourceIndexingStatus" type="application/json">null</script>`
 
 // Options configures optional admin actions that need process ownership.
 type Options struct {
-	Restart           func(context.Context) error
-	UpdateManifestURL string
-	UpdateHTTPClient  *http.Client
+	Restart                  func(context.Context) error
+	UpdateManifestURL        string
+	UpdateHTTPClient         *http.Client
+	SemanticModelManifestURL string
+	SemanticModelHTTPClient  *http.Client
 }
 
 // NewMux returns the local admin API surface for setup and diagnostics.
@@ -38,7 +47,8 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 
 // NewMuxWithOptions returns the local admin API surface with optional lifecycle hooks.
 func NewMuxWithOptions(runtime *runtimestate.AgentRuntime, options Options) http.Handler {
-	api := &server{runtime: runtime, options: options}
+	api := &server{runtime: runtime, options: options, semanticInstallJobs: newSemanticInstallJobStore()}
+	api.scheduleSemanticModelStatusRefresh()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", api.index)
 	mux.HandleFunc("/login", api.login)
@@ -51,6 +61,32 @@ func NewMuxWithOptions(runtime *runtimestate.AgentRuntime, options Options) http
 	mux.HandleFunc("/config", api.requireAdmin(api.config))
 	mux.HandleFunc("/v1/datasource/primary", api.requireAdmin(api.primaryDatasource))
 	mux.HandleFunc("/v1/datasource/primary/check", api.requireAdmin(api.primaryDatasourceCheck))
+	mux.HandleFunc("/v1/datasources", api.requireAdmin(api.datasources))
+	mux.HandleFunc("/v1/datasources/indexing", api.requireAdmin(api.datasourceIndexing))
+	mux.HandleFunc("/v1/datasources/indexing/run", api.requireAdmin(api.datasourceIndexingRun))
+	mux.HandleFunc("/v1/catalog/dedup/status", api.requireAdmin(api.catalogDedupStatus))
+	mux.HandleFunc("/v1/catalog/dedup/repair", api.requireAdmin(api.catalogDedupRepair))
+	mux.HandleFunc("/v1/datasources/local/scan", api.requireAdmin(api.localDatasourceScan))
+	mux.HandleFunc("/v1/datasources/local/root/accept", api.requireAdmin(api.localMediaRootAccept))
+	mux.HandleFunc("/v1/datasources/local/immich-fallback", api.requireAdmin(api.localDatasourceImmichFallback))
+	mux.HandleFunc("/v1/datasources/local/phase0-diagnostics.csv", api.requireAdmin(api.localDatasourcePhase0DiagnosticsCSV))
+	mux.HandleFunc("/v1/datasources/local/failure-diagnostics.csv", api.requireAdmin(api.localDatasourceFailureDiagnosticsCSV))
+	mux.HandleFunc("/v1/datasources/local/metadata/repair", api.requireAdmin(api.localDatasourceMetadataRequeue))
+	mux.HandleFunc("/v1/datasources/local/thumbnails/repair", api.requireAdmin(api.localDatasourceThumbnailRepair))
+	mux.HandleFunc("/v1/datasources/local/embeddings/repair", api.requireAdmin(api.localDatasourceEmbeddingRepair))
+	mux.HandleFunc("/v1/workers", api.requireAdmin(api.workers))
+	mux.HandleFunc("/v1/system/resources", api.requireAdmin(api.systemResources))
+	mux.HandleFunc("/v1/semantic-models", api.requireAdmin(api.semanticModels))
+	mux.HandleFunc("/v1/semantic-install-job", api.requireAdmin(api.semanticInstallJob))
+	mux.HandleFunc("/v1/semantic-models/install", api.requireAdmin(api.semanticModelInstall))
+	mux.HandleFunc("/v1/semantic-models/activate", api.requireAdmin(api.semanticModelActivate))
+	mux.HandleFunc("/v1/semantic-models/uninstall", api.requireAdmin(api.semanticModelUninstall))
+	mux.HandleFunc("/v1/semantic-models/recommended/install", api.requireAdmin(api.semanticModelRecommendedInstall))
+	mux.HandleFunc("/v1/semantic-runtime-packs/recommended/install", api.requireAdmin(api.semanticRuntimePackRecommendedInstall))
+	mux.HandleFunc("/v1/semantic-models/search/enable", api.requireAdmin(api.semanticModelSearchEnable))
+	mux.HandleFunc("/v1/semantic-indexing/run", api.requireAdmin(api.semanticIndexingRun))
+	mux.HandleFunc("/v1/assets/search-preview", api.requireAdmin(api.assetSearchPreview))
+	mux.HandleFunc("/v1/assets/", api.requireAdmin(api.assetPreview))
 	mux.HandleFunc("/v1/nearby-links", api.requireAdmin(api.nearbyLinks))
 	mux.HandleFunc("/v1/nearby-links/approve", api.requireAdmin(api.approveNearbyLink))
 	mux.HandleFunc("/v1/nearby-links/", api.requireAdmin(api.nearbyLink))
@@ -66,8 +102,13 @@ func NewMuxWithOptions(runtime *runtimestate.AgentRuntime, options Options) http
 }
 
 type server struct {
-	runtime *runtimestate.AgentRuntime
-	options Options
+	runtime                      *runtimestate.AgentRuntime
+	options                      Options
+	semanticInstallJobs          *semanticInstallJobStore
+	semanticModelsRefreshMu      sync.Mutex
+	semanticModelsRefreshBusy    bool
+	semanticModelsRefreshStarted time.Time
+	semanticModelsRefreshAt      time.Time
 }
 
 func (s *server) index(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +120,7 @@ func (s *server) index(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.authenticated(r) {
-		writeHTML(w, http.StatusOK, dashboardHTML)
+		writeHTML(w, http.StatusOK, s.dashboardHTML(r.Context()))
 		return
 	}
 	if !s.runtime.AdminAuthReady() {
@@ -87,6 +128,24 @@ func (s *server) index(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeHTML(w, http.StatusOK, loginHTML(""))
+}
+
+func (s *server) dashboardHTML(ctx context.Context) string {
+	if s == nil || s.runtime == nil {
+		return dashboardHTML
+	}
+	snapshotCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	snapshot, ok := s.runtime.CachedDatasourceIndexingStatus(snapshotCtx)
+	if !ok {
+		return dashboardHTML
+	}
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		return dashboardHTML
+	}
+	replacement := strings.Replace(initialDatasourceIndexingStatusScript, "null", string(payload), 1)
+	return strings.Replace(dashboardHTML, initialDatasourceIndexingStatusScript, replacement, 1)
 }
 
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
@@ -211,7 +270,7 @@ func health(status string) http.HandlerFunc {
 }
 
 func (s *server) version(w http.ResponseWriter, _ *http.Request) {
-	status := s.runtime.StatusResponse()
+	status := s.runtime.InfoResponse()
 	payload := map[string]any{
 		"service": "timich-agent",
 		"version": status.Version,
@@ -223,11 +282,14 @@ func (s *server) version(w http.ResponseWriter, _ *http.Request) {
 	if status.BuiltAt != "" {
 		payload["builtAt"] = status.BuiltAt
 	}
+	if status.ReleaseTag != "" {
+		payload["releaseTag"] = status.ReleaseTag
+	}
 	writeJSON(w, http.StatusOK, payload)
 }
 
-func (s *server) status(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.runtime.StatusResponse())
+func (s *server) status(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.runtime.StatusResponseWithContext(r.Context()))
 }
 
 func (s *server) updateCheck(w http.ResponseWriter, r *http.Request) {
@@ -236,7 +298,8 @@ func (s *server) updateCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	manifestURL := strings.TrimSpace(s.options.UpdateManifestURL)
-	currentVersion := s.runtime.StatusResponse().Version
+	currentInfo := s.runtime.InfoResponse()
+	currentVersion := currentInfo.Version
 	platform := runtimePlatform()
 	if manifestURL == "" {
 		writeJSON(w, http.StatusOK, updateCheckResponse{
@@ -262,11 +325,17 @@ func (s *server) updateCheck(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, buildUpdateCheckResponse(currentVersion, manifestURL, manifest))
+	writeJSON(w, http.StatusOK, buildUpdateCheckResponse(
+		currentVersion,
+		currentInfo.Commit,
+		currentInfo.ReleaseTag,
+		manifestURL,
+		manifest,
+	))
 }
 
-func (s *server) config(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.runtime.ConfigResponse())
+func (s *server) config(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.runtime.ConfigResponseWithContext(r.Context()))
 }
 
 func (s *server) primaryDatasource(w http.ResponseWriter, r *http.Request) {
@@ -300,6 +369,60 @@ func (s *server) primaryDatasource(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *server) datasources(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.runtime.Datasources())
+	case http.MethodPost:
+		var request struct {
+			Name        string `json:"name"`
+			Kind        string `json:"kind"`
+			URL         string `json:"url"`
+			AccessToken string `json:"accessToken"`
+			RootKey     string `json:"rootKey"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the datasource request.")
+			return
+		}
+		summary, err := s.runtime.AddDatasource(config.DatasourceConfig{
+			Name:        request.Name,
+			Kind:        request.Kind,
+			URL:         request.URL,
+			AccessToken: request.AccessToken,
+			RootKey:     request.RootKey,
+		})
+		if err != nil {
+			writeDatasourceError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, summary)
+	default:
+		writeMethodNotAllowed(w, "Use GET to list datasources or POST to add one.")
+	}
+}
+
+func (s *server) localDatasourceImmichFallback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		writeMethodNotAllowed(w, "Use PUT to update local datasource Immich fallback.")
+		return
+	}
+	var request struct {
+		SourceKey string `json:"sourceKey"`
+		Enabled   bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the fallback setting request.")
+		return
+	}
+	summary, err := s.runtime.UpdateLocalDatasourceImmichFallback(request.SourceKey, request.Enabled)
+	if err != nil {
+		writeDatasourceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, summary)
+}
+
 func (s *server) primaryDatasourceCheck(w http.ResponseWriter, r *http.Request) {
 	if !requirePost(w, r, "Use POST to check the primary datasource.") {
 		return
@@ -308,6 +431,609 @@ func (s *server) primaryDatasourceCheck(w http.ResponseWriter, r *http.Request) 
 	defer cancel()
 	check := s.runtime.DatasourceCheck(ctx)
 	writeJSON(w, http.StatusOK, check)
+}
+
+func (s *server) datasourceIndexing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, "Use GET to inspect datasource indexing.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	var (
+		status runtimestate.DatasourceIndexingResponse
+		err    error
+	)
+	if r.URL.Query().Get("refresh") == "1" {
+		status, err = s.runtime.RefreshDatasourceIndexingStatus(ctx)
+	} else {
+		status, err = s.runtime.DatasourceIndexingStatus(ctx)
+	}
+	if err != nil && !errors.Is(err, catalog.ErrNoDatasourceConfigured) {
+		writeDatasourceIndexingError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *server) datasourceIndexingRun(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to run datasource indexing.") {
+		return
+	}
+	var request struct {
+		SourceKey string `json:"sourceKey"`
+		Kind      string `json:"kind"`
+		Mode      string `json:"mode"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the datasource indexing request.")
+			return
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Hour)
+	defer cancel()
+	result, err := s.runtime.RunDatasourceIndexing(ctx, runtimestate.DatasourceIndexingRunOptions{
+		SourceKey: request.SourceKey,
+		Kind:      request.Kind,
+		Mode:      request.Mode,
+	})
+	if err != nil {
+		writeLocalDatasourceScanError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) localDatasourceScan(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+		status, err := s.runtime.LocalDatasourceScanStatus(ctx)
+		if err != nil && !errors.Is(err, catalog.ErrNoDatasourceConfigured) {
+			writeLocalDatasourceScanError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, status)
+	case http.MethodPost:
+		ctx, cancel := context.WithTimeout(r.Context(), 12*time.Hour)
+		defer cancel()
+		result, err := s.runtime.RunLocalDatasourcePhase0Scans(ctx)
+		if err != nil {
+			writeLocalDatasourceScanError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	default:
+		writeMethodNotAllowed(w, "Use GET to inspect local datasource scans or POST to run reconciliation.")
+	}
+}
+
+func (s *server) localMediaRootAccept(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeMethodNotAllowed(w, "Use POST to accept the currently observed local media root identity.")
+		return
+	}
+	var request struct {
+		SourceKey        string `json:"sourceKey"`
+		RootKey          string `json:"rootKey"`
+		ObservedIdentity string `json:"observedIdentity"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the local media root acceptance request.")
+		return
+	}
+	if strings.TrimSpace(request.SourceKey) == "" || strings.TrimSpace(request.RootKey) == "" || strings.TrimSpace(request.ObservedIdentity) == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Datasource, root, and observed identity are required.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Hour)
+	defer cancel()
+	result, err := s.runtime.AcceptLocalMediaRoot(ctx, request.SourceKey, request.RootKey, request.ObservedIdentity)
+	if err != nil {
+		writeLocalMediaRootAcceptanceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) localDatasourcePhase0DiagnosticsCSV(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, "Use GET to export local datasource Phase 0 diagnostics.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	sourceKey := strings.TrimSpace(r.URL.Query().Get("sourceKey"))
+	rows, err := s.runtime.LocalPhase0DiagnosticRows(ctx, sourceKey)
+	if err != nil {
+		writeLocalDatasourceScanError(w, err)
+		return
+	}
+	filename := "timich-local-phase0-diagnostics.csv"
+	if sourceKey != "" {
+		filename = "timich-local-phase0-" + sourceKey + ".csv"
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	writer := csv.NewWriter(w)
+	if err := writer.Write(catalog.LocalPhase0DiagnosticCSVHeader()); err != nil {
+		return
+	}
+	for _, row := range rows {
+		if err := writer.Write(row.CSVRecord()); err != nil {
+			return
+		}
+	}
+	writer.Flush()
+}
+
+func (s *server) localDatasourceFailureDiagnosticsCSV(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, "Use GET to export local datasource failure diagnostics.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	sourceKey := strings.TrimSpace(r.URL.Query().Get("sourceKey"))
+	rows, err := s.runtime.LocalFailureDiagnosticRows(ctx, sourceKey)
+	if err != nil {
+		writeLocalDatasourceScanError(w, err)
+		return
+	}
+	filename := "timich-local-failure-diagnostics.csv"
+	if sourceKey != "" {
+		filename = "timich-local-failures-" + sourceKey + ".csv"
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	writer := csv.NewWriter(w)
+	if err := writer.Write(catalog.LocalFailureDiagnosticCSVHeader()); err != nil {
+		return
+	}
+	for _, row := range rows {
+		if err := writer.Write(row.CSVRecord()); err != nil {
+			return
+		}
+	}
+	writer.Flush()
+}
+
+func (s *server) localDatasourceThumbnailRepair(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to requeue failed local datasource thumbnails.") {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	result, err := s.runtime.RequeueFailedLocalDatasourceThumbnails(ctx)
+	if err != nil {
+		writeLocalDatasourceScanError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) localDatasourceMetadataRequeue(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to requeue failed local datasource metadata.") {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	result, err := s.runtime.RequeueFailedLocalDatasourceMetadata(ctx)
+	if err != nil {
+		writeLocalDatasourceScanError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) localDatasourceEmbeddingRepair(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to repair local datasource embeddings.") {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	result, err := s.runtime.RepairLocalDatasourceEmbeddings(ctx)
+	if err != nil {
+		writeSemanticIndexingError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) workers(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.runtime.WorkerRuntimeStatus())
+	case http.MethodPut:
+		var request config.WorkerRuntimeConfig
+		if r.Body != nil && r.ContentLength != 0 {
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the worker settings request.")
+				return
+			}
+		}
+		if request.HeavyTaskWorkers != nil && *request.HeavyTaskWorkers < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_request", "heavyTaskWorkers must not be negative.")
+			return
+		}
+		status, err := s.runtime.UpdateWorkerRuntime(request)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "worker_settings_update_failed", "Could not update worker settings.")
+			return
+		}
+		writeJSON(w, http.StatusOK, status)
+	default:
+		writeMethodNotAllowed(w, "Use GET or PUT for worker settings.")
+	}
+}
+
+func (s *server) systemResources(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, "Use GET for system resources.")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.runtime.SystemResourcesStatus())
+}
+
+func (s *server) catalogDedupRepair(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to repair catalog links.") {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	status, err := s.runtime.RepairCatalogDeduplication(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "catalog_dedup_repair_failed", "Could not repair catalog links.")
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *server) catalogDedupStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, "Use GET to check catalog links.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	status, err := s.runtime.CatalogDeduplicationStatus(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "catalog_dedup_status_failed", "Could not check catalog links.")
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *server) semanticModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, "Use GET to inspect semantic models.")
+		return
+	}
+	switch {
+	case r.URL.Query().Get("cached") == "1":
+		if status, ok := s.runtime.CachedSemanticModelRegistryStatus(r.Context()); ok {
+			s.scheduleSemanticModelStatusRefresh()
+			writeJSON(w, http.StatusOK, status)
+			return
+		}
+		s.scheduleSemanticModelStatusRefresh()
+		writeJSON(w, http.StatusOK, s.semanticModelLoadingStatus())
+		return
+	case r.URL.Query().Get("refresh") == "1":
+		ctx, cancel := context.WithTimeout(r.Context(), semanticModelStatusRefreshTimeout)
+		defer cancel()
+		status, err := s.refreshSemanticModelStatusSnapshot(ctx)
+		if err != nil {
+			if cached, ok := s.runtime.CachedSemanticModelRegistryStatus(r.Context()); ok {
+				writeJSON(w, http.StatusOK, cached)
+				return
+			}
+			writeJSON(w, http.StatusOK, s.semanticModelLoadingStatus())
+			return
+		}
+		writeJSON(w, http.StatusOK, status)
+		return
+	}
+
+	status, err := s.buildSemanticModelsStatus(r.Context())
+	if err == nil {
+		s.runtime.RememberSemanticModelRegistryStatus(status)
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *server) semanticModelRecommendedInstall(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to install the recommended semantic model.") {
+		return
+	}
+	s.startSemanticInstallJob(w, semanticInstallJobStart{
+		Action: "install_model",
+		Label:  "Installing recommended semantic model",
+	}, func(ctx context.Context) (any, string, error) {
+		result, err := s.installRecommendedSemanticModel(ctx)
+		if err != nil {
+			return nil, "", err
+		}
+		return result, "Installed " + result.ModelPack.Name + ".", nil
+	})
+}
+
+func (s *server) installRecommendedSemanticModel(ctx context.Context) (catalog.SemanticModelPackInstallResult, error) {
+	manifestURL := strings.TrimSpace(s.options.SemanticModelManifestURL)
+	if manifestURL == "" {
+		return catalog.SemanticModelPackInstallResult{}, errors.New("semantic model registry is not configured for this build")
+	}
+	client := s.options.SemanticModelHTTPClient
+	if client == nil {
+		client = semanticModelHTTPClient()
+	}
+	manifest, err := fetchSemanticModelManifest(ctx, client, manifestURL)
+	if err != nil {
+		return catalog.SemanticModelPackInstallResult{}, err
+	}
+	recommended, ok := semanticManifestRecommendedModel(manifest)
+	if !ok {
+		return catalog.SemanticModelPackInstallResult{}, errors.New("semantic model registry did not include a recommended model")
+	}
+	profile := semanticManifestModelProfile(recommended, manifestURL, runtimePlatform())
+	if profile.ModelPack == nil || profile.ModelPack.Artifact == nil {
+		return catalog.SemanticModelPackInstallResult{}, catalog.ErrSemanticModelPackInvalid
+	}
+	response, err := fetchSemanticModelArtifact(ctx, client, profile.ModelPack.Artifact.URL)
+	if err != nil {
+		return catalog.SemanticModelPackInstallResult{}, err
+	}
+	defer response.Body.Close()
+	return s.runtime.InstallSemanticModelPack(ctx, *profile.ModelPack, response.Body)
+}
+
+func (s *server) semanticModelInstall(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to install a semantic model.") {
+		return
+	}
+	var request semanticModelActionRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the semantic model install request.")
+			return
+		}
+	}
+	modelID := strings.TrimSpace(request.ModelID)
+	vectorSpaceID := strings.TrimSpace(request.VectorSpaceID)
+	if modelID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "modelId is required.")
+		return
+	}
+	s.startSemanticInstallJob(w, semanticInstallJobStart{
+		Action:        "install_model",
+		Label:         "Installing semantic model",
+		ModelID:       modelID,
+		VectorSpaceID: vectorSpaceID,
+	}, func(ctx context.Context) (any, string, error) {
+		result, err := s.installSemanticModelByIdentity(ctx, modelID, vectorSpaceID)
+		if err != nil {
+			return nil, "", err
+		}
+		return result, "Installed " + result.ModelPack.Name + ". Indexing will continue in Datasource Tasks.", nil
+	})
+}
+
+func (s *server) installSemanticModelByIdentity(ctx context.Context, modelID string, vectorSpaceID string) (semanticModelInstallResponse, error) {
+	manifestURL := strings.TrimSpace(s.options.SemanticModelManifestURL)
+	if manifestURL == "" {
+		return semanticModelInstallResponse{}, errors.New("semantic model registry is not configured for this build")
+	}
+	client := s.options.SemanticModelHTTPClient
+	if client == nil {
+		client = semanticModelHTTPClient()
+	}
+	manifest, err := fetchSemanticModelManifest(ctx, client, manifestURL)
+	if err != nil {
+		return semanticModelInstallResponse{}, err
+	}
+	model, ok := semanticManifestModelByIdentity(manifest, modelID, vectorSpaceID)
+	if !ok {
+		return semanticModelInstallResponse{}, catalog.ErrSemanticModelPackInvalid
+	}
+	profile := semanticManifestModelProfileWithRole(model, manifestURL, runtimePlatform(), "")
+	if profile.ModelPack == nil || profile.ModelPack.Artifact == nil {
+		return semanticModelInstallResponse{}, catalog.ErrSemanticModelPackInvalid
+	}
+	response, err := fetchSemanticModelArtifact(ctx, client, profile.ModelPack.Artifact.URL)
+	if err != nil {
+		return semanticModelInstallResponse{}, err
+	}
+	defer response.Body.Close()
+	result, err := s.runtime.InstallSemanticModelPack(ctx, *profile.ModelPack, response.Body)
+	if err != nil {
+		return semanticModelInstallResponse{}, err
+	}
+	installResponse := semanticModelInstallResponse{SemanticModelPackInstallResult: result}
+	if _, err := s.runtime.UpdateSemanticIndexing(config.SemanticIndexingConfig{
+		Enabled:   true,
+		Interval:  semanticSearchEnableDefaultInterval,
+		BatchSize: semanticSearchEnableDefaultBatch,
+	}); err != nil {
+		installResponse.WarningCode = "semantic_indexing_schedule_failed"
+		installResponse.WarningMessage = "Semantic model installed, but background indexing could not be scheduled."
+		return installResponse, nil
+	}
+	return installResponse, nil
+}
+
+func (s *server) semanticModelActivate(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to activate a semantic model.") {
+		return
+	}
+	if s.semanticInstallJobRunning() {
+		writeError(w, http.StatusConflict, "semantic_install_running", "Wait for the current semantic model install to finish before activating a model.")
+		return
+	}
+	var request semanticModelActionRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the semantic model activation request.")
+		return
+	}
+	result, err := s.runtime.ActivateSemanticModel(r.Context(), request.ModelID, request.VectorSpaceID)
+	if err != nil {
+		writeSemanticModelActivationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) semanticModelUninstall(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to uninstall a semantic model.") {
+		return
+	}
+	if s.semanticInstallJobRunning() {
+		writeError(w, http.StatusConflict, "semantic_install_running", "Wait for the current semantic model install to finish before uninstalling a model.")
+		return
+	}
+	var request semanticModelActionRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the semantic model uninstall request.")
+		return
+	}
+	result, err := s.runtime.UninstallSemanticModelPack(r.Context(), request.ModelID, request.VectorSpaceID)
+	if err != nil {
+		writeSemanticModelUninstallError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) semanticRuntimePackRecommendedInstall(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to install the recommended semantic runtime pack.") {
+		return
+	}
+	s.startSemanticInstallJob(w, semanticInstallJobStart{
+		Action: "install_runtime",
+		Label:  "Installing semantic runtime pack",
+	}, func(ctx context.Context) (any, string, error) {
+		result, err := s.installRecommendedSemanticRuntimePack(ctx)
+		if err != nil {
+			return nil, "", err
+		}
+		return result, "Installed " + result.RuntimePack.Name + ".", nil
+	})
+}
+
+func (s *server) installRecommendedSemanticRuntimePack(ctx context.Context) (catalog.SemanticRuntimePackInstallResult, error) {
+	manifestURL := strings.TrimSpace(s.options.SemanticModelManifestURL)
+	if manifestURL == "" {
+		return catalog.SemanticRuntimePackInstallResult{}, errors.New("semantic model registry is not configured for this build")
+	}
+	client := s.options.SemanticModelHTTPClient
+	if client == nil {
+		client = semanticModelHTTPClient()
+	}
+	manifest, err := fetchSemanticModelManifest(ctx, client, manifestURL)
+	if err != nil {
+		return catalog.SemanticRuntimePackInstallResult{}, err
+	}
+	recommended, ok := semanticManifestRecommendedRuntimePack(manifest)
+	if !ok {
+		return catalog.SemanticRuntimePackInstallResult{}, errors.New("semantic model registry did not include a recommended runtime pack")
+	}
+	runtimePack := semanticManifestRuntimePackStatus(recommended, manifestURL, runtimePlatform())
+	if runtimePack.Artifact == nil {
+		return catalog.SemanticRuntimePackInstallResult{}, catalog.ErrSemanticRuntimePackInvalid
+	}
+	response, err := fetchSemanticModelArtifact(ctx, client, runtimePack.Artifact.URL)
+	if err != nil {
+		return catalog.SemanticRuntimePackInstallResult{}, err
+	}
+	defer response.Body.Close()
+	return s.runtime.InstallSemanticRuntimePack(ctx, runtimePack, response.Body)
+}
+
+func (s *server) semanticIndexingRun(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to run semantic indexing.") {
+		return
+	}
+	var request struct {
+		MaxAssets int `json:"maxAssets"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the semantic indexing request.")
+			return
+		}
+	}
+	if request.MaxAssets < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "maxAssets must not be negative.")
+		return
+	}
+	ctx := r.Context()
+	cancel := func() {}
+	if request.MaxAssets > 0 {
+		ctx, cancel = context.WithTimeout(ctx, 10*time.Minute)
+	}
+	defer cancel()
+	result, err := s.runtime.RunSemanticIndexing(ctx, request.MaxAssets)
+	if err != nil {
+		writeSemanticIndexingError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if request.MaxAssets == 0 {
+		status = http.StatusAccepted
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *server) assetSearchPreview(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to run an asset search preview.") {
+		return
+	}
+	var request adminAssetSearchPreviewRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Could not parse the asset search request.")
+		return
+	}
+	searchCtx, cancelSearch := context.WithTimeout(r.Context(), assetSearchPreviewTimeout)
+	defer cancelSearch()
+	started := time.Now()
+	page, err := s.runtime.SearchAssetsForAdminPreview(searchCtx, request.AssetSearchRequest, catalog.AssetSearchOptions{
+		SemanticModelID:       request.SemanticModelID,
+		SemanticVectorSpaceID: request.SemanticVectorSpaceID,
+	})
+	if err != nil {
+		writeAdminCatalogError(w, err)
+		return
+	}
+	page.ElapsedMs = max(0, time.Since(started).Milliseconds())
+	writeJSON(w, http.StatusOK, page)
+}
+
+type adminAssetSearchPreviewRequest struct {
+	catalog.AssetSearchRequest
+	SemanticModelID       string `json:"semanticModelId,omitempty"`
+	SemanticVectorSpaceID string `json:"semanticVectorSpaceId,omitempty"`
+}
+
+func (s *server) assetPreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeMethodNotAllowed(w, "Use GET or HEAD to read asset preview content.")
+		return
+	}
+	assetID, variant, ok := parseAdminAssetRequest(r.URL.Path)
+	if !ok || variant != "preview" {
+		writeError(w, http.StatusNotFound, "route_not_found", "Unknown asset preview route.")
+		return
+	}
+	response, err := s.runtime.Preview(r, assetID)
+	if err != nil {
+		writeAdminCatalogError(w, err)
+		return
+	}
+	defer response.Body.Close()
+	copyAdminProxyResponse(w, r.Method, response)
 }
 
 func (s *server) pairingSessions(w http.ResponseWriter, r *http.Request) {
@@ -670,9 +1396,118 @@ func writeDatasourceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "datasource_url_required", "Datasource URL is required.")
 	case errors.Is(err, runtimestate.ErrDatasourceAccessTokenNeeded):
 		writeError(w, http.StatusBadRequest, "datasource_access_token_required", "Immich API key is required for the datasource.")
+	case errors.Is(err, runtimestate.ErrDatasourceAlreadyConfigured):
+		writeError(w, http.StatusConflict, "datasource_already_configured", "A datasource with the same target is already configured.")
+	case errors.Is(err, runtimestate.ErrDatasourceNotFound):
+		writeError(w, http.StatusNotFound, "datasource_not_found", "The local datasource was not found.")
+	case errors.Is(err, runtimestate.ErrUploadRootNotFound):
+		writeError(w, http.StatusBadRequest, "local_media_root_required", "Select a configured local media root.")
+	case errors.Is(err, config.ErrImmichPassthroughRequiresSingleDatasource):
+		writeError(w, http.StatusConflict, "immich_passthrough_requires_single_datasource", "Immich passthrough must be the only datasource. Convert it to Immich indexed before adding another datasource.")
 	default:
 		writeError(w, http.StatusBadRequest, "datasource_invalid", "Could not save the datasource configuration.")
 	}
+}
+
+func writeMirrorError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, catalog.ErrCatalogNotConfigured):
+		writeError(w, http.StatusBadRequest, "mirror_not_configured", "Datasource mirror is not configured.")
+	case errors.Is(err, catalog.ErrUnsupportedSearch):
+		writeError(w, http.StatusBadRequest, "mirror_mode_unsupported", "Mirror sync mode is not supported.")
+	default:
+		writeError(w, http.StatusBadGateway, "mirror_sync_failed", "Could not sync the datasource mirror.")
+	}
+}
+
+func writeLocalDatasourceScanError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, catalog.ErrNoDatasourceConfigured):
+		writeError(w, http.StatusBadRequest, "local_datasource_not_configured", "No local filesystem datasource is configured.")
+	case errors.Is(err, runtimestate.ErrDatasourceDiscoveryAlreadyRunning):
+		writeError(w, http.StatusConflict, "datasource_discovery_running", "Media discovery is already running.")
+	case errors.Is(err, runtimestate.ErrStorageWriteBlocked):
+		writeError(w, http.StatusInsufficientStorage, "storage_write_blocked", "Agent storage free space is below the write guardrail.")
+	default:
+		writeError(w, http.StatusInternalServerError, "local_datasource_scan_failed", "Could not inspect or run the local datasource scan.")
+	}
+}
+
+func writeLocalMediaRootAcceptanceError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, catalog.ErrNoDatasourceConfigured):
+		writeError(w, http.StatusBadRequest, "local_datasource_not_configured", "The local datasource or root was not found.")
+	case errors.Is(err, catalog.ErrLocalMediaRootAcceptanceStale):
+		writeError(w, http.StatusConflict, "local_root_acceptance_stale", "The local media root changed after it was inspected. Refresh status and review it again.")
+	case errors.Is(err, catalog.ErrLocalMediaRootAcceptanceNotRequired):
+		writeError(w, http.StatusConflict, "local_root_acceptance_not_required", "The local media root does not currently require acceptance.")
+	case errors.Is(err, runtimestate.ErrStorageWriteBlocked):
+		writeError(w, http.StatusInsufficientStorage, "storage_write_blocked", "Agent storage free space is below the write guardrail.")
+	default:
+		writeError(w, http.StatusConflict, "local_root_acceptance_failed", "Could not safely accept the local media root.")
+	}
+}
+
+func writeDatasourceIndexingError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, catalog.ErrNoDatasourceConfigured):
+		writeError(w, http.StatusServiceUnavailable, "datasource_not_configured", "No datasource is configured on this agent.")
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		writeError(w, http.StatusServiceUnavailable, "datasource_status_busy", "Datasource task status is still loading.")
+	default:
+		writeError(w, http.StatusServiceUnavailable, "datasource_status_unavailable", "Could not refresh datasource task status.")
+	}
+}
+
+func writeAdminCatalogError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, catalog.ErrNoDatasourceConfigured):
+		writeError(w, http.StatusServiceUnavailable, "datasource_not_configured", "No datasource is configured on this agent.")
+	case errors.Is(err, catalog.ErrInvalidSearchRequest):
+		writeError(w, http.StatusBadRequest, "invalid_search_request", "The asset search request is not valid.")
+	case errors.Is(err, catalog.ErrUnsupportedSearch):
+		writeError(w, http.StatusBadRequest, "unsupported_search", "The requested asset search is not supported by this datasource.")
+	case errors.Is(err, catalog.ErrAssetNotFound):
+		writeError(w, http.StatusNotFound, "asset_not_found", "The requested asset could not be found.")
+	case errors.Is(err, catalog.ErrMediaTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "media_too_large", "The requested media response is too large.")
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		writeError(w, http.StatusGatewayTimeout, "catalog_request_timeout", "The catalog request took too long. Try again when the datasource is less busy.")
+	default:
+		writeError(w, http.StatusBadGateway, "catalog_proxy_failed", "Could not fetch data from the configured datasource.")
+	}
+}
+
+func parseAdminAssetRequest(path string) (assetID string, variant string, ok bool) {
+	trimmedPath := strings.TrimPrefix(path, "/v1/assets/")
+	parts := strings.Split(trimmedPath, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+func copyAdminProxyResponse(w http.ResponseWriter, requestMethod string, response *catalog.UpstreamMediaResponse) {
+	for _, headerName := range []string{
+		"Content-Type",
+		"Content-Length",
+		"Cache-Control",
+		"ETag",
+		"Accept-Ranges",
+		"Content-Range",
+		"Content-Disposition",
+		"Last-Modified",
+		"Server-Timing",
+	} {
+		if value := response.Header.Get(headerName); value != "" {
+			w.Header().Set(headerName, value)
+		}
+	}
+	w.WriteHeader(response.StatusCode)
+	if requestMethod == http.MethodHead {
+		return
+	}
+	_, _ = io.Copy(w, response.Body)
 }
 
 func writeDeviceError(w http.ResponseWriter, err error) {

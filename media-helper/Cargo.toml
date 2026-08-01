@@ -1,0 +1,8 @@
+[package]
+name = "timich-media-helper"
+version = "0.1.0"
+edition = "2021"
+description = "Timich Agent local media processing helper"
+license = "MIT"
+
+[dependencies]

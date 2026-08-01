@@ -1,0 +1,1076 @@
+openapi: 3.1.0
+info:
+  title: Timich Agent Media API
+  version: 0.1.0
+  description: |
+    LAN-facing pairing, session, asset search, and media API for the current
+    Timich Agent contract. This file is the source of truth for the currently
+    implemented local and Remote Browsing media contract.
+servers:
+  - url: http://timich-agent.local:8082
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    HealthResponse:
+      type: object
+      required:
+        - service
+        - status
+      properties:
+        service:
+          type: string
+        status:
+          type: string
+    VersionResponse:
+      type: object
+      required:
+        - service
+        - version
+      properties:
+        service:
+          type: string
+        version:
+          type: string
+        commit:
+          type: string
+          description: Build commit identifier when available.
+        builtAt:
+          type: string
+          format: date-time
+          description: UTC build timestamp when available.
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+    RemoteBrowsingSummary:
+      type: object
+      required:
+        - enabled
+        - serverURL
+      properties:
+        enabled:
+          type: boolean
+        serverURL:
+          type: string
+          format: uri
+    PairingStatus:
+      type: string
+      description: Current coarse local readiness signal used by the MVP app flow.
+      enum:
+        - no datasource configured
+        - ready for first local pairing
+        - pairing session available
+        - ready for additional local pairing
+    AgentMediaInfoResponse:
+      type: object
+      required:
+        - service
+        - version
+        - agentId
+        - agentName
+        - mode
+        - deviceLimit
+        - pairedDevices
+        - hosted
+        - mediaAPI
+        - pairingStatus
+      properties:
+        service:
+          type: string
+        version:
+          type: string
+        commit:
+          type: string
+          description: Build commit identifier when available.
+        builtAt:
+          type: string
+          format: date-time
+          description: UTC build timestamp when available.
+        agentId:
+          type: string
+          description: Empty until Remote Browsing relay registration is complete.
+        agentName:
+          type: string
+        mode:
+          type: string
+        deviceLimit:
+          type: integer
+        pairedDevices:
+          type: integer
+        remoteBrowsing:
+          $ref: "#/components/schemas/RemoteBrowsingSummary"
+          description: Remote browsing relay summary. New clients should prefer this field.
+        hosted:
+          $ref: "#/components/schemas/RemoteBrowsingSummary"
+          description: Legacy compatibility alias for remoteBrowsing.
+        mediaAPI:
+          type: string
+        pairingStatus:
+          $ref: "#/components/schemas/PairingStatus"
+    PairingRedeemRequest:
+      type: object
+      required:
+        - pairingCode
+        - deviceName
+      properties:
+        pairingCode:
+          type: string
+        deviceName:
+          type: string
+    SessionRefreshRequest:
+      type: object
+      required:
+        - refreshToken
+      properties:
+        refreshToken:
+          type: string
+        agentId:
+          type: string
+          description: >
+            Optional agent identifier used by the relay server to bootstrap a
+            Remote Browsing refresh route for a LAN-paired device before any relay
+            refresh-token mapping exists. Local agents ignore this field.
+    SessionBundle:
+      type: object
+      required:
+        - accessToken
+        - refreshToken
+        - agentId
+        - agentName
+        - deviceId
+        - baseURL
+        - accessMode
+        - accessTokenExpiresAt
+      properties:
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+        agentId:
+          type: string
+        agentName:
+          type: string
+        deviceId:
+          type: string
+        baseURL:
+          type: string
+          format: uri
+        accessMode:
+          type: string
+          enum: [full, first_page]
+        accessTokenExpiresAt:
+          type: string
+          format: date-time
+        certificateFingerprint:
+          type: string
+    Asset:
+      type: object
+      required:
+        - id
+        - type
+        - filename
+        - capturedAt
+      properties:
+        id:
+          type: string
+          description: Timich-owned opaque asset identifier. Clients must not parse it.
+        type:
+          type: string
+          enum: [image, video]
+        filename:
+          type: string
+        capturedAt:
+          type: string
+          format: date-time
+        duration:
+          type: string
+          nullable: true
+    AssetSearchRequest:
+      type: object
+      required:
+        - collection
+        - page
+      properties:
+        collection:
+          $ref: "#/components/schemas/AssetCollectionRequest"
+        page:
+          $ref: "#/components/schemas/AssetSearchPageRequest"
+    AssetCollectionRequest:
+      type: object
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          enum: [timeline, search]
+        query:
+          $ref: "#/components/schemas/AssetSearchQuery"
+        filters:
+          $ref: "#/components/schemas/AssetSearchFilters"
+        sort:
+          $ref: "#/components/schemas/AssetSearchSort"
+    AssetSearchQuery:
+      type: object
+      properties:
+        text:
+          type: string
+        mode:
+          type: string
+          enum: [auto, semantic, filename]
+    AssetSearchFilters:
+      type: object
+      properties:
+        mediaTypes:
+          type: array
+          items:
+            type: string
+            enum: [image, video]
+        capturedAt:
+          $ref: "#/components/schemas/AssetSearchCapturedAtFilter"
+    AssetSearchCapturedAtFilter:
+      type: object
+      properties:
+        from:
+          type: string
+          format: date-time
+          description: Inclusive UTC lower bound.
+        to:
+          type: string
+          format: date-time
+          description: Exclusive UTC upper bound.
+    AssetSearchSort:
+      type: object
+      properties:
+        field:
+          type: string
+          enum: [capturedAt, relevance]
+        direction:
+          type: string
+          enum: [desc]
+    AssetSearchPageRequest:
+      type: object
+      required:
+        - index
+        - size
+      properties:
+        index:
+          type: integer
+          minimum: 0
+        size:
+          type: integer
+          minimum: 1
+          maximum: 200
+    AssetSearchPage:
+      type: object
+      required:
+        - collectionKey
+        - page
+        - items
+        - total
+        - totalAccuracy
+        - resolved
+      properties:
+        collectionKey:
+          type: string
+        page:
+          $ref: "#/components/schemas/AssetSearchPageRequest"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Asset"
+        total:
+          type: integer
+          minimum: 0
+        totalAccuracy:
+          type: string
+          enum: [exact, estimated, lowerBound]
+        nextPageIndex:
+          type: integer
+          minimum: 0
+          nullable: true
+        boundary:
+          $ref: "#/components/schemas/AssetSearchBoundary"
+        resolved:
+          $ref: "#/components/schemas/AssetSearchResolved"
+    AssetSearchBoundary:
+      type: object
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          enum: [pastEnd]
+    AssetSearchResolved:
+      type: object
+      required:
+        - collectionKind
+        - queryMode
+        - sort
+        - timelineLike
+      properties:
+        collectionKind:
+          type: string
+          enum: [timeline, search]
+        queryMode:
+          type: string
+          enum: [none, semantic, filename]
+        sort:
+          $ref: "#/components/schemas/AssetSearchSort"
+        timelineLike:
+          type: boolean
+    AssetSearchCapabilities:
+      type: object
+      required:
+        - queryModes
+        - filters
+        - sorts
+        - totalAccuracy
+        - page
+      properties:
+        queryModes:
+          type: array
+          items:
+            type: string
+            enum: [auto, semantic, filename]
+        filters:
+          type: object
+          required:
+            - mediaTypes
+            - capturedAt
+          properties:
+            mediaTypes:
+              type: array
+              items:
+                type: string
+                enum: [image, video]
+            capturedAt:
+              type: boolean
+        sorts:
+          type: array
+          items:
+            type: object
+            required:
+              - field
+              - directions
+            properties:
+              field:
+                type: string
+                enum: [capturedAt, relevance]
+              directions:
+                type: array
+                items:
+                  type: string
+                  enum: [desc]
+        totalAccuracy:
+          type: array
+          items:
+            type: string
+            enum: [exact, estimated, lowerBound]
+        page:
+          type: object
+          required:
+            - maxSize
+          properties:
+            maxSize:
+              type: integer
+              minimum: 1
+paths:
+  /healthz:
+    get:
+      operationId: getAgentMediaHealth
+      summary: Check timich-agent media API liveness.
+      responses:
+        "200":
+          description: Agent media API is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /version:
+    get:
+      operationId: getAgentMediaVersion
+      summary: Return the timich-agent media API version.
+      responses:
+        "200":
+          description: Current version metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionResponse"
+  /v1/info:
+    get:
+      operationId: getAgentMediaInfo
+      summary: Return the local LAN-facing agent summary.
+      responses:
+        "200":
+          description: Redacted local agent media info.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentMediaInfoResponse"
+  /v1/pairing/redeem:
+    post:
+      operationId: redeemPairingCode
+      summary: Exchange a short-lived local pairing code for an app session bundle.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PairingRedeemRequest"
+      responses:
+        "201":
+          description: Pairing redeemed and device-scoped session created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionBundle"
+        "400":
+          description: Could not parse the pairing redemption request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Pairing code not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Device limit reached.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "410":
+          description: Pairing code expired or already used.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/session/refresh:
+    post:
+      operationId: refreshAgentSession
+      summary: Rotate the device refresh token and mint a fresh access token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionRefreshRequest"
+      responses:
+        "200":
+          description: Refreshed device-scoped session bundle.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionBundle"
+        "400":
+          description: Could not parse the session refresh request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Refresh token is not valid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/assets/search/capabilities:
+    get:
+      operationId: getAssetSearchCapabilities
+      summary: Return asset search capabilities for the active datasource.
+      description: >
+        Remote Browsing clients with `first_page` access may call this route
+        before fetching the first timeline search page.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Active datasource search capabilities.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssetSearchCapabilities"
+        "401":
+          description: App session bearer token is missing or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/assets/search:
+    post:
+      operationId: searchAssets
+      summary: Return one paginated page from a browsable asset collection.
+      description: |
+        Local-primary assets are browsable only after both the current preview and
+        detail-preview renditions are ready. When the local datasource has Immich
+        fallback enabled, an active configured Immich duplicate also satisfies
+        browsability.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssetSearchRequest"
+      responses:
+        "200":
+          description: Asset search page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssetSearchPage"
+        "400":
+          description: Invalid or unsupported search request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: App session bearer token is missing or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Could not fetch data from the configured datasource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: No datasource is configured on the local agent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/assets/{assetId}:
+    get:
+      operationId: getAsset
+      summary: Return metadata for one Timich-owned opaque asset identifier.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: assetId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Asset metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Asset"
+        "401":
+          description: App session bearer token is missing or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: The asset identifier is invalid or no longer available.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Could not fetch data from the configured datasource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: No datasource is configured on the local agent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/assets/{assetId}/preview:
+    get:
+      operationId: getPreviewAsset
+      summary: Return the grid-preview image response for the configured datasource.
+      description: |
+        This route serves the lightweight image profile used for gallery grid cells.
+        The agent always applies the same preview profile for this route. It fetches
+        the upstream Immich `thumbnail` derivative and keeps it only when it is at
+        most 512px on the longest edge and at most 128KiB. Larger previews are
+        resized to a 512px maximum edge and JPEG-compressed starting at quality 58
+        so grid browsing stays within the 128KiB profile budget. Small WebP
+        thumbnails may pass through unchanged.
+        Local datasource requests are read-only: this route never generates or
+        enqueues renditions. It serves a ready local rendition, uses an enabled
+        active Immich duplicate fallback, or returns not found.
+        `first_page` Remote Browsing access may request this route only for assets
+        that appeared on asset search page 0; original media remains unavailable until
+        full Timich Reach access is granted.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: assetId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Preview asset stream.
+          headers:
+            Content-Type:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+            ETag:
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                type: string
+            Content-Range:
+              schema:
+                type: string
+            Content-Disposition:
+              schema:
+                type: string
+            Last-Modified:
+              schema:
+                type: string
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        "401":
+          description: App session bearer token is missing or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Could not fetch data from the configured datasource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: No datasource is configured on the local agent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: The requested preview asset was not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+      head:
+        operationId: headPreviewAsset
+        summary: Probe the grid-preview response headers from the configured datasource.
+        security:
+          - bearerAuth: []
+        parameters:
+          - in: path
+            name: assetId
+            required: true
+            schema:
+              type: string
+        responses:
+          "200":
+            description: Preview asset headers.
+            headers:
+              Content-Type:
+                schema:
+                  type: string
+              Content-Length:
+                schema:
+                  type: string
+              Cache-Control:
+                schema:
+                  type: string
+              ETag:
+                schema:
+                  type: string
+              Accept-Ranges:
+                schema:
+                  type: string
+              Content-Range:
+                schema:
+                  type: string
+              Content-Disposition:
+                schema:
+                  type: string
+              Last-Modified:
+                schema:
+                  type: string
+          "401":
+            description: App session bearer token is missing or invalid.
+          "404":
+            description: The requested preview asset was not found.
+          "502":
+            description: Could not fetch data from the configured datasource.
+          "503":
+            description: No datasource is configured on the local agent.
+  /v1/assets/{assetId}/detail_preview:
+    get:
+      operationId: getDetailPreviewAsset
+      summary: Return a detail-preview image response for photo viewing and preview export flows.
+      description: |
+        The agent always applies the same detail-preview profile for this route. It
+        fetches the upstream Immich `preview` thumbnail and keeps it only when it is
+        at most 2560px on the longest edge and at most 1MiB. Larger detail-preview
+        images are resized to a 2560px maximum edge and JPEG-compressed with a
+        quality ladder so remote detail viewing stays within the 1MiB profile budget.
+        Apps choose this route explicitly when they want the detail-preview profile;
+        local original viewing or export should use the `original` route instead.
+        Local datasource requests are read-only: this route never generates or
+        enqueues renditions. It serves a ready local rendition, uses an enabled
+        active Immich duplicate fallback, or returns not found.
+        `first_page` Remote Browsing access may request this route only for assets
+        that appeared on asset search page 0; original media remains unavailable until
+        full Timich Reach access is granted.
+        Remote Browsing relay applies hard body-size limits before returning media through the
+        control plane; oversized source/detail responses may fail with `413`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: assetId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Detail-preview image stream.
+          headers:
+            Content-Type:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+            ETag:
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                type: string
+            Content-Range:
+              schema:
+                type: string
+            Content-Disposition:
+              schema:
+                type: string
+            Last-Modified:
+              schema:
+                type: string
+            Server-Timing:
+              description: >
+                Optional detail-preview timing stages for diagnostics. Timings
+                may include Immich upstream headers, original read, decode,
+                transform, encode, and total durations in milliseconds.
+              schema:
+                type: string
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        "401":
+          description: App session bearer token is missing or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: The requested detail-preview asset was not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Could not fetch data from the configured datasource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: No datasource is configured on the local agent.
+        "413":
+          description: The media response is too large for Remote Browsing relay.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+      head:
+        operationId: headDetailPreviewAsset
+        summary: Probe the detail-preview response headers from the configured datasource.
+        security:
+          - bearerAuth: []
+        parameters:
+          - in: path
+            name: assetId
+            required: true
+            schema:
+              type: string
+        responses:
+          "200":
+            description: Detail-preview headers.
+            headers:
+              Content-Type:
+                schema:
+                  type: string
+              Content-Length:
+                schema:
+                  type: string
+              Cache-Control:
+                schema:
+                  type: string
+              ETag:
+                schema:
+                  type: string
+              Accept-Ranges:
+                schema:
+                  type: string
+              Content-Range:
+                schema:
+                  type: string
+              Content-Disposition:
+                schema:
+                  type: string
+              Last-Modified:
+                schema:
+                  type: string
+              Server-Timing:
+                description: Optional detail-preview timing stages for diagnostics.
+                schema:
+                  type: string
+          "401":
+            description: App session bearer token is missing or invalid.
+          "404":
+            description: The requested detail-preview asset was not found.
+          "502":
+            description: Could not fetch data from the configured datasource.
+          "503":
+            description: No datasource is configured on the local agent.
+  /v1/assets/{assetId}/original:
+    get:
+      operationId: getOriginalAsset
+      summary: Return the original asset response from the configured datasource.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: assetId
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Original asset stream.
+          headers:
+            Content-Type:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+            ETag:
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                type: string
+            Content-Range:
+              schema:
+                type: string
+            Content-Disposition:
+              schema:
+                type: string
+            Last-Modified:
+              schema:
+                type: string
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+            video/*:
+              schema:
+                type: string
+                format: binary
+        "206":
+          description: Requested byte range of the original asset.
+          headers:
+            Content-Type:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                type: string
+            Content-Range:
+              required: true
+              schema:
+                type: string
+            Content-Disposition:
+              schema:
+                type: string
+            Last-Modified:
+              schema:
+                type: string
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+            video/*:
+              schema:
+                type: string
+                format: binary
+        "401":
+          description: App session bearer token is missing or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: The requested original asset was not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "416":
+          description: The requested byte range cannot be satisfied.
+          headers:
+            Content-Range:
+              required: true
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+        "502":
+          description: Could not fetch data from the configured datasource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: No datasource is configured on the local agent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+      head:
+        operationId: headOriginalAsset
+        summary: Probe the original asset response headers from the configured datasource.
+        security:
+          - bearerAuth: []
+        parameters:
+          - in: path
+            name: assetId
+            required: true
+            schema:
+              type: string
+        responses:
+          "200":
+            description: Original asset headers.
+            headers:
+              Content-Type:
+                schema:
+                  type: string
+              Content-Length:
+                schema:
+                  type: string
+              Cache-Control:
+                schema:
+                  type: string
+              ETag:
+                schema:
+                  type: string
+              Accept-Ranges:
+                schema:
+                  type: string
+              Content-Range:
+                schema:
+                  type: string
+              Content-Disposition:
+                schema:
+                  type: string
+              Last-Modified:
+                schema:
+                  type: string
+          "206":
+            description: Requested byte-range headers for the original asset.
+            headers:
+              Content-Type:
+                schema:
+                  type: string
+              Content-Length:
+                schema:
+                  type: string
+              Cache-Control:
+                schema:
+                  type: string
+              Accept-Ranges:
+                schema:
+                  type: string
+              Content-Range:
+                required: true
+                schema:
+                  type: string
+              Content-Disposition:
+                schema:
+                  type: string
+              Last-Modified:
+                schema:
+                  type: string
+          "401":
+            description: App session bearer token is missing or invalid.
+          "404":
+            description: The requested original asset was not found.
+          "416":
+            description: The requested byte range cannot be satisfied.
+            headers:
+              Content-Range:
+                required: true
+                schema:
+                  type: string
+              Cache-Control:
+                schema:
+                  type: string
+          "502":
+            description: Could not fetch data from the configured datasource.
+          "503":
+            description: No datasource is configured on the local agent.

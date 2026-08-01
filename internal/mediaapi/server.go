@@ -33,6 +33,7 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 				"/v1/info",
 				"/v1/assets/search",
 				"/v1/assets/search/capabilities",
+				"/v1/assets/{assetID}",
 				"/v1/uploads/me",
 				"/v1/uploads/sessions",
 				"/v1/uploads/sessions/{uploadId}",
@@ -74,6 +75,9 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 		}
 		if info.BuiltAt != "" {
 			payload["builtAt"] = info.BuiltAt
+		}
+		if info.ReleaseTag != "" {
+			payload["releaseTag"] = info.ReleaseTag
 		}
 		writeJSON(w, http.StatusOK, payload)
 	})
@@ -243,7 +247,7 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 			return
 		}
 
-		page, err := runtime.SearchAssets(request)
+		page, err := runtime.SearchAssetsWithContext(r.Context(), request)
 		if err != nil {
 			writeCatalogError(w, err)
 			return
@@ -401,10 +405,6 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 		writeJSON(w, http.StatusOK, response)
 	})
 	mux.HandleFunc("/v1/assets/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			writeMethodNotAllowed(w, "Use GET or HEAD to read media content.")
-			return
-		}
 		if _, ok := authenticateRequest(w, runtime, r); !ok {
 			return
 		}
@@ -412,6 +412,23 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 		assetID, variant, ok := parseAssetRequest(r.URL.Path)
 		if !ok {
 			writeRouteNotFound(w, "Unknown media route.")
+			return
+		}
+		if variant == "" {
+			if r.Method != http.MethodGet {
+				writeMethodNotAllowed(w, "Use GET to read asset metadata.")
+				return
+			}
+			asset, err := runtime.Asset(assetID)
+			if err != nil {
+				writeCatalogError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, asset)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeMethodNotAllowed(w, "Use GET or HEAD to read media content.")
 			return
 		}
 
@@ -503,6 +520,9 @@ func bearerTokenFromHeader(value string) string {
 func parseAssetRequest(path string) (assetID string, variant string, ok bool) {
 	trimmedPath := strings.TrimPrefix(path, "/v1/assets/")
 	parts := strings.Split(trimmedPath, "/")
+	if len(parts) == 1 && parts[0] != "" {
+		return parts[0], "", true
+	}
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return "", "", false
 	}
@@ -575,7 +595,6 @@ func copyProxyResponse(w http.ResponseWriter, requestMethod string, response *ca
 	for _, headerName := range []string{
 		"Content-Type",
 		"Content-Length",
-		"Cache-Control",
 		"ETag",
 		"Accept-Ranges",
 		"Content-Range",
@@ -586,6 +605,11 @@ func copyProxyResponse(w http.ResponseWriter, requestMethod string, response *ca
 		if value := response.Header.Get(headerName); value != "" {
 			w.Header().Set(headerName, value)
 		}
+	}
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		w.Header().Set("Cache-Control", "private, max-age=3600")
+	} else {
+		w.Header().Set("Cache-Control", "private, no-store")
 	}
 	w.WriteHeader(response.StatusCode)
 	if requestMethod == http.MethodHead {
@@ -694,6 +718,10 @@ func writeCatalogError(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 		errorCode = "unsupported_search"
 		message = "The requested asset search is not supported by this datasource."
+	} else if errors.Is(err, catalog.ErrDatasourceUnavailable) {
+		status = http.StatusBadGateway
+		errorCode = "datasource_unavailable"
+		message = "The configured datasource could not serve this request."
 	} else if errors.Is(err, catalog.ErrAssetNotFound) {
 		status = http.StatusNotFound
 		errorCode = "asset_not_found"
@@ -738,6 +766,10 @@ func writeUploadError(w http.ResponseWriter, err error) {
 		status = http.StatusConflict
 		errorCode = "upload_policy_blocked"
 		message = "The upload policy no longer allows this session to continue."
+	case errors.Is(err, runtimestate.ErrStorageWriteBlocked):
+		status = http.StatusInsufficientStorage
+		errorCode = "storage_write_blocked"
+		message = "Agent storage free space is below the write guardrail."
 	case errors.Is(err, store.ErrUploadSessionNotFound):
 		status = http.StatusNotFound
 		errorCode = "upload_session_not_found"

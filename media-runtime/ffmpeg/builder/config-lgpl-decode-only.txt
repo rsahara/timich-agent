@@ -1,0 +1,58 @@
+# Timich local video poster runtime.
+#
+# Keep this profile decode-focused and LGPL-friendly:
+# - do not add --enable-gpl
+# - do not add --enable-nonfree
+# - do not add encoder libraries such as libx264/libx265
+#
+# The Agent currently invokes ffmpeg as:
+#   ffmpeg -hide_banner -loglevel error -nostdin -y -i INPUT \
+#     -map 0:v:0 -frames:v 1 -an -sn -dn poster.jpg
+
+--disable-doc
+--disable-debug
+--disable-autodetect
+--disable-network
+--disable-everything
+--disable-shared
+--enable-static
+--extra-ldflags=-static
+
+--enable-ffmpeg
+--enable-ffprobe
+
+--enable-avcodec
+--enable-avformat
+--enable-avfilter
+--enable-swscale
+--enable-swresample
+
+--enable-protocol=file
+--enable-protocol=pipe
+
+--enable-demuxer=mov
+--enable-demuxer=mjpeg
+--enable-demuxer=image2
+
+--enable-muxer=image2
+
+--enable-decoder=h264
+--enable-decoder=hevc
+--enable-decoder=mpeg4
+--enable-decoder=mjpeg
+--enable-decoder=mjpegb
+--enable-decoder=prores
+
+--enable-encoder=mjpeg
+
+--enable-parser=h264
+--enable-parser=hevc
+--enable-parser=mpeg4video
+--enable-parser=mjpeg
+
+--enable-bsf=h264_mp4toannexb
+--enable-bsf=hevc_mp4toannexb
+
+--enable-filter=format
+--enable-filter=null
+--enable-filter=scale

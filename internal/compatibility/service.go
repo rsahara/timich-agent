@@ -160,8 +160,39 @@ func (s *Service) RunDatasourceCheck(ctx context.Context) Check {
 			Name:        "datasource",
 			Status:      StatusFailed,
 			Summary:     "No datasource is configured on this agent.",
-			Remediation: "Add an Immich datasource and API key, then rerun the datasource check.",
+			Remediation: "Add an Immich or local filesystem datasource, then rerun the datasource check.",
 			Details:     details,
+		}
+	}
+
+	if len(s.cfg.Datasources) > 0 {
+		datasource := s.cfg.Datasources[0]
+		details["datasourceKind"] = datasource.Kind
+		switch strings.TrimSpace(datasource.Kind) {
+		case config.DatasourceKindLocalFiles:
+			details["rootKey"] = datasource.RootKey
+			if !localMediaRootConfigured(s.cfg.LocalMediaRoots, datasource.RootKey) {
+				return Check{
+					Name:        "datasource",
+					Status:      StatusFailed,
+					Summary:     "The local datasource root is not configured.",
+					Remediation: "Add the local media root to localMediaRoots or choose a configured root, then rerun the datasource check.",
+					Details:     details,
+				}
+			}
+			return Check{
+				Name:    "datasource",
+				Status:  StatusOK,
+				Summary: "The local datasource is configured. No upstream HTTP reachability probe is required.",
+				Details: details,
+			}
+		case config.DatasourceKindStaticDemo:
+			return Check{
+				Name:    "datasource",
+				Status:  StatusOK,
+				Summary: "The static demo datasource is configured.",
+				Details: details,
+			}
 		}
 	}
 
@@ -189,6 +220,19 @@ func (s *Service) RunDatasourceCheck(ctx context.Context) Check {
 		Summary: "The configured datasource accepted a metadata request from this agent.",
 		Details: details,
 	}
+}
+
+func localMediaRootConfigured(roots []config.LocalMediaRootConfig, rootKey string) bool {
+	rootKey = strings.TrimSpace(rootKey)
+	if rootKey == "" {
+		return false
+	}
+	for _, root := range roots {
+		if strings.TrimSpace(root.Key) == rootKey {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) runRelayServerCheck(ctx context.Context) Check {

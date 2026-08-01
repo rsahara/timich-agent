@@ -30,11 +30,6 @@ func TestRunReturnsOKWhenDatasourceAndRemoteBrowsingChecksPass(t *testing.T) {
 					"nextPage": nil,
 				},
 			})
-		case "/api/search/statistics":
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"images": 12,
-			})
 		default:
 			t.Fatalf("unexpected datasource path %s", r.URL.Path)
 		}
@@ -137,11 +132,6 @@ func TestRunWarnsWhenRelayCredentialIsNotRegisteredYet(t *testing.T) {
 					"total":    0,
 					"nextPage": nil,
 				},
-			})
-		case "/api/search/statistics":
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"images": 12,
 			})
 		default:
 			t.Fatalf("unexpected datasource path %s", r.URL.Path)

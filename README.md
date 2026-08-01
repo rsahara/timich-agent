@@ -9,6 +9,21 @@ service such as Timich Reach, without exposing Immich directly to the internet.
 Most users should install the latest release bundle. Build from source only if
 you are developing, testing, or packaging the agent yourself.
 
+## Why Timich Agent
+
+Timich Agent grew from wanting a photo system that keeps the library at home,
+makes the transition between local and remote browsing feel seamless, and can
+run continuously on modest hardware such as a NAS. Remote access should not
+require exposing the photo library directly or operating a server-class
+machine at home.
+
+NAS-friendly operation is a lasting design constraint, not a one-time release
+target. Normal browsing and connection handling should remain lightweight and
+predictable. Heavier optional work, such as thumbnail generation and semantic
+indexing, should stay observable, configurable, and pausable so it does not
+take over the host. Future Agent features are expected to preserve that
+separation.
+
 If you want MCP clients such as Codex to search and preview media through a
 paired Agent, run [`timich-mcp`](https://github.com/rsahara/timich-mcp) on the
 machine where the MCP client runs.
@@ -59,14 +74,12 @@ flowchart LR
 
 ## Install From a Release Bundle
 
-Release archives are named by version, OS, and CPU architecture. For a Linux
-NAS, mini PC, or home server, choose the archive that matches your CPU.
+Release archives are named by version, OS, and CPU architecture. The protected
+0.4 release publisher currently produces and verifies the Linux amd64 bundle.
 
 1. Open the latest release:
    <https://github.com/rsahara/timich-agent/releases/latest>
-2. Download the archive for your host, for example:
-   - `timich-agent_VERSION_linux_amd64.tar.gz`
-   - `timich-agent_VERSION_linux_arm64.tar.gz`
+2. Download `timich-agent_VERSION_linux_amd64.tar.gz`.
 3. Download the matching `.sha256` file and verify the archive:
 
 ```bash
@@ -80,10 +93,18 @@ mkdir -p timich-agent
 tar -xzf timich-agent_VERSION_linux_ARCH.tar.gz -C timich-agent --strip-components=1
 cd timich-agent
 ./timich-agent version
+./timich-semantic-helper version
 ```
 
-The bundle includes the `timich-agent` binary, Docker Compose files,
-`.env.example`, build metadata, and a bundle-local README.
+The bundle includes the `timich-agent` binary, `timich-semantic-helper`,
+`timich-media-helper`, Docker Compose files, `.env.example`, build metadata, and
+a bundle-local README.
+When platform media runtimes are included, direct native runs auto-detect the
+bundle-local `media-runtime/libvips/bin/vips` and
+`media-runtime/ffmpeg/bin/ffmpeg` executables for local filesystem thumbnails.
+Docker images built from the bundle install `ffmpeg`, `vips-tools`, and
+`vips-heif` for local filesystem thumbnail generation, including MP4/MOV poster
+frames and HEIC/HEIF inputs.
 
 ## First Run
 
@@ -103,6 +124,38 @@ On first start, the container creates `.local/agent.json` and
 or moving the installation because it contains the agent settings, identity,
 admin token, and paired-device registry.
 
+To use a host or NAS photo directory as a Local datasource, add the bundled
+read-only mount override before starting:
+
+```bash
+cp compose.local-media.example.yaml compose.local-media.yaml
+# Add this to .env and use the real host path:
+TIMICH_AGENT_LOCAL_MEDIA_HOST_PATH=/share/Photos
+
+docker compose -f compose.yaml -f compose.immich-network.yaml -f compose.local-media.yaml up -d --build
+```
+
+The override exposes the host directory as `/media/photos` inside the
+container. After the first start creates `.local/agent.json`, stop the Agent,
+add this root, and restart with the same Compose file list:
+
+```json
+{
+  "localMediaRoots": [
+    {
+      "key": "nas-photos",
+      "path": "/media/photos"
+    }
+  ]
+}
+```
+
+The Admin UI intentionally enables Local datasource creation only after the
+container-visible path is registered in `localMediaRoots` and the Agent has
+restarted. Keep `compose.local-media.yaml` in every later Compose command. Omit
+`compose.immich-network.yaml` when Immich is not running in a separate Docker
+Compose network.
+
 Open the Admin UI from the agent host or a trusted LAN device:
 
 ```text
@@ -119,12 +172,19 @@ First-run setup in the Admin UI:
 
 1. Create an admin token with at least 16 characters.
 2. Configure the primary Immich datasource with the Immich server URL and an
-   Immich API key. For the common Docker Compose layout where this Agent joins
-   Immich's `immich_default` network, use `http://immich_server:2283`.
-3. Pair an app device. Use Nearby Link when the app supports it, or create a
+   Immich API key. The default `Immich (Passthrough)` type relays Immich's
+   gallery and search results directly and must remain the only datasource.
+   Choose `Immich (Indexed)` before adding local or additional datasources. For
+   the common Docker Compose layout where this Agent joins Immich's
+   `immich_default` network, use `http://immich_server:2283`.
+3. Indexed modes only: run media discovery, then install and activate a model
+   from Semantic Models. Background vector indexing continues through
+   Datasource Tasks. Immich Passthrough uses Immich's existing search index and
+   does not require these local indexing steps.
+4. Pair an app device. Use Nearby Link when the app supports it, or create a
    manual pairing code and enter it in the Timich iOS app.
-4. Confirm the app can load the gallery on the trusted LAN.
-5. Optional: run Remote Browsing checks if you want Timich Reach access away
+5. Confirm the app can load the gallery on the trusted LAN.
+6. Optional: run Remote Browsing checks if you want Timich Reach access away
    from home.
 
 The admin API on port `8081` and media API on port `8082` are plain HTTP and
@@ -139,6 +199,8 @@ access path.
 
 Compose runs use `restart: unless-stopped`, publish the admin and media APIs on
 host ports `8081` and `8082`, and mount `.local` into the container.
+`compose.local-media.example.yaml` is the opt-in read-only host-media mount; the
+base Compose file never exposes an arbitrary host directory.
 
 Common `.env` settings:
 
@@ -152,6 +214,24 @@ TIMICH_AGENT_REMOTE_BROWSING_ENABLED=true
 TIMICH_AGENT_ADMIN_PORT=8081
 TIMICH_AGENT_MEDIA_PORT=8082
 # TIMICH_AGENT_MEDIA_PUBLISHED_ADDR=10.0.111.128:18082
+# Host path used only after copying compose.local-media.example.yaml.
+# TIMICH_AGENT_LOCAL_MEDIA_HOST_PATH=/share/Photos
+# Optional shared budget for heavy background work. Empty or omitted uses max(1, logical CPU count / 2); 0 pauses heavy work.
+# TIMICH_AGENT_HEAVY_TASK_WORKERS=1
+# Optional alternate update/model registries for testing or mirroring.
+# TIMICH_AGENT_UPDATE_MANIFEST_URL=https://example.invalid/agent-update-manifest.json
+# TIMICH_AGENT_SEMANTIC_MODEL_MANIFEST_URL=https://example.invalid/semantic-models.json
+# Optional Rust media helper path for native image/video runtime health.
+# Native bundles auto-detect timich-media-helper next to timich-agent when included.
+# TIMICH_AGENT_MEDIA_HELPER_PATH=/usr/local/bin/timich-media-helper
+# Optional libvips executable path override for local filesystem thumbnails.
+# Native bundles auto-detect media-runtime/libvips/bin/vips when included.
+# Docker images find /usr/bin/vips on PATH when this is omitted.
+# TIMICH_AGENT_VIPS_PATH=/usr/bin/vips
+# Optional ffmpeg executable path override for local MP4/MOV poster thumbnails.
+# Native bundles auto-detect media-runtime/ffmpeg/bin/ffmpeg when included.
+# Docker images find /usr/bin/ffmpeg on PATH when this is omitted.
+# TIMICH_AGENT_FFMPEG_PATH=/usr/bin/ffmpeg
 ```
 
 For Docker Compose installs, keep the agent's in-container listen addresses at
@@ -213,37 +293,112 @@ mkdir -p .local
 
 The direct binary defaults to `.local/agent.json` when no config path is passed.
 You can also set `TIMICH_AGENT_CONFIG_PATH`, `TIMICH_AGENT_DATA_DIR`, and
-`TIMICH_AGENT_UPDATE_MANIFEST_URL` before starting the process. Developers who
-need Debug-build Universal Links can set `TIMICH_AGENT_APP_LINK_BASE_URL` to
-`https://link.dev.timich.runo.jp`.
+`TIMICH_AGENT_UPDATE_MANIFEST_URL` before starting the process. Semantic-enabled
+release binaries also default to the `semantic-models.json` registry on their
+own release tag for one-click semantic search setup; set
+`TIMICH_AGENT_SEMANTIC_MODEL_MANIFEST_URL` only when you need to test or mirror
+a different registry. Developers who need Debug-build Universal Links can set
+`TIMICH_AGENT_APP_LINK_BASE_URL` to `https://link.dev.timich.runo.jp`.
+
+For local filesystem media processing, direct native runs use the bundle-local
+`timich-media-helper` executable when the release archive includes one for your
+platform. Set `TIMICH_AGENT_MEDIA_HELPER_PATH` only when the helper is not next
+to `timich-agent` or on `PATH`. Local image thumbnails and MP4/MOV poster
+thumbnails require the media helper; the Go Agent does not silently fall back to
+direct libvips, ffmpeg, or the built-in Go image renderer for those local media
+operations.
+
+The media helper uses backend tools such as bundle-local
+`media-runtime/libvips/bin/vips` and `media-runtime/ffmpeg/bin/ffmpeg` when
+present. If the bundle does not include them, install host `vips`/`ffmpeg`
+executables and set `TIMICH_AGENT_VIPS_PATH` or `TIMICH_AGENT_FFMPEG_PATH` only
+when they are not on `PATH`. HEIC/HEIF thumbnail generation needs libvips with
+HEIF support. Without libvips, local image thumbnails remain pending or failed
+until the helper can use an image backend. Without ffmpeg, local videos remain
+registered but poster thumbnails are skipped until the helper can use an ffmpeg
+backend. The Admin UI and `/status` response run a short ffmpeg preflight
+against a generated JPEG fixture and show the detected version, common video
+decoders, poster-smoke status, and last error when the helper is present but not
+usable.
 
 ## Updating the Agent
 
-Release bundles publish an `agent-update-manifest.json` asset next to the
-downloadable archives and checksums. The Admin UI uses the authenticated
-`/v1/update-check` endpoint to show whether a newer stable agent release is
-available.
+Release bundles publish an immutable, tag-qualified
+`agent-update-manifest.json` asset next to the downloadable archives and
+checksums. Stable builds fetch the manifest through GitHub's moving
+`releases/latest` alias. Prerelease builds select the newest published
+prerelease through the GitHub Releases API, verify the manifest asset's declared
+size and SHA-256 digest, and then read it. Every archive URL inside the manifest
+remains fixed to its release tag. Published binaries and manifests also carry
+that exact tag, so a later release candidate built from the same source commit
+is still detected as an update. The Admin UI uses the authenticated
+`/v1/update-check` endpoint to show whether a newer release is available in the
+build's channel.
+
+Base release bundles intentionally leave the default semantic registry URL
+unset unless a complete, validated semantic model/runtime artifact set is
+published with that release. Semantic-enabled prereleases include a
+`semantic-models.json` registry, and the Admin UI can download the recommended
+model pack and platform runtime pack from that registry when semantic search is
+enabled.
 
 For Docker Compose installs, use the same compose file list you used before.
-For the common Immich Docker path:
+For the common Immich Docker path, build that list once and include the Local
+media override whenever the installation uses it:
 
 ```bash
 # From the existing installation directory.
-docker compose -f compose.yaml -f compose.immich-network.yaml down
+compose_args=(-f compose.yaml -f compose.immich-network.yaml)
+if [ -f compose.local-media.yaml ]; then
+  compose_args+=(-f compose.local-media.yaml)
+fi
+docker compose "${compose_args[@]}" down
 
 # Download the new archive, then extract it over the existing bundle files.
-# Keep .env, compose.immich-network.yaml, and .local.
+# Keep .env, compose.immich-network.yaml, compose.local-media.yaml (when used),
+# and .local.
 # .local contains settings, the admin token, and paired devices.
 tar -xzf ../timich-agent_NEWVERSION_linux_ARCH.tar.gz --strip-components=1
 
-docker compose -f compose.yaml -f compose.immich-network.yaml up -d --build
-docker compose -f compose.yaml -f compose.immich-network.yaml logs -f
+docker compose "${compose_args[@]}" up -d --build
+docker compose "${compose_args[@]}" logs -f
 ```
 
 After the service is back online, open the Admin UI and confirm the displayed
-version. If you run the binary under systemd, launchd, or another supervisor,
-stop the service, replace the `timich-agent` binary, keep the same config/state
-directory, and start the service again.
+version.
+
+For systemd, launchd, or another native supervisor, treat the archive as one
+versioned unit. The documented Direct Binary first run creates configuration and
+state under the bundle-relative `.local` directory. Before switching to another
+versioned directory for the first time, stop the service and copy that complete
+directory to a stable private location outside every bundle:
+
+```bash
+# Run from the old, stopped bundle directory. Choose a host-appropriate path.
+state_root=/var/lib/timich-agent
+install -d -m 0700 "$state_root"
+cp -a .local/. "$state_root/"
+
+# Configure the supervisor with these absolute paths before changing bundles:
+# timich-agent serve \
+#   -config /var/lib/timich-agent/agent.json \
+#   -data-dir /var/lib/timich-agent/state
+```
+
+The equivalent environment variables are `TIMICH_AGENT_CONFIG_PATH` and
+`TIMICH_AGENT_DATA_DIR`. Keep the original `.local` copy until the updated
+service is verified; do not point the old and new service processes at the
+shared state simultaneously.
+
+After configuration and state use stable absolute paths, extract the complete
+new bundle into a new directory. Atomically repoint the service working
+directory or a `current` symlink to the new bundle, then restart and verify
+`timich-agent version-json`, `timich-semantic-helper version`,
+`timich-media-helper health --json`, and the Admin runtime status. Do not replace
+only `timich-agent`: the media helper, semantic helper, semantic runtime, and
+platform media runtimes are a coordinated release set. Keep the previous bundle
+directory until the new service passes those checks so rollback does not mix
+versions.
 
 ## Admin UI and APIs
 
@@ -252,12 +407,40 @@ The admin surface serves a small web management UI at
 every route except `/healthz`, `/readyz`, `/version`, and the first-run
 admin-token setup route.
 
-The Admin UI currently covers:
+The Admin UI groups setup and operations into Overview, Datasources, Tasks,
+Search, Devices, and System tabs. It currently covers:
 
 - agent status and remote browsing readiness
 - first-run admin-token setup
 - agent update checks
-- primary Immich datasource editing and reachability checks
+- datasource listing and adding Immich passthrough, Immich indexed, or
+  configured local filesystem datasources
+- datasource checks: Immich reachability and local filesystem configuration
+- datasource catalog status for Immich and local filesystem datasources
+- datasource task progress by phase, including media discovery, metadata,
+  thumbnail, embedding, and search-index work; normal UI polling reads the last
+  task snapshot immediately, while `?refresh=1` requests a live recompute. Task
+  snapshots are display-oriented: expensive or partially busy status reads keep
+  the most recent usable values, and process-local running state is not restored
+  from persisted snapshots after an agent restart. Until completion totals are
+  available, the Tasks view omits `done` instead of presenting an unknown count
+  as zero.
+- manual reconciliation, plus failed metadata and thumbnail requeue for
+  local filesystem datasources. Media discovery is single-flight; the UI disables
+  the action while a run is active. Requeue actions move failed work back to the
+  repair-priority queue without processing it in the request, so they also work
+  while heavyweight workers are paused. When the Agent restarts, metadata or
+  thumbnail jobs left `running` by the previous process are returned to their
+  queues before background scheduling begins. Changing the heavyweight worker
+  count affects only newly admitted bounded assignments: work that is already
+  running completes normally under the worker budget it started with. Admin
+  keeps every in-flight metadata, thumbnail, content-verification, embedding,
+  or search-index phase displayed as `running`; only queued work with no active assignment is
+  displayed as `paused` when the configured count is zero.
+- background worker budget tuning for metadata, thumbnails, video previews,
+  content verification, and semantic embeddings
+- semantic model listing with installed, active, recommended, indexing, and
+  deprecated state tags plus model install, activate, and uninstall actions
 - Nearby Link Code approval
 - pairing-code creation
 - paired-device listing and revoke
@@ -266,10 +449,64 @@ The Admin UI currently covers:
 - remote browsing checks
 - agent restart
 
-Datasource editing is intentionally limited to the first datasource because the
-current media proxy uses only the first configured datasource. Static demo
-datasources are configured through the JSON config file instead of the current
-web form.
+Local filesystem maintenance uses three complementary scans:
+
+- **Quick discovery** runs every five minutes by default. It traverses the
+  directory tree but inspects files only in new directories or directories
+  whose mtime changed, keeping routine NAS load low.
+- **Reconciliation** runs once daily at `04:00` in the configured Agent
+  timezone, and can also be started from Admin. It inspects every supported
+  path and is the correctness boundary for additions, changes, moves, and
+  removals that quick discovery can miss. Startup performs reconciliation only
+  when the current daily occurrence has not completed.
+- **Content verification** is offered once daily at its configured clock and
+  re-hashes active file locations whose successful verification is oldest. It
+  starts only when a heavyweight worker is idle at that time; otherwise that
+  day's occurrence is recorded as skipped instead of accumulating queued work.
+  Once admitted, it does not start another file while newly discovered metadata
+  is settling, and it verifies one physical location per scheduler slice before
+  yielding so runnable metadata, thumbnail, or semantic work can run first.
+  Slices rotate fairly across Local datasources. Metadata, thumbnail, and
+  content-verification system errors are retried after short phase-specific
+  delays instead of being submitted in a tight loop; other healthy phases can
+  continue during that delay.
+  The per-datasource window lasts 30 minutes by default, including restarts,
+  which spreads full-library verification across days instead of creating a
+  large NAS load spike. Reaching the end of the window prevents the next file
+  from starting but allows the file already being read to finish cleanly. A
+  later daily occurrence never replaces a window that is still running; the
+  schedule is reconsidered when that window finishes, without resetting its
+  recorded progress. Initial metadata registration also records a successful
+  content verification; ordinary reconciliation does not refresh that
+  timestamp. Explicitly accepting a changed Local root ends any verification
+  window for the previous root and records that occurrence as skipped.
+  Set `contentVerificationDuration` to `"0"` to disable this task.
+
+Configure the quick interval, daily reconciliation clock, content-verification
+clock and duration, and two-minute file settling window under the datasource `scan`
+settings. If a supported file cannot be statted during quick discovery, its
+current catalog visibility is preserved and its parent directory is retried by
+the next quick discovery.
+
+New or changed files found by directory scans remain `settling` until their
+size/mtime signature stays unchanged for the configured window. Metadata and
+thumbnail workers return a source to settling when it changes during
+processing, and metadata registration rechecks the latest Location deadline
+before publishing. Verified Agent uploads are queued directly for metadata
+immediately after atomic commit and do not wait for settling or an upload-idle
+scan.
+The Admin Tasks view reports quick discovery, reconciliation, and content
+verification separately. Scheduling timestamps are stored with each root;
+discovery diagnostics retain the most recent 64 runs per root and discovery
+mode.
+
+Existing datasources are shown read-only in the Admin UI. Editing and deletion
+are intentionally deferred; add a new Immich datasource or select an existing
+configured local media root when adding a local filesystem datasource. Static
+demo datasources are configured through the JSON config file instead of the
+current web form. When `Immich (Passthrough)` is configured, the add form is
+disabled until that datasource is changed to `immich_indexed` through the
+config file or primary datasource API.
 
 The restart action gracefully stops the running process. It is useful when the
 agent is supervised by Docker Compose, a NAS service, launchd, or systemd. When
@@ -284,9 +521,38 @@ Admin API:
 - `GET http://AGENT_LAN_HOST:8081/status`
 - `GET http://AGENT_LAN_HOST:8081/config`
 - `POST http://AGENT_LAN_HOST:8081/setup-admin-token`
+- `GET http://AGENT_LAN_HOST:8081/v1/datasources`
+- `POST http://AGENT_LAN_HOST:8081/v1/datasources`
 - `GET http://AGENT_LAN_HOST:8081/v1/datasource/primary`
 - `PUT http://AGENT_LAN_HOST:8081/v1/datasource/primary`
 - `POST http://AGENT_LAN_HOST:8081/v1/datasource/primary/check`
+- `GET http://AGENT_LAN_HOST:8081/v1/datasources/indexing`
+- `GET http://AGENT_LAN_HOST:8081/v1/datasources/indexing?refresh=1`
+- `POST http://AGENT_LAN_HOST:8081/v1/datasources/indexing/run`
+- `GET http://AGENT_LAN_HOST:8081/v1/catalog/dedup/status`
+- `POST http://AGENT_LAN_HOST:8081/v1/catalog/dedup/repair`
+- `GET http://AGENT_LAN_HOST:8081/v1/datasources/local/scan`
+- `POST http://AGENT_LAN_HOST:8081/v1/datasources/local/scan`
+- `GET http://AGENT_LAN_HOST:8081/v1/datasources/local/phase0-diagnostics.csv`
+- `GET http://AGENT_LAN_HOST:8081/v1/datasources/local/failure-diagnostics.csv`
+- `POST http://AGENT_LAN_HOST:8081/v1/datasources/local/metadata/repair`
+- `POST http://AGENT_LAN_HOST:8081/v1/datasources/local/thumbnails/repair`
+- `POST http://AGENT_LAN_HOST:8081/v1/datasources/local/embeddings/repair`
+- `GET http://AGENT_LAN_HOST:8081/v1/workers`
+- `PUT http://AGENT_LAN_HOST:8081/v1/workers`
+  - `heavyTaskWorkers: null` or omitted uses `max(1, logical CPU count / 2)` background workers.
+  - `heavyTaskWorkers: 0` pauses heavyweight background metadata, thumbnail, video preview, content-verification, and semantic embedding work while keeping discovery/status checks available.
+  - Positive values set a fixed background worker limit.
+- `GET http://AGENT_LAN_HOST:8081/v1/system/resources`
+- `GET http://AGENT_LAN_HOST:8081/v1/semantic-models`
+- `GET http://AGENT_LAN_HOST:8081/v1/semantic-install-job`
+- `POST http://AGENT_LAN_HOST:8081/v1/semantic-models/install`
+- `POST http://AGENT_LAN_HOST:8081/v1/semantic-models/activate`
+- `POST http://AGENT_LAN_HOST:8081/v1/semantic-models/uninstall`
+- `POST http://AGENT_LAN_HOST:8081/v1/semantic-models/recommended/install`
+- `POST http://AGENT_LAN_HOST:8081/v1/semantic-runtime-packs/recommended/install`
+- `POST http://AGENT_LAN_HOST:8081/v1/semantic-models/search/enable`
+- `POST http://AGENT_LAN_HOST:8081/v1/semantic-indexing/run`
 - `GET http://AGENT_LAN_HOST:8081/v1/nearby-links`
 - `POST http://AGENT_LAN_HOST:8081/v1/nearby-links/approve`
 - `POST http://AGENT_LAN_HOST:8081/v1/nearby-links/{linkID}/deny`
@@ -301,6 +567,11 @@ Admin API:
 - `GET http://AGENT_LAN_HOST:8081/v1/devices/{deviceID}/upload-policy`
 - `PUT http://AGENT_LAN_HOST:8081/v1/devices/{deviceID}/upload-policy`
 - `POST http://AGENT_LAN_HOST:8081/v1/devices/{deviceID}/upload-reset`
+
+Semantic model and runtime-pack install requests return `202 Accepted` and run
+as Agent-side background jobs. Poll `GET /v1/semantic-install-job` for the
+current or latest install state; the Admin UI does this automatically so a page
+navigation does not cancel the download/checksum/install work.
 
 Media API:
 
@@ -323,6 +594,10 @@ Media API:
 - `GET http://AGENT_LAN_HOST:8082/v1/assets/{assetID}/preview`
 - `GET http://AGENT_LAN_HOST:8082/v1/assets/{assetID}/detail_preview`
 - `GET http://AGENT_LAN_HOST:8082/v1/assets/{assetID}/original`
+
+`/v1/info` is intentionally a minimal unauthenticated compatibility response;
+datasource names, source keys, upstream URLs, and token state are available only
+through the authenticated Admin API.
 
 When you call the admin API from the agent host, export the saved admin token:
 
@@ -419,9 +694,94 @@ A starter config created by `timich-agent init` looks like this:
     "enabled": false,
     "serverURL": "https://timich.runo.jp"
   },
+  "mediaRuntime": {
+    "helperPath": "",
+    "vipsPath": "",
+    "ffmpegPath": ""
+  },
   "datasources": []
 }
 ```
+
+### Datasource kinds
+
+The datasource `kind` selects both the connector and the catalog behavior:
+
+| `kind` | Behavior | Allowed topology |
+| --- | --- | --- |
+| `immich` | Passthrough: gallery, filters, filename search, and semantic search are requested from Immich at query time. Timich still signs asset IDs and proxies media. | Exactly one datasource total. This is the default Immich choice in the Admin UI. |
+| `immich_indexed` | Indexed: Immich metadata is synchronized into the Timich-owned catalog and can use Timich semantic indexing. | Can be combined with indexed Immich and local filesystem datasources. |
+| `local_filesystem` | Indexed local filesystem library. | Can be combined with other indexed datasources. |
+
+Use passthrough when Immich should remain the source of truth for gallery and
+search while Timich Reach provides remote access. A minimal passthrough config
+with an independent device-upload destination looks like this:
+
+```json
+{
+  "datasources": [
+    {
+      "name": "Home Immich",
+      "kind": "immich",
+      "url": "http://immich_server:2283",
+      "accessToken": "IMMICH_API_KEY"
+    }
+  ],
+  "uploadRoots": [
+    {
+      "key": "camera-uploads",
+      "path": "/mnt/timich-upload"
+    }
+  ]
+}
+```
+
+`uploadRoots` and per-device upload policy are independent of datasource
+catalog behavior, so uploads remain available with `kind: "immich"`. An upload
+root does not count as a second datasource.
+
+Use indexed kinds when combining Immich with a NAS or another library:
+
+```json
+{
+  "localMediaRoots": [
+    {
+      "key": "nas-photos",
+      "path": "/media/photos"
+    }
+  ],
+  "datasources": [
+    {
+      "name": "Home Immich",
+      "kind": "immich_indexed",
+      "url": "http://immich_server:2283",
+      "accessToken": "IMMICH_API_KEY",
+      "indexing": {
+        "phase0SyncInterval": "15m",
+        "dailyFullSweepWindow": "02:00"
+      }
+    },
+    {
+      "name": "NAS Photos",
+      "kind": "local_filesystem",
+      "rootKey": "nas-photos",
+      "scan": {
+        "quickScanInterval": "5m",
+        "reconciliationTime": "04:00",
+        "contentVerificationTime": "04:00",
+        "contentVerificationDuration": "30m",
+        "settlingDuration": "2m"
+      }
+    }
+  ]
+}
+```
+
+The optional `indexing` object is valid only for `immich_indexed`. If an
+`immich` passthrough datasource appears with any other datasource, config load
+fails before the Agent starts with an actionable error. Admin API mutations
+return HTTP `409` with
+`immich_passthrough_requires_single_datasource` for the same conflict.
 
 Optional device-upload storage settings can be added when device uploads are
 enabled:
@@ -450,6 +810,19 @@ The Agent keeps uploaded-asset ledger rows so media is not re-uploaded after
 destination files are deleted, but it runs daily maintenance to prune old upload
 sessions, audit rows, stale temporary files, and the SQLite WAL.
 
+At startup, the Agent creates `tmp` under `dataDir` and uses it for SQLite and
+process temporary files when `SQLITE_TMPDIR` or `TMPDIR` are not already set.
+This avoids filling small NAS `/tmp` tmpfs mounts during large catalog or
+semantic-index operations.
+
+`mediaRuntime.helperPath`, `mediaRuntime.vipsPath`, and
+`mediaRuntime.ffmpegPath` are optional. Leave them empty for Docker Compose
+bundles because the image includes `timich-media-helper` and installs media
+backend tools on `PATH`. Native bundles auto-detect `timich-media-helper`,
+`media-runtime/libvips/bin/vips`, and `media-runtime/ffmpeg/bin/ffmpeg` when
+present. Set absolute paths only when you want to override the bundled/PATH
+helpers.
+
 For direct binary runs, set `adminListenAddress` to `127.0.0.1:8081` if you
 want to opt out of LAN admin access and use only the local browser,
 authenticated admin API, or SSH tunnel workflows. Set `mediaListenAddress` to
@@ -462,10 +835,17 @@ QR/link pairing is generated per pairing code from the Admin UI or Admin API.
 Choose or enter the Media API URL that the app device can reach on the trusted
 LAN. Manual pairing-code creation does not depend on a selected URL.
 
-The first datasource-backed local flow proxies the first configured Immich
-datasource for asset search pages plus `preview`, `detail_preview`, and
-`original` media delivery. A `static_demo` datasource can also serve a generated
-sample bundle from local disk for repeatable local testing.
+An `immich_indexed` datasource is synchronized into the Agent-owned SQLite
+catalog and participates in the same gallery, filename, filter, and semantic
+search path as local filesystem datasources. Indexed search does not call Immich
+search APIs at request time. An `immich` datasource instead relays supported
+search requests directly to Immich and does not populate or schedule the local
+catalog. Both kinds use Immich for `preview`, `detail_preview`, and `original`
+bytes through the Agent media proxy. On the first start after adding or
+upgrading an indexed Immich datasource, gallery/search results can be empty or
+partial until its initial full sync completes. A `static_demo` datasource can
+also serve a generated sample bundle from local disk for repeatable local
+testing.
 
 ## Build From Source
 
@@ -474,6 +854,11 @@ From the directory containing this README and the agent Makefile:
 ```bash
 make test
 make build
+make build-helper
+make build-media-helper
+make test-media-helper
+make media-helper-smoke
+make media-libvips-runtime-pack
 make init
 make run
 make docker-build
@@ -487,6 +872,168 @@ Source builds use local development paths by default:
 - state: `.local/state/agent-state.json`
 - admin API: `0.0.0.0:8081`
 - media API: `0.0.0.0:8082`
+
+`timich-semantic-helper` is the local semantic model runtime helper used to
+inspect installed model-pack runtime layouts and execute image/text embedding
+commands. Release bundles and Docker images auto-detect the bundled helper when
+no explicit helper path is configured.
+
+`timich-media-helper` is the Rust local media processing boundary for image,
+video, and media inspection work. The current helper exposes `health --json`,
+backend discovery, image rendition generation, and the MP4/MOV poster extraction
+command used by local thumbnail generation. Build it with
+`make build-media-helper`, run Rust tests with `make test-media-helper`, and run
+`make media-helper-smoke` to verify the built helper can render an image through
+the configured libvips backend. Set `MEDIA_HELPER_SMOKE_VIDEO=/path/to/video.mp4`
+to include poster extraction in the smoke test.
+
+Linux native release bundles build `timich-media-helper` with static Rust
+runtime linking by default so the helper can run on NAS hosts without a matching
+musl loader. For a standalone Linux/QNAP helper build, use:
+
+```bash
+MEDIA_HELPER_RUSTFLAGS="-C target-feature=+crt-static" make build-media-helper
+```
+
+Release builders without a local Rust toolchain can build the Linux helper
+through Docker:
+
+```bash
+DIST_OS=linux DIST_ARCH=amd64 MEDIA_HELPER_DOCKER=1 make build-media-helper
+```
+
+Native linux amd64 bundles can include a bundled libvips runtime for local image
+thumbnail generation:
+
+```bash
+make media-libvips-runtime-pack
+make media-libvips-runtime-verify
+```
+
+The current libvips runtime builder assembles Alpine `vips-tools` and
+`vips-heif` with a wrapper that runs through a bundled musl loader. It has been
+smoke-tested on QNAP native for PNG-to-JPEG thumbnail rendering and HEIF loader
+availability, but release publication still needs final license/SBOM review for
+the Alpine package dependency set.
+
+For ONNX SigLIP 2 model packs, the Agent can manage a long-lived local runtime
+server. Native bundles auto-detect `semantic-runtime/siglip2-onnx/server.py`
+next to `timich-agent`; if a bundle-local `.venv` or `venv` Python is present
+under that directory it is used, otherwise the Agent falls back to `python3` on
+`PATH`. Override this with `semanticRuntime.onnxRuntime.serverPath`,
+`semanticRuntime.onnxRuntime.pythonPath`, or the matching
+`TIMICH_AGENT_SEMANTIC_ONNX_*` environment variables. The managed server exports
+model-specific helper URLs internally, so installed model migration can keep two
+runtime layouts available at the same time.
+
+When a runtime-pack Python includes its own standard library, the Agent sets
+`PYTHONHOME` and isolates user site packages before starting `server.py`.
+Ordinary `python -m venv` environments are still supported, but they are not
+treated as fully bundled Python runtimes unless the standard library is present
+inside the environment.
+
+Release registries can also publish platform-specific semantic runtime packs.
+The Admin UI installs the recommended pack into Agent-managed state, verifies
+its checksum and size, and then prefers that pack's `server.py` and bundled
+Python when the ONNX runtime config was auto-detected. This keeps the base Agent
+binary small while native/QNAP bundles can still offer a one-click path for the
+Python and ONNX Runtime dependencies.
+
+Runtime packs require a non-empty version and a bundled executable
+`pythonPath`. A model or runtime replacement is exposed only after the Agent has
+run exact text and image embedding probes; runtime replacements are checked
+against every installed compatible model layout.
+
+Release builders can create the current-platform runtime pack with:
+
+```bash
+make semantic-runtime-pack
+```
+
+The target writes a zip artifact, `.sha256`, SPDX JSON SBOM, metadata JSON, and
+an optional `.sig` when `SEMANTIC_RUNTIME_PACK_SIGNING_KEY` points to an OpenSSL
+RSA signing key. Set `SEMANTIC_RUNTIME_PACK_BASE_URL` to also emit a registry
+fragment that can be merged into the semantic model manifest. For release-grade
+native/QNAP artifacts, pass a target-platform relocatable Python runtime with
+`SEMANTIC_RUNTIME_PACK_PYTHON_RUNTIME_ROOT`; otherwise the builder creates a
+development venv from the host Python.
+
+Validate the artifact before publishing:
+
+```bash
+make semantic-runtime-pack-validate
+```
+
+For release candidates, include the signing public key and require the strict
+runtime checks:
+
+```bash
+make semantic-runtime-pack-validate \
+  SEMANTIC_RUNTIME_PACK_PUBLIC_KEY=/path/to/release-signing-public-key.pem \
+  SEMANTIC_RUNTIME_PACK_REQUIRE_SIGNATURE=1 \
+  SEMANTIC_RUNTIME_PACK_REQUIRE_BUNDLED_PYTHON=1 \
+  SEMANTIC_RUNTIME_PACK_SMOKE_IMPORT=1
+```
+
+Host-created development venv packs are only smoke artifacts unless that strict
+validation passes on the target platform. The pack builder can carry the macOS
+framework Python helper app and standard library for local darwin smoke packs,
+but native/QNAP release packs should still use a release-owned relocatable Python
+runtime root when possible. QNAP-style older Linux targets should be built from
+a manylinux2014-compatible environment with
+`SEMANTIC_RUNTIME_PACK_REQUIREMENTS=semantic-runtime/siglip2-onnx/requirements-legacy-linux.txt`;
+newer default Linux wheels can validate inside a modern container while still
+failing native startup on older NAS glibc/OpenSSL libraries.
+
+Create the recommended SigLIP 2 ONNX model pack from release-owned exported
+ONNX files and processor/tokenizer files with:
+
+```bash
+make semantic-model-pack \
+  SEMANTIC_MODEL_PACK_IMAGE_MODEL=/path/to/image.onnx \
+  SEMANTIC_MODEL_PACK_TEXT_MODEL=/path/to/text.onnx \
+  SEMANTIC_MODEL_PACK_PROCESSOR_DIR=/path/to/processor \
+  SEMANTIC_MODEL_PACK_BASE_URL=https://github.com/OWNER/REPO/releases/download/TAG
+```
+
+The target writes the model pack zip, `.sha256`, metadata JSON, SPDX JSON SBOM,
+registry fragment, and an optional `.sig` when
+`SEMANTIC_MODEL_PACK_SIGNING_KEY` points to an OpenSSL RSA signing key. Validate
+the model artifact before merging it into the public registry:
+
+```bash
+make semantic-model-pack-validate
+```
+
+For signed release candidates, verify with the public key:
+
+```bash
+make semantic-model-pack-validate \
+  SEMANTIC_MODEL_PACK_PUBLIC_KEY=/path/to/release-signing-public-key.pem \
+  SEMANTIC_MODEL_PACK_REQUIRE_SIGNATURE=1
+```
+
+After building a model pack and any platform runtime packs, merge their
+`timich-semantic-models` fragments into the release registry:
+
+```bash
+make semantic-model-registry
+```
+
+The target writes `dist/semantic-models.json`. Validate the merged registry
+against local model/runtime artifacts before publishing:
+
+```bash
+make semantic-release-validate
+```
+
+The validator uses the same manifest contract as the Agent consumer and, for a
+release bundle, requires installable recommended model and runtime artifacts for
+the target platform. It also requires registry, metadata, and extracted model
+layout identity to agree on vector space, embedding dimension, input kind, and
+runtime; the release linux-amd64 runtime must contain a structurally complete
+bundled Python. Public release publication is maintained by the project; source
+builds are for local validation and do not publish or modify releases.
 
 Stop a compose run with:
 
@@ -594,7 +1141,8 @@ The current check covers:
 
 - remote browsing and relay connection config presence
 - relay signing-key state and registration status
-- datasource metadata reachability
+- datasource status: Immich metadata reachability or local filesystem datasource
+  configuration
 - relay server `/version` reachability
 - gRPC control-plane hello/ack round trip once relay credentials are registered
 
