@@ -108,7 +108,7 @@ func (s *CatalogStore) RebuildCatalogCanonicalAssets(ctx context.Context) (Catal
 		_ = tx.Rollback()
 		return CatalogDeduplicationStatus{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.commitCatalogAssetChanges(ctx, tx, true); err != nil {
 		return CatalogDeduplicationStatus{}, fmt.Errorf("commit catalog canonical rebuild: %w", err)
 	}
 	return s.CatalogDeduplicationStatus(ctx)
@@ -463,6 +463,10 @@ func (s *CatalogStore) canonicalAssetsForScoredSources(ctx context.Context, scor
 func (s *CatalogStore) canonicalAssetsForScoredSourceChunk(ctx context.Context, scored []semanticScoredAsset, includeSemanticScores bool, scoreOffset int, seen map[string]struct{}, readiness catalogGalleryReadiness) ([]Asset, error) {
 	var builder strings.Builder
 	args := make([]any, 0, len(scored)*4)
+	canonicalColumn := func(name string) string {
+		return "c." + name
+	}
+	sourceKeyColumn, upstreamAssetIDColumn, sourceArgs := catalogGallerySourceProjection(canonicalColumn, readiness)
 	builder.WriteString(`WITH requested(source_key, upstream_asset_id, score_order, semantic_score) AS (VALUES `)
 	for index, candidate := range scored {
 		if index > 0 {
@@ -473,7 +477,7 @@ func (s *CatalogStore) canonicalAssetsForScoredSourceChunk(ctx context.Context, 
 	}
 	builder.WriteString(`)
 		SELECT r.score_order, r.semantic_score,
-			c.canonical_asset_id, c.primary_source_key, c.primary_upstream_asset_id,
+			c.canonical_asset_id, ` + sourceKeyColumn + `, ` + upstreamAssetIDColumn + `,
 			c.media_type, c.filename, c.captured_at, c.duration
 		FROM requested r
 		JOIN catalog_assets a
@@ -482,9 +486,8 @@ func (s *CatalogStore) canonicalAssetsForScoredSourceChunk(ctx context.Context, 
 			ON c.canonical_asset_id = a.canonical_asset_id
 		WHERE c.visibility_status = 'active'
 			AND `)
-	readinessClause, readinessArgs := catalogGalleryReadinessClause(func(name string) string {
-		return "c." + name
-	}, readiness)
+	args = append(args, sourceArgs...)
+	readinessClause, readinessArgs := catalogGalleryReadinessClause(canonicalColumn, readiness)
 	builder.WriteString(readinessClause)
 	builder.WriteString(`
 		ORDER BY r.score_order ASC`)

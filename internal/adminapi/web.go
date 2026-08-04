@@ -242,6 +242,8 @@ const dashboardHTML = `<!doctype html>
     details.disclosure > form { padding: 12px; }
     .muted { color: var(--muted); }
     .section-note { margin: -4px 0 12px; max-width: 760px; color: var(--muted); }
+    .worker-note { display: grid; gap: 6px; }
+    .worker-note p { margin: 0; }
     .status-ok { color: var(--ok); }
     .status-warn { color: var(--warn); }
     .status-running { color: var(--running); }
@@ -417,7 +419,11 @@ const dashboardHTML = `<!doctype html>
       </section>
       <section data-tab-panel="tasks">
         <h2>Background Workers</h2>
-        <p class="section-note">Limit concurrent metadata, thumbnail, video preview, content verification, semantic embedding, and search-index publish jobs. Content verification, semantic embedding, and publish use at most 1 worker; remaining workers can continue metadata or thumbnail work. Media discovery and lightweight status checks run outside this limit. After pausing, an in-flight task remains running until it has actually stopped; queued work then shows paused.</p>
+        <div class="section-note worker-note">
+          <p>Limits concurrent metadata, thumbnail, video preview, content verification, semantic embedding, and search-index publishing jobs.</p>
+          <p>Content verification, semantic embedding, and publishing use at most 1 worker; remaining workers can continue metadata or thumbnail work. Media discovery and status checks run outside this limit.</p>
+          <p>After pausing, in-flight work continues until its current batch completes. Queued work then shows paused.</p>
+        </div>
         <form class="stack" id="workerSettingsForm">
           <label>Max workers
             <select id="heavyTaskWorkersMode" name="heavyTaskWorkersMode"></select>
@@ -1017,6 +1023,10 @@ const dashboardHTML = `<!doctype html>
       return kind === 'immich' || kind === 'immich_indexed';
     }
 
+    function isImmichPassthroughDatasource(datasource) {
+      return datasource?.kind === 'immich' && !Boolean(datasource?.indexingEnabled);
+    }
+
     function datasourceEndpoint(datasource) {
       if (datasource.kind === 'local_filesystem') {
         return datasource.rootKey || '';
@@ -1130,7 +1140,13 @@ const dashboardHTML = `<!doctype html>
 
     function datasourceCoverageMetric(datasource, key) {
       const metric = datasource?.coverage ? datasource.coverage[key] : null;
-      if (!metric) return { status: 'updating', count: 0, totalCount: 0 };
+      if (!metric) {
+        return {
+          status: isImmichPassthroughDatasource(datasource) ? 'immich-managed' : 'updating',
+          count: 0,
+          totalCount: 0
+        };
+      }
       return {
         status: metric.status || 'ready',
         count: Number(metric.count || 0),
@@ -1147,6 +1163,7 @@ const dashboardHTML = `<!doctype html>
     }
 
     function datasourceCoverageText(metric, emptyText = 'updating') {
+      if (metric.status === 'immich-managed') return 'Immich-managed';
       if (metric.status === 'unavailable') return 'unavailable';
       if (metric.status === 'updating') return emptyText;
       return formatCount(metric.count || 0);

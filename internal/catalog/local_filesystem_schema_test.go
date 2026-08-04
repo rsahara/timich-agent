@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,9 @@ func TestLocalFilesystemCatalogSchemaCreatesCoreTables(t *testing.T) {
 		t.Fatalf("application id = %#x, want %#x", applicationID, catalogApplicationID)
 	}
 	for _, table := range []string{
+		"catalog_canonical_state",
+		"catalog_gallery_timeline_state",
+		"catalog_gallery_timeline",
 		"local_assets",
 		"local_asset_locations",
 		"local_renditions",
@@ -125,6 +129,34 @@ func TestLocalFilesystemCatalogSchemaCreatesCoreTables(t *testing.T) {
 	if !hasStringPrefix(contentVerificationIndex, []string{"source_key", "status", "content_verification_attempted_at", "id"}) {
 		t.Fatalf("content verification index = %#v, want durable attempt ordering", contentVerificationIndex)
 	}
+	gallerySourceIndex, err := store.indexColumns(catalogGallerySourceCanonicalIndex)
+	if err != nil {
+		t.Fatalf("inspect gallery source index: %v", err)
+	}
+	if !hasStringPrefix(gallerySourceIndex, []string{"source_key", "datasource_kind", "visibility_status", "canonical_asset_id"}) {
+		t.Fatalf("gallery source index = %#v, want configured-source count coverage", gallerySourceIndex)
+	}
+	galleryTimelineIndex, err := store.indexColumns("idx_catalog_gallery_timeline_captured")
+	if err != nil {
+		t.Fatalf("inspect gallery timeline date index: %v", err)
+	}
+	if !hasStringPrefix(galleryTimelineIndex, []string{"generation", "captured_at", "canonical_asset_id", "global_position"}) {
+		t.Fatalf("gallery timeline date index = %#v, want generation-scoped date lookup", galleryTimelineIndex)
+	}
+	galleryTimelineStateColumns, err := store.tableColumns("catalog_gallery_timeline_state")
+	if err != nil {
+		t.Fatalf("inspect gallery timeline state columns: %v", err)
+	}
+	if !galleryTimelineStateColumns["canonical_generation"] {
+		t.Fatalf("gallery timeline state columns = %#v, want canonical_generation", galleryTimelineStateColumns)
+	}
+	var canonicalGeneration int64
+	if err := store.db.QueryRowContext(ctx, `SELECT generation FROM catalog_canonical_state WHERE singleton_id = 1`).Scan(&canonicalGeneration); err != nil {
+		t.Fatalf("read initial canonical generation: %v", err)
+	}
+	if canonicalGeneration != 0 {
+		t.Fatalf("initial canonical generation = %d, want 0", canonicalGeneration)
+	}
 
 	now := formatCatalogTime(time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC))
 	if _, err := store.db.ExecContext(ctx, `INSERT INTO local_assets (
@@ -177,6 +209,40 @@ func TestLocalFilesystemCatalogSchemaCreatesCoreTables(t *testing.T) {
 	}
 }
 
+func TestCatalogStoreRestoresGallerySourceIndexForExistingCurrentSchema(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	store, err := LoadOrCreateCatalogStore(dataDir)
+	if err != nil {
+		t.Fatalf("LoadOrCreateCatalogStore() error = %v", err)
+	}
+	if _, err := store.db.Exec(`DROP INDEX ` + catalogGallerySourceCanonicalIndex); err != nil {
+		_ = store.Close()
+		t.Fatalf("drop gallery source index: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store without gallery source index: %v", err)
+	}
+
+	reopened, err := LoadOrCreateCatalogStore(dataDir)
+	if err != nil {
+		t.Fatalf("reopen existing current-schema store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
+	columns, err := reopened.indexColumns(catalogGallerySourceCanonicalIndex)
+	if err != nil {
+		t.Fatalf("inspect restored gallery source index: %v", err)
+	}
+	if !reflect.DeepEqual(columns, []string{"source_key", "datasource_kind", "visibility_status", "canonical_asset_id"}) {
+		t.Fatalf("restored gallery source index = %#v", columns)
+	}
+}
+
 func TestCatalogUsesFreshStateRootInsteadOfDevelopmentState(t *testing.T) {
 	t.Parallel()
 
@@ -206,7 +272,7 @@ func TestCatalogUsesFreshStateRootInsteadOfDevelopmentState(t *testing.T) {
 	}
 	var developmentTableCount int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'development_only'`).Scan(&developmentTableCount); err != nil {
-		t.Fatalf("inspect product V1 DB: %v", err)
+		t.Fatalf("inspect current product DB: %v", err)
 	}
 	if developmentTableCount != 0 {
 		t.Fatalf("development table count = %d, want fresh product schema", developmentTableCount)
@@ -414,6 +480,41 @@ func TestCatalogStoreRejectsUnknownSchemaVersion(t *testing.T) {
 	}
 }
 
+func TestCatalogStoreRejectsPreviousSchemaVersion(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	dbDir := filepath.Join(dataDir, catalogStateDirName)
+	if err := os.MkdirAll(dbDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dbDir, catalogDatabaseName))
+	if err != nil {
+		t.Fatalf("open previous-version db: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE previous_schema (id INTEGER PRIMARY KEY)`); err != nil {
+		_ = db.Close()
+		t.Fatalf("create previous schema table: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+		_ = db.Close()
+		t.Fatalf("set previous schema version: %v", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA application_id = %d`, catalogApplicationID)); err != nil {
+		_ = db.Close()
+		t.Fatalf("set catalog application ID: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close previous-version db: %v", err)
+	}
+
+	if _, err := LoadOrCreateCatalogStore(dataDir); !errors.Is(err, ErrCatalogSchemaResetRequired) {
+		t.Fatalf("LoadOrCreateCatalogStore() error = %v, want ErrCatalogSchemaResetRequired", err)
+	} else if !strings.Contains(err.Error(), "found schema version 1") || !strings.Contains(err.Error(), "want version 2") {
+		t.Fatalf("reset-required error = %q, want explicit V1 to V2 rebuild guidance", err)
+	}
+}
+
 func TestCatalogStoreRejectsV1WithoutApplicationID(t *testing.T) {
 	t.Parallel()
 
@@ -443,7 +544,7 @@ func TestCatalogStoreRejectsV1WithoutApplicationID(t *testing.T) {
 	}
 }
 
-func TestCatalogStoreRejectsV1WithoutRootWorkGeneration(t *testing.T) {
+func TestCatalogStoreRejectsV2WithoutRootWorkGeneration(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
@@ -453,7 +554,7 @@ func TestCatalogStoreRejectsV1WithoutRootWorkGeneration(t *testing.T) {
 	}
 	db, err := sql.Open("sqlite", filepath.Join(dbDir, catalogDatabaseName))
 	if err != nil {
-		t.Fatalf("open V1 db without root work generation: %v", err)
+		t.Fatalf("open V2 db without root work generation: %v", err)
 	}
 	if _, err := db.Exec(`CREATE TABLE local_scan_root_state (
 		source_key TEXT NOT NULL,
@@ -472,16 +573,32 @@ func TestCatalogStoreRejectsV1WithoutRootWorkGeneration(t *testing.T) {
 		_ = db.Close()
 		t.Fatalf("create jobs without work generation: %v", err)
 	}
-	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE catalog_canonical_state (
+		singleton_id INTEGER PRIMARY KEY,
+		generation INTEGER NOT NULL
+	);
+	INSERT INTO catalog_canonical_state(singleton_id, generation) VALUES (1, 0);
+	CREATE TABLE catalog_gallery_timeline_state (
+		singleton_id INTEGER PRIMARY KEY,
+		generation INTEGER NOT NULL,
+		canonical_generation INTEGER NOT NULL,
+		scope_key TEXT NOT NULL,
+		total_count INTEGER NOT NULL,
+		built_at TEXT NOT NULL
+	)`); err != nil {
 		_ = db.Close()
-		t.Fatalf("seed V1 schema version: %v", err)
+		t.Fatalf("create current gallery generation state: %v", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, catalogSchemaVersion)); err != nil {
+		_ = db.Close()
+		t.Fatalf("seed V2 schema version: %v", err)
 	}
 	if _, err := db.Exec(fmt.Sprintf(`PRAGMA application_id = %d`, catalogApplicationID)); err != nil {
 		_ = db.Close()
 		t.Fatalf("seed catalog application ID: %v", err)
 	}
 	if err := db.Close(); err != nil {
-		t.Fatalf("close V1 db without root work generation: %v", err)
+		t.Fatalf("close V2 db without root work generation: %v", err)
 	}
 
 	if _, err := LoadOrCreateCatalogStore(dataDir); !errors.Is(err, ErrCatalogSchemaResetRequired) {
@@ -491,7 +608,7 @@ func TestCatalogStoreRejectsV1WithoutRootWorkGeneration(t *testing.T) {
 	}
 }
 
-func TestCatalogStoreRejectsV1WithOutdatedLocalWorkIndex(t *testing.T) {
+func TestCatalogStoreRejectsCurrentSchemaWithOutdatedLocalWorkIndex(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()

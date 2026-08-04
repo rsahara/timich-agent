@@ -267,10 +267,11 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 		t.Fatalf("dashboard body is missing worker settings controls: %s", recorder.Body.String())
 	}
 	if !bytes.Contains(body, []byte("Max workers")) ||
-		!bytes.Contains(body, []byte("Limit concurrent metadata, thumbnail, video preview, content verification, semantic embedding, and search-index publish jobs")) ||
-		!bytes.Contains(body, []byte("Content verification, semantic embedding, and publish use at most 1 worker")) ||
-		!bytes.Contains(body, []byte("Media discovery and lightweight status checks run outside this limit")) ||
-		!bytes.Contains(body, []byte("an in-flight task remains running until it has actually stopped")) {
+		!bytes.Contains(body, []byte("<div class=\"section-note worker-note\">")) ||
+		!bytes.Contains(body, []byte("Limits concurrent metadata, thumbnail, video preview, content verification, semantic embedding, and search-index publishing jobs")) ||
+		!bytes.Contains(body, []byte("Content verification, semantic embedding, and publishing use at most 1 worker")) ||
+		!bytes.Contains(body, []byte("Media discovery and status checks run outside this limit")) ||
+		!bytes.Contains(body, []byte("After pausing, in-flight work continues until its current batch completes")) {
 		t.Fatalf("dashboard body is missing simplified background worker copy: %s", recorder.Body.String())
 	}
 	if bytes.Contains(body, []byte("Active workers")) ||
@@ -390,6 +391,11 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 		!bytes.Contains(body, []byte(`id="datasourceStatus"`)) ||
 		!bytes.Contains(body, []byte("<th>Datasource</th><th>Found medias</th><th>Browsable medias</th><th>Searchable medias</th><th>Issues</th>")) {
 		t.Fatalf("dashboard body is missing datasource health table: %s", recorder.Body.String())
+	}
+	if !bytes.Contains(body, []byte("function isImmichPassthroughDatasource(datasource)")) ||
+		!bytes.Contains(body, []byte("status: isImmichPassthroughDatasource(datasource) ? 'immich-managed' : 'updating'")) ||
+		!bytes.Contains(body, []byte("if (metric.status === 'immich-managed') return 'Immich-managed';")) {
+		t.Fatalf("dashboard body is missing Immich-managed passthrough coverage formatting: %s", recorder.Body.String())
 	}
 	if !bytes.Contains(body, []byte("Search Coverage")) ||
 		!bytes.Contains(body, []byte(`id="searchCoverageStatus"`)) ||

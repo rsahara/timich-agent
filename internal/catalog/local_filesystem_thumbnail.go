@@ -1333,7 +1333,7 @@ func (s *Service) resettleLocalSource(ctx context.Context, asset localThumbnailA
 		_ = tx.Rollback()
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0); err != nil {
 		return fmt.Errorf("commit local source resettle: %w", err)
 	}
 	return nil

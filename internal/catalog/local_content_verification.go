@@ -889,7 +889,7 @@ func (s *Service) resettleLocalLocationAfterContentVerification(ctx context.Cont
 		_ = tx.Rollback()
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0); err != nil {
 		return fmt.Errorf("commit local content verification resettle: %w", err)
 	}
 	s.notifyLocalWorkQueued()

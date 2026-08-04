@@ -478,6 +478,10 @@ func NewServiceWithOptions(datasources []config.DatasourceConfig, options Servic
 			return nil, err
 		}
 		catalogStore.datasourceState = &service.datasourceState
+		if err := catalogStore.ensureGalleryTimeline(context.Background(), state.galleryReadiness); err != nil {
+			_ = catalogStore.Close()
+			return nil, fmt.Errorf("prepare gallery timeline: %w", err)
+		}
 		service.catalog = catalogStore
 	}
 	return service, nil
@@ -562,11 +566,24 @@ func (s *Service) ReconfigureDatasources(datasources []config.DatasourceConfig) 
 		}
 	}
 	nextState := newServiceDatasourceState(datasources, localRoots, s.datasourceGeneration.Add(1))
+	if s.catalog != nil {
+		if err := s.catalog.ensureGalleryTimeline(context.Background(), nextState.galleryReadiness); err != nil {
+			log.Printf("timich-agent gallery timeline reconfigure failed error=%v", err)
+		}
+	}
 	s.mu.Lock()
 	s.datasourceState.Store(nextState)
 	s.statisticsTotalCache = nil
 	s.semanticSourceRetry = nil
 	s.mu.Unlock()
+	// Re-check after publication so a Local worker that committed between the
+	// prebuild and the atomic datasource-state swap cannot leave the new scope
+	// without a current Gallery generation.
+	if s.catalog != nil {
+		if err := s.catalog.ensureGalleryTimeline(context.Background(), nextState.galleryReadiness); err != nil {
+			log.Printf("timich-agent gallery timeline post-reconfigure repair failed error=%v", err)
+		}
+	}
 }
 
 func semanticRetryDelay(attempts int) time.Duration {
@@ -632,7 +649,7 @@ func (s *Service) clearSemanticSourceRetry(sourceKey string) {
 }
 
 func catalogGalleryReadinessForDatasources(datasources []config.DatasourceConfig) catalogGalleryReadiness {
-	readiness := catalogGalleryReadiness{}
+	readiness := catalogGalleryReadiness{immichOnly: len(datasources) > 0}
 	for _, datasource := range datasources {
 		sourceKey := strings.TrimSpace(datasource.SourceKey)
 		if sourceKey == "" {
@@ -640,13 +657,17 @@ func catalogGalleryReadinessForDatasources(datasources []config.DatasourceConfig
 		}
 		switch datasource.Kind {
 		case config.DatasourceKindLocalFiles:
+			readiness.immichOnly = false
 			if config.LocalDatasourceImmichFallbackEnabled(datasource) {
 				readiness.localImmichFallbackSourceKeys = append(readiness.localImmichFallbackSourceKeys, sourceKey)
 			}
 		case config.DatasourceKindImmichIndexed:
 			readiness.immichSourceKeys = append(readiness.immichSourceKeys, sourceKey)
+		default:
+			readiness.immichOnly = false
 		}
 	}
+	readiness.immichOnly = readiness.immichOnly && len(readiness.immichSourceKeys) > 0
 	return readiness
 }
 
