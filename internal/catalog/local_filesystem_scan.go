@@ -220,6 +220,7 @@ func (s *Service) QueueCommittedLocalUpload(ctx context.Context, sourceKey strin
 			return false, err
 		}
 	}
+	canonicalChanged := false
 	if visibilityDirty {
 		changedCanonicalIDs, err := refreshLocalAssetVisibilityInTx(ctx, tx, trustedRoot.datasource.SourceKey, trustedRoot.root.Key, scanner.nowText)
 		if err != nil {
@@ -230,8 +231,9 @@ func (s *Service) QueueCommittedLocalUpload(ctx context.Context, sourceKey strin
 			_ = tx.Rollback()
 			return false, err
 		}
+		canonicalChanged = len(changedCanonicalIDs) > 0
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, canonicalChanged); err != nil {
 		return false, fmt.Errorf("commit local upload metadata queue: %w", err)
 	}
 	return queued, nil
@@ -1199,6 +1201,7 @@ func (s *localPhase0Scanner) run(ctx context.Context) (returned LocalPhase0ScanR
 	// Reconciliation is also the correctness boundary for a configured root-key
 	// change. Former-root locations can remain as history, but they must not keep
 	// assets visible or retain the primary pointer for the current root.
+	canonicalChanged := false
 	if s.visibilityDirty || s.scanMode == localPhase0ScanModeReconciliation {
 		changedCanonicalIDs, err := refreshLocalAssetVisibilityInTx(ctx, tx, s.datasource.SourceKey, s.root.Key, s.nowText)
 		if err != nil {
@@ -1209,6 +1212,7 @@ func (s *localPhase0Scanner) run(ctx context.Context) (returned LocalPhase0ScanR
 			_ = tx.Rollback()
 			return LocalPhase0ScanResult{}, err
 		}
+		canonicalChanged = len(changedCanonicalIDs) > 0
 	}
 	if s.scanMode == localPhase0ScanModeReconciliation && s.reconciliationPending {
 		if err := s.deleteStaleRootJobsInTx(ctx, tx); err != nil {
@@ -1225,7 +1229,7 @@ func (s *localPhase0Scanner) run(ctx context.Context) (returned LocalPhase0ScanR
 		_ = tx.Rollback()
 		return LocalPhase0ScanResult{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.service.catalog.commitCatalogAssetChanges(ctx, tx, canonicalChanged); err != nil {
 		return LocalPhase0ScanResult{}, fmt.Errorf("commit local phase0 scan: %w", err)
 	}
 	finished = true

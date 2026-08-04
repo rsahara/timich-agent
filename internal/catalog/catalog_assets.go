@@ -11,6 +11,7 @@ import (
 type catalogGalleryReadiness struct {
 	localImmichFallbackSourceKeys []string
 	immichSourceKeys              []string
+	immichOnly                    bool
 }
 
 func (s *CatalogStore) SearchCatalogAssets(ctx context.Context, normalized normalizedAssetSearch) (AssetSearchPage, error) {
@@ -21,20 +22,35 @@ func (s *CatalogStore) SearchCatalogAssets(ctx context.Context, normalized norma
 		return AssetSearchPage{}, ErrUnsupportedSearch
 	}
 	db := s.queryDB()
-	where, args := catalogSearchWhere(normalized, "c", s.galleryReadinessSnapshot())
-	countQuery := `SELECT COUNT(*) FROM catalog_canonical_assets c ` + where
-	var total int
-	if err := db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
-		return AssetSearchPage{}, fmt.Errorf("count catalog assets: %w", err)
+	readiness := s.galleryReadinessSnapshot()
+	if page, handled, err := s.searchGalleryTimeline(ctx, normalized, readiness); handled {
+		return page, err
 	}
-
+	where, args := catalogSearchWhere(normalized, "c", readiness)
+	sourceKeyColumn, upstreamAssetIDColumn, sourceArgs := catalogGallerySourceProjection(func(name string) string {
+		return "c." + name
+	}, readiness)
 	limit := normalized.Request.Page.Size
 	offset := normalized.Request.Page.Index * normalized.Request.Page.Size
-	query := `SELECT primary_source_key, primary_upstream_asset_id, media_type, filename, captured_at, duration
+	includeTotal := catalogSearchIncludesExactTotal(normalized)
+	var total int
+	if includeTotal {
+		countedTotal, err := s.catalogExactTotal(ctx, db, normalized, readiness, where, args)
+		if err != nil {
+			return AssetSearchPage{}, fmt.Errorf("count catalog assets: %w", err)
+		}
+		total = countedTotal
+	}
+	queryLimit := limit
+	if !includeTotal {
+		queryLimit++
+	}
+	query := `SELECT ` + sourceKeyColumn + `, ` + upstreamAssetIDColumn + `,
+			c.media_type, c.filename, c.captured_at, c.duration
 		FROM catalog_canonical_assets c ` + where + `
-		ORDER BY c.captured_at DESC, c.primary_source_key ASC, c.primary_upstream_asset_id ASC
+		ORDER BY c.captured_at DESC, c.canonical_asset_id ASC
 		LIMIT ? OFFSET ?`
-	queryArgs := append(append([]any{}, args...), limit, offset)
+	queryArgs := append(append(append([]any{}, sourceArgs...), args...), queryLimit, offset)
 	rows, err := db.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return AssetSearchPage{}, fmt.Errorf("query catalog assets: %w", err)
@@ -75,7 +91,25 @@ func (s *CatalogStore) SearchCatalogAssets(ctx context.Context, normalized norma
 	}
 
 	var nextPageIndex *int
-	if offset+len(items) < total {
+	totalAccuracy := TotalAccuracyExact
+	if !includeTotal {
+		hasMore := len(items) > limit
+		if hasMore {
+			items = items[:limit]
+			total = offset + len(items) + 1
+			totalAccuracy = TotalAccuracyLowerBound
+		} else {
+			total = offset + len(items)
+			if len(items) == 0 && normalized.Request.Page.Index > 0 {
+				total = 0
+				totalAccuracy = TotalAccuracyLowerBound
+			}
+		}
+		if hasMore {
+			next := normalized.Request.Page.Index + 1
+			nextPageIndex = &next
+		}
+	} else if offset+len(items) < total {
 		next := normalized.Request.Page.Index + 1
 		nextPageIndex = &next
 	}
@@ -84,11 +118,86 @@ func (s *CatalogStore) SearchCatalogAssets(ctx context.Context, normalized norma
 		Page:          normalized.Request.Page,
 		Items:         items,
 		Total:         total,
-		TotalAccuracy: TotalAccuracyExact,
+		TotalAccuracy: totalAccuracy,
 		NextPageIndex: nextPageIndex,
 		Boundary:      searchBoundary(normalized.Request.Page, len(items)),
 		Resolved:      normalized.Resolved,
 	}, nil
+}
+
+func (s *CatalogStore) catalogExactTotal(
+	ctx context.Context,
+	db *sql.DB,
+	normalized normalizedAssetSearch,
+	readiness catalogGalleryReadiness,
+	canonicalWhere string,
+	canonicalArgs []any,
+) (int, error) {
+	countQuery, countArgs := catalogExactTotalQuery(normalized, readiness, canonicalWhere, canonicalArgs)
+	if !catalogCanCountConfiguredImmichAssets(normalized, readiness) {
+		var total int
+		if err := db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&total); err != nil {
+			return 0, err
+		}
+		return total, nil
+	}
+
+	cacheKey := strings.Join(readiness.immichSourceKeys, "\x00")
+	s.galleryTotalMu.Lock()
+	defer s.galleryTotalMu.Unlock()
+	if total, ok := s.galleryTotalCache[cacheKey]; ok {
+		return total, nil
+	}
+	var total int
+	if err := db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&total); err != nil {
+		return 0, err
+	}
+	if s.galleryTotalCache == nil {
+		s.galleryTotalCache = make(map[string]int)
+	}
+	s.galleryTotalCache[cacheKey] = total
+	return total, nil
+}
+
+func catalogExactTotalQuery(normalized normalizedAssetSearch, readiness catalogGalleryReadiness, canonicalWhere string, canonicalArgs []any) (string, []any) {
+	if catalogCanCountConfiguredImmichAssets(normalized, readiness) {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(readiness.immichSourceKeys)), ",")
+		args := make([]any, 0, len(readiness.immichSourceKeys))
+		for _, sourceKey := range readiness.immichSourceKeys {
+			args = append(args, sourceKey)
+		}
+		// Active source rows and their canonical row are refreshed in the same
+		// transaction. Counting distinct links from the configured sources is
+		// therefore equivalent to the canonical timeline count, while avoiding
+		// one correlated readiness lookup for every canonical asset.
+		return `SELECT COUNT(DISTINCT configured_immich.canonical_asset_id)
+			FROM catalog_assets configured_immich INDEXED BY ` + catalogGallerySourceCanonicalIndex + `
+			WHERE configured_immich.source_key IN (` + placeholders + `)
+				AND configured_immich.datasource_kind = 'immich'
+				AND configured_immich.visibility_status = 'active'
+				AND configured_immich.canonical_asset_id IS NOT NULL`, args
+	}
+	return `SELECT COUNT(*) FROM catalog_canonical_assets c ` + canonicalWhere, canonicalArgs
+}
+
+func catalogCanCountConfiguredImmichAssets(normalized normalizedAssetSearch, readiness catalogGalleryReadiness) bool {
+	request := normalized.Request
+	return readiness.immichOnly &&
+		len(readiness.immichSourceKeys) > 0 &&
+		request.Collection.Kind == CollectionKindTimeline &&
+		request.Collection.Query == nil &&
+		len(request.Collection.Filters.MediaTypes) == 0 &&
+		request.Collection.Filters.CapturedAt == nil
+}
+
+func catalogSearchIncludesExactTotal(normalized normalizedAssetSearch) bool {
+	request := normalized.Request
+	if request.Page.Index == 0 || request.Collection.Kind != CollectionKindTimeline {
+		return true
+	}
+	return request.Collection.Query != nil ||
+		len(request.Collection.Filters.MediaTypes) > 0 ||
+		request.Collection.Filters.CapturedAt != nil
 }
 
 func catalogSearchWhere(normalized normalizedAssetSearch, canonicalAlias string, readiness catalogGalleryReadiness) (string, []any) {
@@ -103,8 +212,10 @@ func catalogSearchWhere(normalized normalizedAssetSearch, canonicalAlias string,
 	}
 	args := []any{}
 	readinessClause, readinessArgs := catalogGalleryReadinessClause(column, readiness)
-	clauses = append(clauses, readinessClause)
-	args = append(args, readinessArgs...)
+	if readinessClause != "" {
+		clauses = append(clauses, readinessClause)
+		args = append(args, readinessArgs...)
+	}
 	if mediaTypes := normalized.Request.Collection.Filters.MediaTypes; len(mediaTypes) > 0 {
 		placeholders := make([]string, 0, len(mediaTypes))
 		for _, mediaType := range mediaTypes {
@@ -140,6 +251,21 @@ func catalogSearchWhere(normalized normalizedAssetSearch, canonicalAlias string,
 }
 
 func catalogGalleryReadinessClause(column func(string) string, readiness catalogGalleryReadiness) (string, []any) {
+	if readiness.immichOnly && len(readiness.immichSourceKeys) > 0 {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(readiness.immichSourceKeys)), ",")
+		args := make([]any, 0, len(readiness.immichSourceKeys))
+		for _, sourceKey := range readiness.immichSourceKeys {
+			args = append(args, sourceKey)
+		}
+		return `EXISTS (
+			SELECT 1
+			FROM catalog_assets configured_immich
+			WHERE configured_immich.canonical_asset_id = ` + column("canonical_asset_id") + `
+				AND configured_immich.datasource_kind = 'immich'
+				AND configured_immich.visibility_status = 'active'
+				AND configured_immich.source_key IN (` + placeholders + `)
+		)`, args
+	}
 	localPrimary := `EXISTS (
 		SELECT 1
 		FROM catalog_assets primary_source
@@ -190,4 +316,28 @@ func catalogGalleryReadinessClause(column func(string) string, readiness catalog
 		}
 	}
 	return "(" + strings.Join(clauses, " OR ") + ")", args
+}
+
+func catalogGallerySourceProjection(column func(string) string, readiness catalogGalleryReadiness) (string, string, []any) {
+	if !readiness.immichOnly || len(readiness.immichSourceKeys) == 0 {
+		return column("primary_source_key"), column("primary_upstream_asset_id"), nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(readiness.immichSourceKeys)), ",")
+	configuredSourceColumn := func(name string) string {
+		return `(SELECT configured_immich.` + name + `
+			FROM catalog_assets configured_immich
+			WHERE configured_immich.canonical_asset_id = ` + column("canonical_asset_id") + `
+				AND configured_immich.datasource_kind = 'immich'
+				AND configured_immich.visibility_status = 'active'
+				AND configured_immich.source_key IN (` + placeholders + `)
+			ORDER BY configured_immich.source_key ASC, configured_immich.upstream_asset_id ASC
+			LIMIT 1)`
+	}
+	args := make([]any, 0, len(readiness.immichSourceKeys)*2)
+	for range 2 {
+		for _, sourceKey := range readiness.immichSourceKeys {
+			args = append(args, sourceKey)
+		}
+	}
+	return configuredSourceColumn("source_key"), configuredSourceColumn("upstream_asset_id"), args
 }

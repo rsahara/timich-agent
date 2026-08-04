@@ -18,11 +18,12 @@ import (
 )
 
 const (
-	catalogStateDirName  = "catalog-state-v1"
-	catalogDatabaseName  = "catalog.db"
-	catalogAdminDBName   = "catalog-admin.db"
-	catalogReadConns     = 4
-	catalogSchemaVersion = 1
+	catalogStateDirName                = "catalog-state-v1"
+	catalogDatabaseName                = "catalog.db"
+	catalogAdminDBName                 = "catalog-admin.db"
+	catalogReadConns                   = 4
+	catalogSchemaVersion               = 2
+	catalogGallerySourceCanonicalIndex = "idx_catalog_assets_gallery_source_canonical"
 	// "TMCH" identifies the final Timich catalog format. Earlier unreleased
 	// development databases reused user_version=1 without this marker.
 	catalogApplicationID = 0x544d4348
@@ -116,6 +117,8 @@ type CatalogStore struct {
 	semanticVectorPayloadCacheMu sync.Mutex
 	semanticVectorPayloadCache   map[string][]byte
 	semanticVectorPayloadOrder   []string
+	galleryTotalMu               sync.Mutex
+	galleryTotalCache            map[string]int
 	datasourceState              *atomic.Pointer[serviceDatasourceState]
 	standaloneGalleryReadiness   atomic.Pointer[catalogGalleryReadiness]
 }
@@ -140,6 +143,9 @@ func (s *CatalogStore) setStandaloneGalleryReadiness(readiness catalogGalleryRea
 		return
 	}
 	s.standaloneGalleryReadiness.Store(&readiness)
+	if err := s.ensureGalleryTimeline(context.Background(), readiness); err != nil {
+		log.Printf("timich-agent gallery timeline refresh failed error=%v", err)
+	}
 }
 
 func LoadOrCreateCatalogStore(dataDir string) (*CatalogStore, error) {
@@ -162,6 +168,7 @@ func LoadOrCreateCatalogStore(dataDir string) (*CatalogStore, error) {
 		db:                         db,
 		semanticBinaryIntegrity:    make(map[string]semanticBinaryIntegrityCacheEntry),
 		semanticVectorPayloadCache: make(map[string][]byte),
+		galleryTotalCache:          make(map[string]int),
 	}
 	if err := store.ensureCatalogSchema(); err != nil {
 		_ = db.Close()
@@ -223,6 +230,43 @@ func (s *CatalogStore) queryDB() *sql.DB {
 		return s.readDB
 	}
 	return s.db
+}
+
+func (s *CatalogStore) commitCatalogAssetChanges(ctx context.Context, tx *sql.Tx, canonicalChanged bool) error {
+	s.galleryTotalMu.Lock()
+	defer s.galleryTotalMu.Unlock()
+	if canonicalChanged {
+		if err := advanceCatalogCanonicalGenerationInTx(ctx, tx); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	readiness := s.galleryReadinessSnapshot()
+	refreshGallery, err := galleryTimelineNeedsRefreshInTx(ctx, tx, readiness)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if refreshGallery {
+		if err := s.rebuildGalleryTimelineInTx(ctx, tx, readiness); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	clear(s.galleryTotalCache)
+	return nil
+}
+
+func (s *CatalogStore) clearGalleryTotalCache() {
+	if s == nil {
+		return
+	}
+	s.galleryTotalMu.Lock()
+	clear(s.galleryTotalCache)
+	s.galleryTotalMu.Unlock()
 }
 
 func (s *CatalogStore) openStatsWriteDB(ctx context.Context) (*sql.DB, error) {
@@ -383,6 +427,24 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 		if err != nil {
 			return fmt.Errorf("inspect catalog local work schema: %w", err)
 		}
+		canonicalStateColumns, err := s.tableColumns("catalog_canonical_state")
+		if err != nil {
+			return fmt.Errorf("inspect catalog canonical generation schema: %w", err)
+		}
+		galleryStateColumns, err := s.tableColumns("catalog_gallery_timeline_state")
+		if err != nil {
+			return fmt.Errorf("inspect catalog gallery timeline state schema: %w", err)
+		}
+		if !canonicalStateColumns["generation"] || !galleryStateColumns["canonical_generation"] {
+			return fmt.Errorf("%w: catalog schema is missing required gallery generation state; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, s.root)
+		}
+		var canonicalStateCount int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM catalog_canonical_state WHERE singleton_id = 1`).Scan(&canonicalStateCount); err != nil {
+			return fmt.Errorf("inspect catalog canonical generation state: %w", err)
+		}
+		if canonicalStateCount != 1 {
+			return fmt.Errorf("%w: catalog schema is missing the canonical generation singleton; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, s.root)
+		}
 		if !rootStateColumns["root_identity"] ||
 			!rootStateColumns["root_generation"] ||
 			!rootStateColumns["reconciliation_pending"] ||
@@ -420,6 +482,9 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 			if !hasStringPrefix(indexColumns, requiredPrefix) {
 				return fmt.Errorf("%w: catalog schema has an outdated local work index %q; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, indexName, s.root)
 			}
+		}
+		if err := s.ensureCatalogQueryIndexes(context.Background()); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -466,6 +531,8 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 			ON catalog_assets(source_key, datasource_kind, visibility_status, media_type, upstream_asset_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_catalog_assets_canonical
 			ON catalog_assets(canonical_asset_id, visibility_status, source_key, upstream_asset_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_catalog_assets_gallery_source_canonical
+			ON catalog_assets(source_key, datasource_kind, visibility_status, canonical_asset_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_catalog_assets_source_updated
 			ON catalog_assets(source_key, datasource_kind, source_updated_at)`,
 		`CREATE TABLE IF NOT EXISTS catalog_canonical_assets (
@@ -491,6 +558,38 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 			ON catalog_canonical_assets(visibility_status, captured_at DESC, canonical_asset_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_catalog_canonical_media_timeline
 			ON catalog_canonical_assets(visibility_status, media_type, captured_at DESC, canonical_asset_id)`,
+		`CREATE TABLE IF NOT EXISTS catalog_canonical_state (
+			singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+			generation INTEGER NOT NULL CHECK(generation >= 0)
+		)`,
+		`INSERT INTO catalog_canonical_state(singleton_id, generation)
+			VALUES (1, 0)
+			ON CONFLICT(singleton_id) DO NOTHING`,
+		`CREATE TABLE IF NOT EXISTS catalog_gallery_timeline_state (
+			singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+			generation INTEGER NOT NULL,
+			canonical_generation INTEGER NOT NULL CHECK(canonical_generation >= 0),
+			scope_key TEXT NOT NULL,
+			total_count INTEGER NOT NULL CHECK(total_count >= 0),
+			built_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS catalog_gallery_timeline (
+			generation INTEGER NOT NULL,
+			global_position INTEGER NOT NULL CHECK(global_position >= 0),
+			canonical_asset_id TEXT NOT NULL,
+			source_key TEXT NOT NULL,
+			upstream_asset_id TEXT NOT NULL,
+			media_type TEXT NOT NULL CHECK(media_type IN ('image', 'video')),
+			filename TEXT NOT NULL,
+			captured_at TEXT NOT NULL,
+			duration TEXT,
+			PRIMARY KEY(generation, global_position),
+			UNIQUE(generation, canonical_asset_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_catalog_gallery_timeline_captured
+			ON catalog_gallery_timeline(generation, captured_at DESC, canonical_asset_id, global_position)`,
+		`CREATE INDEX IF NOT EXISTS idx_catalog_gallery_timeline_media_captured
+			ON catalog_gallery_timeline(generation, media_type, captured_at DESC, canonical_asset_id)`,
 		`CREATE TABLE IF NOT EXISTS local_assets (
 			source_key TEXT NOT NULL,
 			asset_id TEXT NOT NULL,
@@ -790,6 +889,35 @@ func createCatalogSchema(ctx context.Context, db *sql.DB, statements []string) e
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit catalog schema creation: %w", err)
+	}
+	return nil
+}
+
+func (s *CatalogStore) ensureCatalogQueryIndexes(ctx context.Context) error {
+	statements := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: catalogGallerySourceCanonicalIndex,
+			sql: `CREATE INDEX IF NOT EXISTS idx_catalog_assets_gallery_source_canonical
+				ON catalog_assets(source_key, datasource_kind, visibility_status, canonical_asset_id)`,
+		},
+		{
+			name: "idx_catalog_gallery_timeline_captured",
+			sql: `CREATE INDEX IF NOT EXISTS idx_catalog_gallery_timeline_captured
+				ON catalog_gallery_timeline(generation, captured_at DESC, canonical_asset_id, global_position)`,
+		},
+		{
+			name: "idx_catalog_gallery_timeline_media_captured",
+			sql: `CREATE INDEX IF NOT EXISTS idx_catalog_gallery_timeline_media_captured
+				ON catalog_gallery_timeline(generation, media_type, captured_at DESC, canonical_asset_id)`,
+		},
+	}
+	for _, statement := range statements {
+		if _, err := s.db.ExecContext(ctx, statement.sql); err != nil {
+			return fmt.Errorf("ensure catalog query index %s: %w", statement.name, err)
+		}
 	}
 	return nil
 }
@@ -1176,7 +1304,7 @@ func (s *CatalogStore) ReplaceFull(
 	if err = s.upsertStateInTx(ctx, tx, sourceKey, status, now); err != nil {
 		return MirrorSyncResult{}, err
 	}
-	if err = tx.Commit(); err != nil {
+	if err = s.commitCatalogAssetChanges(ctx, tx, len(changedAssetIDs) > 0); err != nil {
 		return MirrorSyncResult{}, fmt.Errorf("commit immich mirror sync: %w", err)
 	}
 	if cleanupErr := s.cleanupSemanticVectorPayloadCandidates(context.Background()); cleanupErr != nil {
@@ -1309,7 +1437,19 @@ func (s *CatalogStore) MergeIncremental(
 			content_size_bytes = excluded.content_size_bytes,
 			place_label = excluded.place_label,
 			description = excluded.description,
-			updated_at = excluded.updated_at`)
+			updated_at = excluded.updated_at
+		WHERE catalog_assets.datasource_kind IS NOT excluded.datasource_kind
+			OR catalog_assets.media_type IS NOT excluded.media_type
+			OR catalog_assets.filename IS NOT excluded.filename
+			OR catalog_assets.captured_at IS NOT excluded.captured_at
+			OR catalog_assets.duration IS NOT excluded.duration
+			OR catalog_assets.visibility_status IS NOT excluded.visibility_status
+			OR catalog_assets.source_updated_at IS NOT excluded.source_updated_at
+			OR catalog_assets.is_favorite IS NOT excluded.is_favorite
+			OR catalog_assets.content_sha1_hex IS NOT excluded.content_sha1_hex
+			OR catalog_assets.content_size_bytes IS NOT excluded.content_size_bytes
+			OR catalog_assets.place_label IS NOT excluded.place_label
+			OR catalog_assets.description IS NOT excluded.description`)
 	if err != nil {
 		return MirrorSyncResult{}, fmt.Errorf("prepare immich mirror incremental upsert: %w", err)
 	}
@@ -1333,7 +1473,7 @@ func (s *CatalogStore) MergeIncremental(
 			updatedAt.Valid = true
 			updatedAt.String = formatCatalogTime(asset.SourceUpdatedAt.UTC())
 		}
-		_, err = statement.ExecContext(
+		sqlResult, execErr := statement.ExecContext(
 			ctx,
 			sourceKey,
 			upstreamAssetID,
@@ -1351,8 +1491,15 @@ func (s *CatalogStore) MergeIncremental(
 			nowText,
 			nowText,
 		)
-		if err != nil {
-			return MirrorSyncResult{}, fmt.Errorf("upsert immich mirror incremental asset %q: %w", asset.UpstreamAssetID, err)
+		if execErr != nil {
+			return MirrorSyncResult{}, fmt.Errorf("upsert immich mirror incremental asset %q: %w", asset.UpstreamAssetID, execErr)
+		}
+		rowsAffected, rowsErr := sqlResult.RowsAffected()
+		if rowsErr != nil {
+			return MirrorSyncResult{}, fmt.Errorf("inspect immich mirror incremental asset %q: %w", asset.UpstreamAssetID, rowsErr)
+		}
+		if rowsAffected == 0 {
+			continue
 		}
 		if _, ok := seenUpstreamAssetIDs[upstreamAssetID]; !ok {
 			seenUpstreamAssetIDs[upstreamAssetID] = struct{}{}
@@ -1382,7 +1529,7 @@ func (s *CatalogStore) MergeIncremental(
 			return MirrorSyncResult{}, err
 		}
 	}
-	if err = tx.Commit(); err != nil {
+	if err = s.commitCatalogAssetChanges(ctx, tx, len(upstreamAssetIDs) > 0); err != nil {
 		return MirrorSyncResult{}, fmt.Errorf("commit immich mirror incremental sync: %w", err)
 	}
 	if cleanupErr := s.cleanupSemanticVectorPayloadCandidates(context.Background()); cleanupErr != nil {

@@ -697,7 +697,7 @@ func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.D
 		_ = tx.Rollback()
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, true); err != nil {
 		return fmt.Errorf("commit local metadata registration: %w", err)
 	}
 	return nil
@@ -910,7 +910,7 @@ func (s *Service) resettleLocalMetadataJob(ctx context.Context, jobID int64, loc
 		_ = tx.Rollback()
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0); err != nil {
 		return fmt.Errorf("commit local metadata resettle: %w", err)
 	}
 	return nil
@@ -946,7 +946,7 @@ func (s *Service) markLocalLocationMissing(ctx context.Context, locationID int64
 		_ = tx.Rollback()
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0); err != nil {
 		return fmt.Errorf("commit local metadata missing update: %w", err)
 	}
 	return nil

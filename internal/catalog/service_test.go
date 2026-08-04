@@ -49,6 +49,490 @@ func TestNormalizeAssetSearchRequestRejectsOverflowingPageOffset(t *testing.T) {
 	}
 }
 
+func TestCatalogGalleryReadinessUsesImmichOnlyFastPath(t *testing.T) {
+	t.Parallel()
+
+	const immichSource = "1111111111111111"
+	readiness := catalogGalleryReadinessForDatasources([]config.DatasourceConfig{{
+		SourceKey: immichSource,
+		Kind:      config.DatasourceKindImmichIndexed,
+	}})
+	clause, args := catalogGalleryReadinessClause(func(name string) string {
+		return "c." + name
+	}, readiness)
+	if !strings.Contains(clause, "configured_immich.canonical_asset_id = c.canonical_asset_id") ||
+		!strings.Contains(clause, "configured_immich.source_key IN (?)") {
+		t.Fatalf("Immich-only readiness clause = %q, want configured active-source lookup", clause)
+	}
+	if len(args) != 1 || args[0] != immichSource {
+		t.Fatalf("Immich-only readiness args = %#v, want source key", args)
+	}
+	if !strings.Contains(clause, "EXISTS") || strings.Contains(clause, "local_") {
+		t.Fatalf("Immich-only readiness clause unexpectedly joins Local state: %s", clause)
+	}
+	sourceKeyColumn, upstreamAssetIDColumn, sourceArgs := catalogGallerySourceProjection(func(name string) string {
+		return "c." + name
+	}, readiness)
+	if !strings.Contains(sourceKeyColumn, "configured_immich.source_key") ||
+		!strings.Contains(upstreamAssetIDColumn, "configured_immich.upstream_asset_id") {
+		t.Fatalf("Immich-only source projection = %q / %q, want configured source identity", sourceKeyColumn, upstreamAssetIDColumn)
+	}
+	if !reflect.DeepEqual(sourceArgs, []any{immichSource, immichSource}) {
+		t.Fatalf("Immich-only source projection args = %#v, want source key for each projected column", sourceArgs)
+	}
+
+	mixed := catalogGalleryReadinessForDatasources([]config.DatasourceConfig{
+		{SourceKey: immichSource, Kind: config.DatasourceKindImmichIndexed},
+		{SourceKey: "2222222222222222", Kind: config.DatasourceKindLocalFiles},
+	})
+	mixedClause, _ := catalogGalleryReadinessClause(func(name string) string {
+		return "c." + name
+	}, mixed)
+	if !strings.Contains(mixedClause, "local_assets") || !strings.Contains(mixedClause, "local_renditions") {
+		t.Fatalf("mixed readiness clause = %q, want Local rendition checks", mixedClause)
+	}
+}
+
+func TestCatalogGalleryKeepsConfiguredImmichDuplicateWhenPrimaryIsRemoved(t *testing.T) {
+	t.Parallel()
+
+	store, err := LoadOrCreateCatalogStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateCatalogStore() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
+
+	ctx := context.Background()
+	const removedSource = "1111111111111111"
+	const configuredSource = "2222222222222222"
+	const configuredAssetID = "configured-copy"
+	capturedAt := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	sha1Hex := strings.Repeat("a", 40)
+	for _, source := range []struct {
+		key    string
+		assets []ImmichMirrorAsset
+	}{
+		{key: removedSource, assets: []ImmichMirrorAsset{
+			{
+				UpstreamAssetID:  "removed-primary",
+				MediaType:        "image",
+				Filename:         "removed-primary.jpg",
+				CapturedAt:       capturedAt,
+				ContentSHA1Hex:   sha1Hex,
+				ContentSizeBytes: 1234,
+			},
+			{
+				UpstreamAssetID: "removed-only",
+				MediaType:       "image",
+				Filename:        "removed-only.jpg",
+				CapturedAt:      capturedAt.Add(-time.Minute),
+			},
+		}},
+		{key: configuredSource, assets: []ImmichMirrorAsset{{
+			UpstreamAssetID:  configuredAssetID,
+			MediaType:        "image",
+			Filename:         configuredAssetID + ".jpg",
+			CapturedAt:       capturedAt,
+			ContentSHA1Hex:   sha1Hex,
+			ContentSizeBytes: 1234,
+		}}},
+	} {
+		if _, err := store.ReplaceFull(ctx, source.key, source.assets, 0, time.Now().UTC()); err != nil {
+			t.Fatalf("ReplaceFull(%s) error = %v", source.key, err)
+		}
+	}
+
+	var primarySource string
+	if err := store.queryDB().QueryRowContext(ctx, `SELECT primary_source_key
+		FROM catalog_canonical_assets`).Scan(&primarySource); err != nil {
+		t.Fatalf("read canonical primary: %v", err)
+	}
+	if primarySource != removedSource {
+		t.Fatalf("canonical primary = %q, want removed source %q", primarySource, removedSource)
+	}
+	store.setStandaloneGalleryReadiness(catalogGalleryReadiness{
+		immichSourceKeys: []string{configuredSource},
+		immichOnly:       true,
+	})
+	normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{Kind: CollectionKindTimeline},
+		Page:       AssetSearchPageRequest{Index: 0, Size: 10},
+	})
+	if err != nil {
+		t.Fatalf("normalize timeline request: %v", err)
+	}
+	page, err := store.SearchCatalogAssets(ctx, normalized)
+	if err != nil {
+		t.Fatalf("SearchCatalogAssets() error = %v", err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 {
+		t.Fatalf("timeline page total=%d items=%d, want configured duplicate", page.Total, len(page.Items))
+	}
+	if page.Items[0].SourceKey != configuredSource || page.Items[0].ID != configuredAssetID {
+		t.Fatalf("timeline item = %#v, want configured duplicate identity", page.Items[0])
+	}
+	semanticItems, err := store.canonicalAssetsForScoredSources(ctx, []semanticScoredAsset{{
+		Asset:      semanticAsset{SourceKey: configuredSource, ID: configuredAssetID},
+		Similarity: 0.9,
+	}}, true)
+	if err != nil {
+		t.Fatalf("canonicalAssetsForScoredSources() error = %v", err)
+	}
+	if len(semanticItems) != 1 || semanticItems[0].SourceKey != configuredSource || semanticItems[0].ID != configuredAssetID {
+		t.Fatalf("semantic item = %#v, want configured duplicate identity", semanticItems)
+	}
+}
+
+func TestCatalogTimelineExactTotalUsesConfiguredSourceIndex(t *testing.T) {
+	t.Parallel()
+
+	store, err := LoadOrCreateCatalogStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateCatalogStore() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
+
+	readiness := catalogGalleryReadiness{
+		immichSourceKeys: []string{"1111111111111111"},
+		immichOnly:       true,
+	}
+	normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{Kind: CollectionKindTimeline},
+		Page:       AssetSearchPageRequest{Index: 0, Size: 60},
+	})
+	if err != nil {
+		t.Fatalf("normalize timeline request: %v", err)
+	}
+	where, whereArgs := catalogSearchWhere(normalized, "c", readiness)
+	query, args := catalogExactTotalQuery(normalized, readiness, where, whereArgs)
+	rows, err := store.queryDB().QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN error = %v", err)
+	}
+	defer rows.Close()
+	details := []string{}
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatalf("scan query plan: %v", err)
+		}
+		details = append(details, detail)
+	}
+	plan := strings.Join(details, "\n")
+	if !strings.Contains(plan, "COVERING INDEX "+catalogGallerySourceCanonicalIndex) {
+		t.Fatalf("timeline count does not use configured-source covering index:\n%s", plan)
+	}
+	if strings.Contains(plan, "CORRELATED") {
+		t.Fatalf("timeline count still uses a correlated lookup:\n%s", plan)
+	}
+}
+
+func TestCatalogTimelineReadModelPublishesWithMirrorCommit(t *testing.T) {
+	t.Parallel()
+
+	store, err := LoadOrCreateCatalogStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateCatalogStore() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
+
+	const sourceKey = "1111111111111111"
+	store.setStandaloneGalleryReadiness(catalogGalleryReadiness{
+		immichSourceKeys: []string{sourceKey},
+		immichOnly:       true,
+	})
+	capturedAt := time.Date(2026, 8, 3, 11, 0, 0, 0, time.UTC)
+	replace := func(assets []ImmichMirrorAsset) {
+		t.Helper()
+		if _, err := store.ReplaceFull(context.Background(), sourceKey, assets, 0, time.Now().UTC()); err != nil {
+			t.Fatalf("ReplaceFull() error = %v", err)
+		}
+	}
+	search := func(pageSize int) AssetSearchPage {
+		t.Helper()
+		normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+			Collection: AssetCollectionRequest{Kind: CollectionKindTimeline},
+			Page:       AssetSearchPageRequest{Index: 0, Size: pageSize},
+		})
+		if err != nil {
+			t.Fatalf("normalize timeline request: %v", err)
+		}
+		page, err := store.SearchCatalogAssets(context.Background(), normalized)
+		if err != nil {
+			t.Fatalf("SearchCatalogAssets() error = %v", err)
+		}
+		return page
+	}
+
+	replace([]ImmichMirrorAsset{{
+		UpstreamAssetID: "asset-1",
+		MediaType:       "image",
+		Filename:        "asset-1.jpg",
+		CapturedAt:      capturedAt,
+	}})
+	if page := search(1); page.Total != 1 {
+		t.Fatalf("initial timeline total = %d, want 1", page.Total)
+	}
+	var firstGeneration int64
+	var firstTotal int
+	if err := store.queryDB().QueryRow(`SELECT generation, total_count
+		FROM catalog_gallery_timeline_state WHERE singleton_id = ?`, catalogGalleryTimelineStateID).Scan(&firstGeneration, &firstTotal); err != nil {
+		t.Fatalf("read initial gallery timeline state: %v", err)
+	}
+	if firstGeneration <= 0 || firstTotal != 1 {
+		t.Fatalf("initial gallery timeline generation=%d total=%d, want positive generation and total 1", firstGeneration, firstTotal)
+	}
+	if page := search(10); page.Total != 1 {
+		t.Fatalf("reused timeline total = %d, want 1", page.Total)
+	}
+
+	replace([]ImmichMirrorAsset{
+		{
+			UpstreamAssetID: "asset-1",
+			MediaType:       "image",
+			Filename:        "asset-1.jpg",
+			CapturedAt:      capturedAt,
+		},
+		{
+			UpstreamAssetID: "asset-2",
+			MediaType:       "image",
+			Filename:        "asset-2.jpg",
+			CapturedAt:      capturedAt.Add(-time.Minute),
+		},
+	})
+	var secondGeneration int64
+	var secondTotal int
+	if err := store.queryDB().QueryRow(`SELECT generation, total_count
+		FROM catalog_gallery_timeline_state WHERE singleton_id = ?`, catalogGalleryTimelineStateID).Scan(&secondGeneration, &secondTotal); err != nil {
+		t.Fatalf("read updated gallery timeline state: %v", err)
+	}
+	if secondGeneration <= firstGeneration || secondTotal != 2 {
+		t.Fatalf("updated gallery timeline generation=%d total=%d, want generation > %d and total 2", secondGeneration, secondTotal, firstGeneration)
+	}
+	if page := search(10); page.Total != 2 {
+		t.Fatalf("timeline total after mirror commit = %d, want 2", page.Total)
+	}
+
+	for name, incrementalAssets := range map[string][]ImmichMirrorAsset{
+		"empty": nil,
+		"unchanged": {{
+			UpstreamAssetID: "asset-1",
+			MediaType:       "image",
+			Filename:        "asset-1.jpg",
+			CapturedAt:      capturedAt,
+		}},
+	} {
+		if _, err := store.MergeIncremental(context.Background(), sourceKey, incrementalAssets, time.Now().UTC()); err != nil {
+			t.Fatalf("MergeIncremental(%s) error = %v", name, err)
+		}
+		var generation int64
+		if err := store.queryDB().QueryRow(`SELECT generation
+			FROM catalog_gallery_timeline_state WHERE singleton_id = ?`, catalogGalleryTimelineStateID).Scan(&generation); err != nil {
+			t.Fatalf("read gallery timeline state after %s incremental sync: %v", name, err)
+		}
+		if generation != secondGeneration {
+			t.Fatalf("generation after %s incremental sync = %d, want unchanged %d", name, generation, secondGeneration)
+		}
+	}
+
+	if _, err := store.MergeIncremental(context.Background(), sourceKey, []ImmichMirrorAsset{{
+		UpstreamAssetID: "asset-1",
+		MediaType:       "image",
+		Filename:        "asset-1-renamed.jpg",
+		CapturedAt:      capturedAt,
+	}}, time.Now().UTC()); err != nil {
+		t.Fatalf("MergeIncremental(changed) error = %v", err)
+	}
+	var thirdGeneration int64
+	if err := store.queryDB().QueryRow(`SELECT generation
+		FROM catalog_gallery_timeline_state WHERE singleton_id = ?`, catalogGalleryTimelineStateID).Scan(&thirdGeneration); err != nil {
+		t.Fatalf("read gallery timeline state after changed incremental sync: %v", err)
+	}
+	if thirdGeneration <= secondGeneration {
+		t.Fatalf("generation after changed incremental sync = %d, want > %d", thirdGeneration, secondGeneration)
+	}
+}
+
+func TestCatalogTimelineSearchSkipsExactTotalAfterFirstPage(t *testing.T) {
+	t.Parallel()
+
+	store, err := LoadOrCreateCatalogStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateCatalogStore() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
+
+	const sourceKey = "1111111111111111"
+	capturedAt := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	assets := []ImmichMirrorAsset{
+		{UpstreamAssetID: "asset-c", MediaType: "image", Filename: "c.jpg", CapturedAt: capturedAt},
+		{UpstreamAssetID: "asset-a", MediaType: "image", Filename: "a.jpg", CapturedAt: capturedAt},
+		{UpstreamAssetID: "asset-b", MediaType: "image", Filename: "b.jpg", CapturedAt: capturedAt},
+		{UpstreamAssetID: "asset-e", MediaType: "image", Filename: "e.jpg", CapturedAt: capturedAt},
+		{UpstreamAssetID: "asset-d", MediaType: "image", Filename: "d.jpg", CapturedAt: capturedAt},
+	}
+	if _, err := store.ReplaceFull(context.Background(), sourceKey, assets, 0, time.Now().UTC()); err != nil {
+		t.Fatalf("ReplaceFull() error = %v", err)
+	}
+	store.setStandaloneGalleryReadiness(catalogGalleryReadiness{
+		immichSourceKeys: []string{sourceKey},
+		immichOnly:       true,
+	})
+	exactNormalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{Kind: CollectionKindTimeline},
+		Page:       AssetSearchPageRequest{Index: 0, Size: 10},
+	})
+	if err != nil {
+		t.Fatalf("normalize exact timeline request: %v", err)
+	}
+	exact, err := store.SearchCatalogAssets(context.Background(), exactNormalized)
+	if err != nil {
+		t.Fatalf("SearchCatalogAssets(exact) error = %v", err)
+	}
+	if len(exact.Items) != 5 || exact.Total != 5 || exact.TotalAccuracy != TotalAccuracyExact {
+		t.Fatalf("exact timeline page = %#v, want five items and exact total", exact)
+	}
+	search := func(pageIndex int) AssetSearchPage {
+		t.Helper()
+		normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+			Collection: AssetCollectionRequest{Kind: CollectionKindTimeline},
+			Page:       AssetSearchPageRequest{Index: pageIndex, Size: 2},
+		})
+		if err != nil {
+			t.Fatalf("normalizeAssetSearchRequest(page %d) error = %v", pageIndex, err)
+		}
+		page, err := store.SearchCatalogAssets(context.Background(), normalized)
+		if err != nil {
+			t.Fatalf("SearchCatalogAssets(page %d) error = %v", pageIndex, err)
+		}
+		return page
+	}
+
+	first := search(0)
+	if len(first.Items) != 2 || first.Total != 5 || first.TotalAccuracy != TotalAccuracyExact ||
+		first.NextPageIndex == nil || *first.NextPageIndex != 1 {
+		t.Fatalf("first page = %#v, want exact total and next page", first)
+	}
+	if first.Items[0].ID != exact.Items[0].ID || first.Items[1].ID != exact.Items[1].ID {
+		t.Fatalf("first page IDs = %q/%q, want exact order %q/%q",
+			first.Items[0].ID, first.Items[1].ID, exact.Items[0].ID, exact.Items[1].ID)
+	}
+	second := search(1)
+	if len(second.Items) != 2 || second.Total != 5 || second.TotalAccuracy != TotalAccuracyLowerBound ||
+		second.NextPageIndex == nil || *second.NextPageIndex != 2 {
+		t.Fatalf("count-free second page = %#v, want two items and next-page lower bound", second)
+	}
+	if second.Items[0].ID != exact.Items[2].ID || second.Items[1].ID != exact.Items[3].ID {
+		t.Fatalf("count-free second page IDs = %q/%q, want exact order %q/%q",
+			second.Items[0].ID, second.Items[1].ID, exact.Items[2].ID, exact.Items[3].ID)
+	}
+	last := search(2)
+	if len(last.Items) != 1 || last.Items[0].ID != exact.Items[4].ID || last.Total != 5 ||
+		last.TotalAccuracy != TotalAccuracyExact || last.NextPageIndex != nil {
+		t.Fatalf("count-free last page = %#v, want exact terminal page", last)
+	}
+	beyond := search(3)
+	if len(beyond.Items) != 0 || beyond.Total != 0 || beyond.TotalAccuracy != TotalAccuracyLowerBound ||
+		beyond.Boundary == nil || beyond.Boundary.Kind != BoundaryPastEnd {
+		t.Fatalf("count-free beyond page = %#v, want past-end lower bound", beyond)
+	}
+
+	from := capturedAt.Add(-time.Hour)
+	filteredNormalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind: CollectionKindTimeline,
+			Filters: AssetSearchFilters{CapturedAt: &AssetSearchCapturedTime{
+				From: &from,
+			}},
+		},
+		Page: AssetSearchPageRequest{Index: 1, Size: 2},
+	})
+	if err != nil {
+		t.Fatalf("normalize filtered timeline request: %v", err)
+	}
+	filtered, err := store.SearchCatalogAssets(context.Background(), filteredNormalized)
+	if err != nil {
+		t.Fatalf("SearchCatalogAssets(filtered) error = %v", err)
+	}
+	if filtered.Total != 5 || filtered.TotalAccuracy != TotalAccuracyExact {
+		t.Fatalf("filtered timeline page = %#v, want exact total for date-jump compatibility", filtered)
+	}
+}
+
+func TestCatalogTimelineQueryUsesExistingTimelineIndex(t *testing.T) {
+	t.Parallel()
+
+	store, err := LoadOrCreateCatalogStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateCatalogStore() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
+
+	readiness := catalogGalleryReadiness{
+		immichSourceKeys: []string{"1111111111111111"},
+		immichOnly:       true,
+	}
+	normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{Kind: CollectionKindTimeline},
+		Page:       AssetSearchPageRequest{Index: 5000, Size: 60},
+	})
+	if err != nil {
+		t.Fatalf("normalize timeline request: %v", err)
+	}
+	where, whereArgs := catalogSearchWhere(normalized, "c", readiness)
+	sourceKeyColumn, upstreamAssetIDColumn, sourceArgs := catalogGallerySourceProjection(func(name string) string {
+		return "c." + name
+	}, readiness)
+	query := `EXPLAIN QUERY PLAN SELECT ` + sourceKeyColumn + `, ` + upstreamAssetIDColumn + `,
+			c.media_type, c.filename, c.captured_at, c.duration
+		FROM catalog_canonical_assets c ` + where + `
+		ORDER BY c.captured_at DESC, c.canonical_asset_id ASC
+		LIMIT ? OFFSET ?`
+	queryArgs := append(append(append([]any{}, sourceArgs...), whereArgs...), 60, 300000)
+	rows, err := store.queryDB().QueryContext(context.Background(), query, queryArgs...)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN error = %v", err)
+	}
+	defer rows.Close()
+	details := []string{}
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatalf("scan query plan: %v", err)
+		}
+		details = append(details, detail)
+	}
+	plan := strings.Join(details, "\n")
+	if strings.Contains(plan, "USE TEMP B-TREE") {
+		t.Fatalf("timeline query plan uses a temporary sort:\n%s", plan)
+	}
+	if !strings.Contains(plan, "idx_catalog_canonical_visible_timeline") {
+		t.Fatalf("timeline query plan does not use visible timeline index:\n%s", plan)
+	}
+}
+
 func TestSearchAssetsItemsUnmarshalSupportsStringNextPage(t *testing.T) {
 	t.Parallel()
 

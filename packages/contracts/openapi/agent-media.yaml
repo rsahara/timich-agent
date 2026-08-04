@@ -518,6 +518,13 @@ paths:
         detail-preview renditions are ready. When the local datasource has Immich
         fallback enabled, an active configured Immich duplicate also satisfies
         browsability.
+        In an Immich-only catalog, a canonical asset remains browsable when an
+        active duplicate belongs to a configured Immich datasource, and the
+        response uses that configured duplicate's source identity.
+        For catalog-backed unfiltered timelines, page 0 reports the exact total.
+        Later pages avoid repeating the exact count and use one look-ahead item
+        for next-page detection; their total is a lower bound unless the request
+        reaches the final non-empty page.
       security:
         - bearerAuth: []
       requestBody:
