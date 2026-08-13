@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -32,6 +33,7 @@ const (
 	AssetProcessingStatusUnavailable = "unavailable"
 
 	assetProcessingSemanticStatsRefreshMinAge = 30 * time.Second
+	assetProcessingSemanticVariantPrefix      = "semantic-profile-v1:"
 )
 
 // AssetProcessingStat is a low-cost Admin read model row. Counts are refreshed
@@ -147,11 +149,23 @@ func (s AssetProcessingStatsSnapshot) TotalForScope(scopeKey string, stage strin
 }
 
 func (s AssetProcessingStatsSnapshot) StatForScope(scopeKey string, stage string) (AssetProcessingStat, bool) {
+	return s.statForScopeAndVariant(scopeKey, stage, "", false)
+}
+
+func (s AssetProcessingStatsSnapshot) statForScopeVariant(scopeKey string, stage string, variant string) (AssetProcessingStat, bool) {
+	return s.statForScopeAndVariant(scopeKey, stage, variant, true)
+}
+
+func (s AssetProcessingStatsSnapshot) statForScopeAndVariant(scopeKey string, stage string, variant string, matchVariant bool) (AssetProcessingStat, bool) {
 	scopeKey = strings.TrimSpace(scopeKey)
 	stage = strings.TrimSpace(stage)
+	variant = strings.TrimSpace(variant)
 	var fallback AssetProcessingStat
 	for _, stat := range s.Stats {
 		if stat.ScopeKey != scopeKey || stat.Stage != stage {
+			continue
+		}
+		if matchVariant && strings.TrimSpace(stat.Variant) != variant {
 			continue
 		}
 		if stat.Status == AssetProcessingStatusReady {
@@ -167,7 +181,7 @@ func (s AssetProcessingStatsSnapshot) StatForScope(scopeKey string, stage string
 	return AssetProcessingStat{}, false
 }
 
-func (s AssetProcessingStatsSnapshot) statsForScopesAndStages(scopeKeys []string, stages []string) []AssetProcessingStat {
+func (s AssetProcessingStatsSnapshot) statsForScopesStagesVariant(scopeKeys []string, stages []string, variant string) []AssetProcessingStat {
 	scopeSet := make(map[string]struct{}, len(scopeKeys))
 	for _, scopeKey := range scopeKeys {
 		scopeSet[strings.TrimSpace(scopeKey)] = struct{}{}
@@ -177,6 +191,7 @@ func (s AssetProcessingStatsSnapshot) statsForScopesAndStages(scopeKeys []string
 		stageSet[strings.TrimSpace(stage)] = struct{}{}
 	}
 	stats := make([]AssetProcessingStat, 0)
+	variant = strings.TrimSpace(variant)
 	for _, stat := range s.Stats {
 		if _, ok := scopeSet[strings.TrimSpace(stat.ScopeKey)]; !ok {
 			continue
@@ -184,9 +199,41 @@ func (s AssetProcessingStatsSnapshot) statsForScopesAndStages(scopeKeys []string
 		if _, ok := stageSet[strings.TrimSpace(stat.Stage)]; !ok {
 			continue
 		}
+		if strings.TrimSpace(stat.Variant) != variant {
+			continue
+		}
 		stats = append(stats, stat)
 	}
 	return stats
+}
+
+func assetProcessingSemanticVariant(profile *SemanticModelProfileStatus) string {
+	if profile == nil {
+		return ""
+	}
+	modelID := strings.TrimSpace(profile.ModelID)
+	vectorSpaceID := strings.TrimSpace(profile.VectorSpaceID)
+	if modelID == "" || vectorSpaceID == "" {
+		return ""
+	}
+	identity, _ := json.Marshal([2]string{modelID, vectorSpaceID})
+	return assetProcessingSemanticVariantPrefix + string(identity)
+}
+
+// MatchesSemanticProfile reports whether aggregate semantic rows belong to the
+// requested profile. Legacy rows with an empty variant intentionally do not
+// match an installed profile and are recounted once after upgrade.
+func (s AssetProcessingStatsSnapshot) MatchesSemanticProfile(profile *SemanticModelProfileStatus) bool {
+	variant := assetProcessingSemanticVariant(profile)
+	if variant == "" {
+		return !s.HasStage(AssetProcessingStageEmbeddings) && !s.HasStage(AssetProcessingStageSearchIndex)
+	}
+	for _, stage := range []string{AssetProcessingStageEmbeddings, AssetProcessingStageSearchIndex} {
+		if _, ok := s.statForScopeVariant(AssetProcessingScopeAll, stage, variant); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // SemanticBackfillStatusFromAssetProcessingStats converts the Admin read model
@@ -194,7 +241,7 @@ func (s AssetProcessingStatsSnapshot) statsForScopesAndStages(scopeKeys []string
 // avoids live catalog joins so installed model status can render even while the
 // main catalog is busy.
 func SemanticBackfillStatusFromAssetProcessingStats(snapshot AssetProcessingStatsSnapshot, profile SemanticModelProfileStatus) *SemanticModelBackfillStatus {
-	if snapshot.Empty() {
+	if snapshot.Empty() || !snapshot.MatchesSemanticProfile(&profile) {
 		return nil
 	}
 	modelID := strings.TrimSpace(profile.ModelID)
@@ -211,6 +258,7 @@ func SemanticBackfillStatusFromAssetProcessingStats(snapshot AssetProcessingStat
 		EmbeddingDim:         profile.EmbeddingDim,
 		EligibleAssetCount:   snapshot.Total(AssetProcessingStageEmbeddings),
 		CompletedVectorCount: snapshot.Ready(AssetProcessingStageEmbeddings),
+		FailedVectorCount:    snapshot.Failed(AssetProcessingStageEmbeddings),
 		IndexedVectorCount:   snapshot.Ready(AssetProcessingStageSearchIndex),
 		FailedIndexJobCount:  snapshot.Failed(AssetProcessingStageSearchIndex),
 		MessageCode:          semanticBackfillMessageReady,
@@ -250,7 +298,7 @@ func (s *Service) RefreshAssetProcessingStats(ctx context.Context, profile *Sema
 	if err != nil {
 		return AssetProcessingStatsSnapshot{}, fmt.Errorf("load asset processing stats: %w", err)
 	}
-	if minAge > 0 && !current.RefreshedAt.IsZero() && time.Since(current.RefreshedAt) < minAge {
+	if minAge > 0 && !current.RefreshedAt.IsZero() && time.Since(current.RefreshedAt) < minAge && current.MatchesSemanticProfile(profile) {
 		return current, nil
 	}
 
@@ -274,19 +322,22 @@ func (s *Service) collectAssetProcessingStats(ctx context.Context, profile *Sema
 
 	datasources := s.processingStatsDatasources()
 	stats := make([]AssetProcessingStat, 0, 16)
-	addAt := func(scopeKey string, stage string, status string, count int, total int, statRefreshedAt time.Time) {
+	addVariantAt := func(scopeKey string, stage string, variant string, status string, count int, total int, statRefreshedAt time.Time) {
 		if statRefreshedAt.IsZero() {
 			statRefreshedAt = refreshedAt
 		}
 		stats = append(stats, AssetProcessingStat{
 			ScopeKey:    scopeKey,
 			Stage:       stage,
-			Variant:     "",
+			Variant:     variant,
 			Status:      status,
 			Count:       max(count, 0),
 			TotalCount:  max(total, 0),
 			RefreshedAt: statRefreshedAt,
 		})
+	}
+	addAt := func(scopeKey string, stage string, status string, count int, total int, statRefreshedAt time.Time) {
+		addVariantAt(scopeKey, stage, "", status, count, total, statRefreshedAt)
 	}
 	add := func(stage string, status string, count int, total int) {
 		addAt(AssetProcessingScopeAll, stage, status, count, total, refreshedAt)
@@ -379,30 +430,32 @@ func (s *Service) collectAssetProcessingStats(ctx context.Context, profile *Sema
 
 	semanticCountsBySource := map[string]semanticProcessingCounts{}
 	reuseSemanticStats := false
-	if profile != nil && strings.TrimSpace(profile.ModelID) != "" && strings.TrimSpace(profile.VectorSpaceID) != "" {
-		reuseSemanticStats = assetProcessingSemanticStatsFresh(current, datasources, refreshedAt)
+	semanticVariant := assetProcessingSemanticVariant(profile)
+	if semanticVariant != "" {
+		reuseSemanticStats = assetProcessingSemanticStatsFresh(current, datasources, semanticVariant, refreshedAt)
 	}
 	if reuseSemanticStats {
-		stats = append(stats, current.statsForScopesAndStages(
+		stats = append(stats, current.statsForScopesStagesVariant(
 			[]string{AssetProcessingScopeAll},
 			[]string{AssetProcessingStageEmbeddings, AssetProcessingStageSearchIndex},
+			semanticVariant,
 		)...)
-	} else if profile != nil && strings.TrimSpace(profile.ModelID) != "" && strings.TrimSpace(profile.VectorSpaceID) != "" {
+	} else if semanticVariant != "" {
 		countsBySource, status, err := s.semanticProcessingCounts(ctx, readDB, *profile)
 		if err != nil {
 			return nil, fmt.Errorf("count semantic processing stats: %w", err)
 		}
 		semanticCountsBySource = countsBySource
 		if status != nil {
-			embeddingPending := max(status.EligibleCount-status.CompletedVectorCount, 0)
-			add(AssetProcessingStageEmbeddings, AssetProcessingStatusPending, embeddingPending, status.EligibleCount)
-			add(AssetProcessingStageEmbeddings, AssetProcessingStatusReady, status.CompletedVectorCount, status.EligibleCount)
-			add(AssetProcessingStageEmbeddings, AssetProcessingStatusFailed, status.FailedVectorCount, status.EligibleCount)
+			embeddingPending := max(status.EligibleCount-status.CompletedVectorCount-status.FailedVectorCount, 0)
+			addVariantAt(AssetProcessingScopeAll, AssetProcessingStageEmbeddings, semanticVariant, AssetProcessingStatusPending, embeddingPending, status.EligibleCount, refreshedAt)
+			addVariantAt(AssetProcessingScopeAll, AssetProcessingStageEmbeddings, semanticVariant, AssetProcessingStatusReady, status.CompletedVectorCount, status.EligibleCount, refreshedAt)
+			addVariantAt(AssetProcessingScopeAll, AssetProcessingStageEmbeddings, semanticVariant, AssetProcessingStatusFailed, status.FailedVectorCount, status.EligibleCount, refreshedAt)
 
 			searchPending := max(status.CompletedVectorCount-status.IndexedVectorCount, 0)
-			add(AssetProcessingStageSearchIndex, AssetProcessingStatusPending, searchPending, status.CompletedVectorCount)
-			add(AssetProcessingStageSearchIndex, AssetProcessingStatusReady, status.IndexedVectorCount, status.CompletedVectorCount)
-			add(AssetProcessingStageSearchIndex, AssetProcessingStatusFailed, status.FailedIndexJobCount, status.CompletedVectorCount)
+			addVariantAt(AssetProcessingScopeAll, AssetProcessingStageSearchIndex, semanticVariant, AssetProcessingStatusPending, searchPending, status.CompletedVectorCount, refreshedAt)
+			addVariantAt(AssetProcessingScopeAll, AssetProcessingStageSearchIndex, semanticVariant, AssetProcessingStatusReady, status.IndexedVectorCount, status.CompletedVectorCount, refreshedAt)
+			addVariantAt(AssetProcessingScopeAll, AssetProcessingStageSearchIndex, semanticVariant, AssetProcessingStatusFailed, status.FailedIndexJobCount, status.CompletedVectorCount, refreshedAt)
 		}
 	}
 
@@ -417,19 +470,23 @@ func (s *Service) collectAssetProcessingStats(ctx context.Context, profile *Sema
 
 func (s *Service) collectDatasourceCoverageStats(ctx context.Context, db processingStatsQueryer, profile *SemanticModelProfileStatus, refreshedAt time.Time, datasources []processingStatsDatasource, semanticCountsBySource map[string]semanticProcessingCounts, reuseSemanticStats bool, current AssetProcessingStatsSnapshot) ([]AssetProcessingStat, error) {
 	stats := make([]AssetProcessingStat, 0, len(datasources)*4)
-	addAt := func(scopeKey string, stage string, status string, count int, total int, statRefreshedAt time.Time) {
+	semanticVariant := assetProcessingSemanticVariant(profile)
+	addVariantAt := func(scopeKey string, stage string, variant string, status string, count int, total int, statRefreshedAt time.Time) {
 		if statRefreshedAt.IsZero() {
 			statRefreshedAt = refreshedAt
 		}
 		stats = append(stats, AssetProcessingStat{
 			ScopeKey:    scopeKey,
 			Stage:       stage,
-			Variant:     "",
+			Variant:     variant,
 			Status:      status,
 			Count:       max(count, 0),
 			TotalCount:  max(total, 0),
 			RefreshedAt: statRefreshedAt,
 		})
+	}
+	addAt := func(scopeKey string, stage string, status string, count int, total int, statRefreshedAt time.Time) {
+		addVariantAt(scopeKey, stage, "", status, count, total, statRefreshedAt)
 	}
 	add := func(scopeKey string, stage string, status string, count int, total int) {
 		addAt(scopeKey, stage, status, count, total, refreshedAt)
@@ -446,10 +503,10 @@ func (s *Service) collectDatasourceCoverageStats(ctx context.Context, db process
 		searchableStatus := AssetProcessingStatusUnavailable
 		searchable := 0
 		searchableRefreshedAt := refreshedAt
-		if profile != nil && strings.TrimSpace(profile.ModelID) != "" && strings.TrimSpace(profile.VectorSpaceID) != "" {
+		if semanticVariant != "" {
 			searchableStatus = AssetProcessingStatusReady
 			if reuseSemanticStats {
-				if stat, ok := current.StatForScope(datasource.SourceKey, AssetProcessingStageSearchable); ok {
+				if stat, ok := current.statForScopeVariant(datasource.SourceKey, AssetProcessingStageSearchable, semanticVariant); ok {
 					searchableStatus = stat.Status
 					searchable = stat.Count
 					searchableRefreshedAt = stat.RefreshedAt
@@ -475,7 +532,7 @@ func (s *Service) collectDatasourceCoverageStats(ctx context.Context, db process
 		coverageTotal := max(found, browsable)
 		add(datasource.SourceKey, AssetProcessingStageFoundMedias, AssetProcessingStatusReady, found, found)
 		add(datasource.SourceKey, AssetProcessingStageBrowsable, AssetProcessingStatusReady, browsable, coverageTotal)
-		addAt(datasource.SourceKey, AssetProcessingStageSearchable, searchableStatus, searchable, browsable, searchableRefreshedAt)
+		addVariantAt(datasource.SourceKey, AssetProcessingStageSearchable, semanticVariant, searchableStatus, searchable, browsable, searchableRefreshedAt)
 		add(datasource.SourceKey, AssetProcessingStageIssues, AssetProcessingStatusReady, issues, coverageTotal)
 	}
 	return stats, nil
@@ -629,25 +686,26 @@ func countProcessingRows(ctx context.Context, db processingStatsQueryer, query s
 	return count, nil
 }
 
-func assetProcessingSemanticStatsFresh(current AssetProcessingStatsSnapshot, datasources []processingStatsDatasource, now time.Time) bool {
-	if current.Empty() {
+func assetProcessingSemanticStatsFresh(current AssetProcessingStatsSnapshot, datasources []processingStatsDatasource, variant string, now time.Time) bool {
+	variant = strings.TrimSpace(variant)
+	if current.Empty() || variant == "" {
 		return false
 	}
 	for _, stage := range []string{AssetProcessingStageEmbeddings, AssetProcessingStageSearchIndex} {
-		if !assetProcessingStatFresh(current, AssetProcessingScopeAll, stage, now, assetProcessingSemanticStatsRefreshMinAge) {
+		if !assetProcessingStatFresh(current, AssetProcessingScopeAll, stage, variant, now, assetProcessingSemanticStatsRefreshMinAge) {
 			return false
 		}
 	}
 	for _, datasource := range datasources {
-		if !assetProcessingStatFresh(current, datasource.SourceKey, AssetProcessingStageSearchable, now, assetProcessingSemanticStatsRefreshMinAge) {
+		if !assetProcessingStatFresh(current, datasource.SourceKey, AssetProcessingStageSearchable, variant, now, assetProcessingSemanticStatsRefreshMinAge) {
 			return false
 		}
 	}
 	return true
 }
 
-func assetProcessingStatFresh(current AssetProcessingStatsSnapshot, scopeKey string, stage string, now time.Time, maxAge time.Duration) bool {
-	stat, ok := current.StatForScope(scopeKey, stage)
+func assetProcessingStatFresh(current AssetProcessingStatsSnapshot, scopeKey string, stage string, variant string, now time.Time, maxAge time.Duration) bool {
+	stat, ok := current.statForScopeVariant(scopeKey, stage, variant)
 	if !ok || stat.RefreshedAt.IsZero() {
 		return false
 	}
@@ -683,16 +741,25 @@ func (s *Service) semanticProcessingCounts(ctx context.Context, db processingSta
 		}
 		sourceCounts := semanticProcessingCounts{EligibleCount: eligible}
 
-		completed, err := countProcessingRows(ctx, db, `SELECT COUNT(*)
-			FROM semantic_vectors
-			WHERE source_key = ?
-				AND model_id = ?
-				AND vector_space_id = ?
-				AND status = 'ready'`, sourceKey, modelID, vectorSpaceID)
+		progressWhere, progressArgs := semanticCatalogEligibilityWhere(sourceKey, profile.InputKind, "a")
+		progressArgs = append(progressArgs, modelID, vectorSpaceID)
+		var completed int
+		var failedVectors int
+		err = db.QueryRowContext(ctx, `SELECT
+				COALESCE(SUM(CASE WHEN v.status = 'ready' THEN 1 ELSE 0 END), 0),
+				COALESCE(SUM(CASE WHEN v.status = 'failed' THEN 1 ELSE 0 END), 0)
+			FROM catalog_assets a
+			JOIN semantic_vectors v
+				ON v.source_key = a.source_key
+				AND v.upstream_asset_id = a.upstream_asset_id
+			`+progressWhere+`
+				AND v.model_id = ?
+				AND v.vector_space_id = ?`, progressArgs...).Scan(&completed, &failedVectors)
 		if err != nil {
-			return nil, nil, fmt.Errorf("count semantic ready vectors: %w", err)
+			return nil, nil, fmt.Errorf("count semantic ready and failed vectors: %w", err)
 		}
 		sourceCounts.CompletedVectorCount = completed
+		sourceCounts.FailedVectorCount = failedVectors
 
 		indexed, err := countProcessingRows(ctx, db, `SELECT COALESCE((SELECT indexed_vector_count
 			FROM semantic_state
@@ -703,17 +770,6 @@ func (s *Service) semanticProcessingCounts(ctx context.Context, db processingSta
 			return nil, nil, fmt.Errorf("count indexed semantic vectors: %w", err)
 		}
 		sourceCounts.IndexedVectorCount = indexed
-
-		failedVectors, err := countProcessingRows(ctx, db, `SELECT COUNT(*)
-			FROM semantic_vectors
-			WHERE source_key = ?
-				AND model_id = ?
-				AND vector_space_id = ?
-				AND status = 'failed'`, sourceKey, modelID, vectorSpaceID)
-		if err != nil {
-			return nil, nil, fmt.Errorf("count semantic failed vectors: %w", err)
-		}
-		sourceCounts.FailedVectorCount = failedVectors
 
 		failedJobs, err := countProcessingRows(ctx, db, `SELECT COUNT(*)
 			FROM semantic_index_jobs

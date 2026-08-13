@@ -344,6 +344,61 @@ published with that release. Semantic-enabled prereleases include a
 model pack and platform runtime pack from that registry when semantic search is
 enabled.
 
+### One-Time Pre-Release V2 Catalog Migration
+
+This step applies only to a development or prerelease installation explicitly
+known to have catalog schema V2. Fresh installations and released schemas must
+skip it. Normal Agent startup intentionally does not migrate V2. The maintenance
+command is part of the same versioned `timich-agent` binary as the new service,
+requires an explicit stopped-Agent confirmation, refuses schemas other than V2
+or the already-current V3, and creates the requested backup with exclusive
+creation before changing the database.
+
+For the release-bundle Docker Compose path, stop and remove the old Agent, put
+the new bundle files in place, build the new image without starting it, and run
+the migration against the existing state volume:
+
+```bash
+compose_args=(-f compose.yaml -f compose.immich-network.yaml)
+if [ -f compose.local-media.yaml ]; then
+  compose_args+=(-f compose.local-media.yaml)
+fi
+docker compose "${compose_args[@]}" down
+
+# Extract the new complete bundle before continuing.
+docker compose "${compose_args[@]}" build timich-agent
+docker compose "${compose_args[@]}" run --rm --no-deps \
+  --entrypoint /usr/local/bin/timich-agent timich-agent \
+  pre-release-migrate-catalog-v2-v3 \
+  --data-dir /var/lib/timich-agent/state \
+  --backup /var/lib/timich-agent/backups/catalog-v2-before-v3.db \
+  --confirm-agent-stopped
+```
+
+The successful JSON result identifies the exact Agent version and commit and
+reports `fromVersion: 2`, `toVersion: 3`, the preserved asset count, active
+semantic manifest count, and reconstructed membership count. Keep the backup
+and the previous bundle until Gallery browsing and semantic search have both
+been verified. Then start the new Agent with the same Compose file list:
+
+```bash
+docker compose "${compose_args[@]}" up -d
+docker compose "${compose_args[@]}" logs -f
+```
+
+For a stopped native service, run the same command from the new versioned
+bundle before starting it, using the exact data directory configured in the
+supervisor:
+
+```bash
+state_root=/var/lib/timich-agent
+install -d -m 0700 "$state_root/backups"
+./timich-agent pre-release-migrate-catalog-v2-v3 \
+  --data-dir "$state_root/state" \
+  --backup "$state_root/backups/catalog-v2-before-v3.db" \
+  --confirm-agent-stopped
+```
+
 For Docker Compose installs, use the same compose file list you used before.
 For the common Immich Docker path, build that list once and include the Local
 media override whenever the installation uses it:

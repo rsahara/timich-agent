@@ -1187,6 +1187,7 @@ func (s *Service) semanticModelBackfillStatusForSourceKeys(ctx context.Context, 
 		status.EligibleAssetCount += sourceStatus.EligibleAssetCount
 		status.EligibleNowVectorCount += sourceStatus.EligibleNowVectorCount
 		status.CompletedVectorCount += sourceStatus.CompletedVectorCount
+		status.FailedVectorCount += sourceStatus.FailedVectorCount
 		status.IndexedVectorCount += sourceStatus.IndexedVectorCount
 		status.PendingIndexJobCount += sourceStatus.PendingIndexJobCount
 		status.FailedIndexJobCount += sourceStatus.FailedIndexJobCount

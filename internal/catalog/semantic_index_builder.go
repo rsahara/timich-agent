@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"container/heap"
+	"container/list"
 	"context"
 	"database/sql"
 	"errors"
@@ -19,9 +20,10 @@ import (
 )
 
 const (
-	semanticIndexBuilderVectorCacheLimit = 4096
-	semanticIndexBuilderTransactionSize  = 128
-	semanticIndexBuilderFormatVersion    = "2"
+	semanticIndexBuilderVectorCacheMaxBytes = 64 << 20
+	semanticIndexBuilderPrefetchSize        = 128
+	semanticIndexBuilderTransactionSize     = 128
+	semanticIndexBuilderFormatVersion       = "3"
 )
 
 type semanticIndexBuilderQueryer interface {
@@ -31,15 +33,36 @@ type semanticIndexBuilderQueryer interface {
 }
 
 type semanticIndexBuilder struct {
-	store           *CatalogStore
-	db              *sql.DB
-	path            string
-	sourceKey       string
-	profile         semanticEmbeddingProfile
-	assetGeneration int64
-	checkpoint      func(context.Context) error
-	vectorCache     map[int][]float32
-	vectorOrder     []int
+	store                 *CatalogStore
+	db                    *sql.DB
+	path                  string
+	sourceKey             string
+	profile               semanticEmbeddingProfile
+	assetGeneration       int64
+	checkpoint            func(context.Context) error
+	vectorCache           map[int]*list.Element
+	vectorLRU             *list.List
+	vectorCacheBytes      int64
+	vectorCachePeakBytes  int64
+	vectorCacheMaxBytes   int64
+	vectorCacheHits       int64
+	vectorCacheMisses     int64
+	vectorPrefetchQueries int64
+	vectorPrefetched      int64
+}
+
+type semanticIndexBuilderVectorCacheEntry struct {
+	ordinal int
+	vector  []float32
+	size    int64
+}
+
+type semanticIndexBuilderMetrics struct {
+	VectorCacheHits       int64
+	VectorCacheMisses     int64
+	VectorCachePeakBytes  int64
+	VectorPrefetchQueries int64
+	VectorPrefetched      int64
 }
 
 type semanticIndexBuilderNode struct {
@@ -169,7 +192,7 @@ func openSemanticIndexBuilder(store *CatalogStore, path string, sourceKey string
 	db.SetMaxOpenConns(1)
 	statements := []string{
 		`PRAGMA journal_mode = WAL`,
-		`PRAGMA synchronous = FULL`,
+		`PRAGMA synchronous = NORMAL`,
 		`PRAGMA busy_timeout = 5000`,
 		`CREATE TABLE IF NOT EXISTS build_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS build_nodes (
@@ -199,14 +222,16 @@ func openSemanticIndexBuilder(store *CatalogStore, path string, sourceKey string
 		}
 	}
 	return &semanticIndexBuilder{
-		store:           store,
-		db:              db,
-		path:            path,
-		sourceKey:       strings.TrimSpace(sourceKey),
-		profile:         profile,
-		assetGeneration: generation,
-		checkpoint:      checkpoint,
-		vectorCache:     make(map[int][]float32),
+		store:               store,
+		db:                  db,
+		path:                path,
+		sourceKey:           strings.TrimSpace(sourceKey),
+		profile:             profile,
+		assetGeneration:     generation,
+		checkpoint:          checkpoint,
+		vectorCache:         make(map[int]*list.Element),
+		vectorLRU:           list.New(),
+		vectorCacheMaxBytes: semanticIndexBuilderVectorCacheMaxBytes,
 	}, nil
 }
 
@@ -292,6 +317,7 @@ func (b *semanticIndexBuilder) identityMatches(ctx context.Context) (bool, error
 	}
 	return values["source_key"] == b.sourceKey &&
 		values["builder_version"] == semanticIndexBuilderFormatVersion &&
+		values["ef_construction"] == strconv.Itoa(semanticHNSWEfConstruction) &&
 		values["model_id"] == b.profile.ModelID() &&
 		values["vector_space_id"] == b.profile.VectorSpaceID() &&
 		values["embedding_dim"] == strconv.Itoa(b.profile.EmbeddingDim()) &&
@@ -379,6 +405,7 @@ func (b *semanticIndexBuilder) populate(ctx context.Context) error {
 	}
 	meta := map[string]string{
 		"builder_version":    semanticIndexBuilderFormatVersion,
+		"ef_construction":    strconv.Itoa(semanticHNSWEfConstruction),
 		"source_key":         b.sourceKey,
 		"model_id":           b.profile.ModelID(),
 		"vector_space_id":    b.profile.VectorSpaceID(),
@@ -414,6 +441,9 @@ func (b *semanticIndexBuilder) Build(ctx context.Context) error {
 		return err
 	}
 	for next < nodeCount {
+		if err := b.prefetchOrdinalRange(ctx, b.db, next, min(next+semanticIndexBuilderTransactionSize, nodeCount)); err != nil {
+			return err
+		}
 		if err := b.check(ctx); err != nil {
 			return err
 		}
@@ -534,6 +564,13 @@ func (b *semanticIndexBuilder) greedyNearest(ctx context.Context, queryer semant
 		if err != nil {
 			return current, err
 		}
+		neighbors := make([]int, 0, len(edges))
+		for _, edge := range edges {
+			neighbors = append(neighbors, edge.Neighbor)
+		}
+		if err := b.prefetchVectors(ctx, queryer, neighbors); err != nil {
+			return current, err
+		}
 		for _, edge := range edges {
 			neighborVector, err := b.vector(ctx, queryer, edge.Neighbor)
 			if err != nil {
@@ -573,11 +610,22 @@ func (b *semanticIndexBuilder) searchLayer(ctx context.Context, queryer semantic
 		if err != nil {
 			return nil, err
 		}
+		unvisited := make([]semanticIndexBuilderEdge, 0, len(edges))
 		for _, edge := range edges {
 			if _, ok := visited[edge.Neighbor]; ok {
 				continue
 			}
 			visited[edge.Neighbor] = struct{}{}
+			unvisited = append(unvisited, edge)
+		}
+		neighbors := make([]int, 0, len(unvisited))
+		for _, edge := range unvisited {
+			neighbors = append(neighbors, edge.Neighbor)
+		}
+		if err := b.prefetchVectors(ctx, queryer, neighbors); err != nil {
+			return nil, err
+		}
+		for _, edge := range unvisited {
 			vector, err := b.vector(ctx, queryer, edge.Neighbor)
 			if err != nil {
 				return nil, err
@@ -672,6 +720,9 @@ func (b *semanticIndexBuilder) ensureLevelZeroChain(ctx context.Context, nodeCou
 			return err
 		}
 		end := min(next+semanticIndexBuilderTransactionSize, nodeCount)
+		if err := b.prefetchOrdinalRange(ctx, b.db, max(0, next-1), min(end+1, nodeCount)); err != nil {
+			return err
+		}
 		tx, err := b.db.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("begin semantic index chain chunk: %w", err)
@@ -810,6 +861,11 @@ func (b *semanticIndexBuilder) WriteBinary(ctx context.Context, builtAt time.Tim
 		if err := b.check(ctx); err != nil {
 			return fail(err)
 		}
+		if ordinal%semanticIndexBuilderPrefetchSize == 0 {
+			if err := b.prefetchOrdinalRange(ctx, b.db, ordinal, min(ordinal+semanticIndexBuilderPrefetchSize, nodeCount)); err != nil {
+				return fail(err)
+			}
+		}
 		vector, err := b.vector(ctx, b.db, ordinal)
 		if err != nil {
 			return fail(err)
@@ -903,9 +959,11 @@ func (b *semanticIndexBuilder) node(ctx context.Context, queryer semanticIndexBu
 }
 
 func (b *semanticIndexBuilder) vector(ctx context.Context, queryer semanticIndexBuilderQueryer, ordinal int) ([]float32, error) {
-	if vector, ok := b.vectorCache[ordinal]; ok {
+	if vector, ok := b.cachedVector(ordinal); ok {
+		b.vectorCacheHits++
 		return vector, nil
 	}
+	b.vectorCacheMisses++
 	var batchID string
 	var offset int64
 	var length int
@@ -916,13 +974,130 @@ func (b *semanticIndexBuilder) vector(ctx context.Context, queryer semanticIndex
 	if err != nil {
 		return nil, err
 	}
-	if len(b.vectorOrder) >= semanticIndexBuilderVectorCacheLimit {
-		delete(b.vectorCache, b.vectorOrder[0])
-		b.vectorOrder = b.vectorOrder[1:]
-	}
-	b.vectorCache[ordinal] = vector
-	b.vectorOrder = append(b.vectorOrder, ordinal)
+	b.cacheVector(ordinal, vector)
 	return vector, nil
+}
+
+func (b *semanticIndexBuilder) prefetchOrdinalRange(ctx context.Context, queryer semanticIndexBuilderQueryer, start int, end int) error {
+	if start >= end {
+		return nil
+	}
+	ordinals := make([]int, 0, end-start)
+	for ordinal := start; ordinal < end; ordinal++ {
+		ordinals = append(ordinals, ordinal)
+	}
+	return b.prefetchVectors(ctx, queryer, ordinals)
+}
+
+func (b *semanticIndexBuilder) prefetchVectors(ctx context.Context, queryer semanticIndexBuilderQueryer, ordinals []int) error {
+	missing := make([]int, 0, len(ordinals))
+	seen := make(map[int]struct{}, len(ordinals))
+	for _, ordinal := range ordinals {
+		if ordinal < 0 {
+			continue
+		}
+		if _, ok := seen[ordinal]; ok {
+			continue
+		}
+		seen[ordinal] = struct{}{}
+		if _, ok := b.vectorCache[ordinal]; ok {
+			continue
+		}
+		missing = append(missing, ordinal)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(missing))
+	args := make([]any, len(missing))
+	for index, ordinal := range missing {
+		placeholders[index] = "?"
+		args[index] = ordinal
+	}
+	rows, err := queryer.QueryContext(ctx, `SELECT ordinal, payload_batch_id, vector_offset, vector_length
+		FROM build_nodes WHERE ordinal IN (`+strings.Join(placeholders, ",")+`)
+		ORDER BY payload_batch_id, vector_offset`, args...)
+	if err != nil {
+		return fmt.Errorf("prefetch semantic index builder vector refs: %w", err)
+	}
+	type vectorRef struct {
+		ordinal int
+		batchID string
+		offset  int64
+		length  int
+	}
+	refs := make([]vectorRef, 0, len(missing))
+	for rows.Next() {
+		var ref vectorRef
+		if err := rows.Scan(&ref.ordinal, &ref.batchID, &ref.offset, &ref.length); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(refs) != len(missing) {
+		return fmt.Errorf("prefetch semantic index builder vectors: found %d refs, want %d", len(refs), len(missing))
+	}
+	b.vectorPrefetchQueries++
+	for _, ref := range refs {
+		vector, err := b.store.readSemanticVectorPayload(ctx, ref.batchID, b.profile.EmbeddingDim(), ref.offset, ref.length)
+		if err != nil {
+			return err
+		}
+		b.cacheVector(ref.ordinal, vector)
+		b.vectorPrefetched++
+	}
+	return nil
+}
+
+func (b *semanticIndexBuilder) cachedVector(ordinal int) ([]float32, bool) {
+	element, ok := b.vectorCache[ordinal]
+	if !ok {
+		return nil, false
+	}
+	b.vectorLRU.MoveToBack(element)
+	return element.Value.(semanticIndexBuilderVectorCacheEntry).vector, true
+}
+
+func (b *semanticIndexBuilder) cacheVector(ordinal int, vector []float32) {
+	if element, ok := b.vectorCache[ordinal]; ok {
+		b.vectorLRU.MoveToBack(element)
+		return
+	}
+	maxBytes := b.vectorCacheMaxBytes
+	if maxBytes <= 0 {
+		return
+	}
+	size := int64(len(vector) * 4)
+	if size > maxBytes {
+		return
+	}
+	for b.vectorCacheBytes+size > maxBytes && b.vectorLRU.Len() > 0 {
+		oldest := b.vectorLRU.Front()
+		entry := oldest.Value.(semanticIndexBuilderVectorCacheEntry)
+		delete(b.vectorCache, entry.ordinal)
+		b.vectorLRU.Remove(oldest)
+		b.vectorCacheBytes -= entry.size
+	}
+	entry := semanticIndexBuilderVectorCacheEntry{ordinal: ordinal, vector: vector, size: size}
+	b.vectorCache[ordinal] = b.vectorLRU.PushBack(entry)
+	b.vectorCacheBytes += size
+	if b.vectorCacheBytes > b.vectorCachePeakBytes {
+		b.vectorCachePeakBytes = b.vectorCacheBytes
+	}
+}
+
+func (b *semanticIndexBuilder) metrics() semanticIndexBuilderMetrics {
+	return semanticIndexBuilderMetrics{
+		VectorCacheHits:       b.vectorCacheHits,
+		VectorCacheMisses:     b.vectorCacheMisses,
+		VectorCachePeakBytes:  b.vectorCachePeakBytes,
+		VectorPrefetchQueries: b.vectorPrefetchQueries,
+		VectorPrefetched:      b.vectorPrefetched,
+	}
 }
 
 func (b *semanticIndexBuilder) edges(ctx context.Context, queryer semanticIndexBuilderQueryer, source int, level int) ([]semanticIndexBuilderEdge, error) {

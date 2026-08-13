@@ -1199,6 +1199,17 @@ const dashboardHTML = `<!doctype html>
       return (tasks || []).find(task => task.phase === phase) || null;
     }
 
+    function datasourceTaskFailureText(task, count) {
+      const unit = String(task?.failureUnit || '');
+      if (unit === 'publish_jobs' || task?.phase === 'search_index') {
+        return 'publish jobs failed: ' + count;
+      }
+      if (unit === 'items' || task?.phase === 'metadata' || task?.phase === 'thumbnails' || task?.phase === 'embeddings') {
+        return 'items failed: ' + count;
+      }
+      return 'failed: ' + count;
+    }
+
     function searchCoverageModelLabel(payload) {
       const datasources = payload?.datasources || [];
       const models = Array.from(new Set(datasources.map(datasource => datasource.embeddingModelId || '').filter(Boolean)));
@@ -1224,7 +1235,7 @@ const dashboardHTML = `<!doctype html>
       } else if (done > 0) {
         parts.push('done: ' + formatCount(done));
       }
-      if (failed > 0) parts.push('failed: ' + formatCount(failed));
+      if (failed > 0) parts.push(datasourceTaskFailureText(task, formatCount(failed)));
       return parts.join('<br>');
     }
 
@@ -1332,6 +1343,9 @@ const dashboardHTML = `<!doctype html>
         return 'not enabled';
       }
       const rawStatus = task?.status || 'idle';
+      if (task?.phase === 'content_verification' && rawStatus === 'not_applicable') {
+        return 'not applicable (no local datasource)';
+      }
       const parts = [];
       const showWorkCounts = task?.phase !== 'phase0' && task?.phase !== 'content_verification';
       const showScanModeTimes = task?.phase === 'phase0' && Boolean(task?.lastQuickScanAt || task?.lastReconciliationAt);
@@ -1367,7 +1381,7 @@ const dashboardHTML = `<!doctype html>
             resultParts.push(formatCount(task.lastChangedFiles) + ' changed');
           }
           if (Number(task?.lastFailedFiles || 0) > 0) {
-            resultParts.push(formatCount(task.lastFailedFiles) + ' failed');
+            resultParts.push('failed files: ' + formatCount(task.lastFailedFiles));
           }
           parts.push((task.lastRunStatus === 'running' ? 'current: ' : 'result: ') + resultParts.join(', '));
         } else if (rawStatus === 'disabled') {
@@ -1391,9 +1405,9 @@ const dashboardHTML = `<!doctype html>
         parts.push(target > 0 ? 'waiting ' + formatCount(target) + ' queued items' : 'waiting queued items');
       }
       if (task?.failedTasksUnknown) {
-        parts.push('failed: unknown');
+        parts.push(datasourceTaskFailureText(task, 'unknown'));
       } else if (Number(task?.failedTasks || 0) > 0) {
-        parts.push('failed: ' + formatCount(task.failedTasks));
+        parts.push(datasourceTaskFailureText(task, formatCount(task.failedTasks)));
       }
       return parts.length ? parts.map(part => escapeHTML(part)).join(showScanModeTimes ? '<br>' : ' · ') : '-';
     }
@@ -1479,7 +1493,8 @@ const dashboardHTML = `<!doctype html>
     }
 
     function datasourceTaskFailureLinkHTML(task, options) {
-      if (!options.hasLocalDatasource || Number(task?.failedTasks || 0) <= 0) return '';
+      const hasLocalItemDiagnostics = task?.phase === 'metadata' || task?.phase === 'thumbnails';
+      if (!options.hasLocalDatasource || !hasLocalItemDiagnostics || Number(task?.failedTasks || 0) <= 0) return '';
       return '<div class="muted task-action-link"><a href="/v1/datasources/local/failure-diagnostics.csv" target="_blank" rel="noreferrer">Download failures CSV</a></div>';
     }
 
@@ -1575,6 +1590,7 @@ const dashboardHTML = `<!doctype html>
     }
 
     function mergeDatasourceTaskRow(task, previous) {
+      if (task?.phase === 'content_verification' && task?.status === 'not_applicable') return task;
       if (!previous) return task;
       const lastCompletedAt = latestDatasourceTaskTimestamp(task.lastCompletedAt, previous.lastCompletedAt);
       const lastQuickScanAt = latestDatasourceTaskTimestamp(task.lastQuickScanAt, previous.lastQuickScanAt);
@@ -1665,8 +1681,8 @@ const dashboardHTML = `<!doctype html>
       content_verification: 'At the configured daily time, re-hashes the least recently verified media with an idle heavy-task worker. If no worker is idle, that day is skipped. The default duration is 30 minutes; a duration of 0 disables this task.',
       metadata: 'Registers media information in the media database. Recently added or changed files remain settling before metadata processing (2 minutes by default). Requeue failed moves failed metadata jobs back to the queue at repair priority. Processing starts after settling when a worker is available, and jobs that fail again return to failed.',
       thumbnails: 'Generates thumbnails so media can be previewed quickly. Requeue failed moves failed thumbnails back to the queue at repair priority. Processing starts when a worker is available, and items that fail again return to failed.',
-      embeddings: 'Analyzes media features so visual search can find matching photos and videos. Search becomes available after the Search index processes the embeddings.',
-      search_index: 'Updates the search index so media can be searched.'
+      embeddings: 'Analyzes media features for visual search. Within each datasource, first-attempt work is prioritized ahead of eligible retries, so the failed count may remain unchanged while new embeddings complete. Search becomes available after the Search index processes the embeddings.',
+      search_index: 'Updates the search index so media can be searched. Publishing can take several hours for a large library. An existing published index remains searchable while publishing runs. Failed publish jobs are retried automatically on the next eligible run.'
     };
 
     function datasourceTaskNote(phase) {

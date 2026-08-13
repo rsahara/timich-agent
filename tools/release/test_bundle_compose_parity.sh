@@ -36,6 +36,9 @@ grep -Fq 'docker compose "${compose_args[@]}" logs -f' "$public_readme"
 grep -Fq 'copy that complete' "$public_readme"
 grep -Fq -- '-config /var/lib/timich-agent/agent.json' "$public_readme"
 grep -Fq -- '-data-dir /var/lib/timich-agent/state' "$public_readme"
+grep -Fq 'pre-release-migrate-catalog-v2-v3' "$public_readme"
+grep -Fq -- '--entrypoint /usr/local/bin/timich-agent' "$public_readme"
+grep -Fq -- '--backup /var/lib/timich-agent/backups/catalog-v2-before-v3.db' "$public_readme"
 
 sed -n 's/^      \(TIMICH_AGENT_[A-Z0-9_]*\):.*/\1/p' "$source_compose" | sort -u > "$temporary_dir/source-environment"
 sed -n 's/^      \(TIMICH_AGENT_[A-Z0-9_]*\):.*/\1/p' "$bundle_compose" | sort -u > "$temporary_dir/bundle-environment"
@@ -82,6 +85,7 @@ grep -Fq \
   "$temporary_dir/dist-dry-run"
 grep -Fxq 'FROM debian:bookworm-slim' "$bundle_dockerfile"
 grep -Fq 'libvips-tools' "$bundle_dockerfile"
+grep -Fq 'COPY timich-agent /usr/local/bin/timich-agent' "$bundle_dockerfile"
 grep -Fq \
   '"# TIMICH_AGENT_LOCAL_MEDIA_HOST_PATH=/share/Photos"' \
   "$temporary_dir/dist-dry-run"
@@ -90,6 +94,12 @@ grep -Fq \
   "$temporary_dir/dist-dry-run"
 grep -Fq \
   '"state_root=/var/lib/timich-agent"' \
+  "$temporary_dir/dist-dry-run"
+grep -Fq \
+  'pre-release-migrate-catalog-v2-v3' \
+  "$temporary_dir/dist-dry-run"
+grep -Fq \
+  '/var/lib/timich-agent/backups/catalog-v2-before-v3.db' \
   "$temporary_dir/dist-dry-run"
 grep -Fq -- \
   "-X main.releaseTag=$release_tag" \

@@ -5371,6 +5371,9 @@ func TestDatasourceTaskStatusesIncludeFailedEmbeddings(t *testing.T) {
 	if byPhase["embeddings"].FailedTasks != 1 || byPhase["embeddings"].Status != "attention" {
 		t.Fatalf("embedding task status = %+v, want failed attention", byPhase["embeddings"])
 	}
+	if note := byPhase["embeddings"].Note; !strings.Contains(note, "Within each datasource, first-attempt work is prioritized ahead of eligible retries, so the failed count may remain unchanged while new embeddings complete.") {
+		t.Fatalf("embedding task note = %q, want datasource-scoped deferred retry guidance", note)
+	}
 }
 
 func TestDatasourceTaskStatusesMarkSemanticTasksNotEnabledWithoutModel(t *testing.T) {
@@ -5893,7 +5896,7 @@ func TestDatasourceTaskStatusesShowIndexPublishQueuedTargetWait(t *testing.T) {
 	searchIndex := byPhase["search_index"]
 	if searchIndex.Status != "waiting" ||
 		searchIndex.WaitingReason != datasourceTaskWaitingQueuedTarget ||
-		searchIndex.WaitingQueuedTarget != 100 ||
+		searchIndex.WaitingQueuedTarget != 200 ||
 		searchIndex.QueuedTasks != 50 ||
 		searchIndex.CompletedTasks != 1000 ||
 		searchIndex.TotalTasks != 1050 {
@@ -5938,11 +5941,53 @@ func TestDatasourceTaskStatusesShowIndexPublishQueuedTargetWaitFromStats(t *test
 	searchIndex := byPhase["search_index"]
 	if searchIndex.Status != "waiting" ||
 		searchIndex.WaitingReason != datasourceTaskWaitingQueuedTarget ||
-		searchIndex.WaitingQueuedTarget != 100 ||
+		searchIndex.WaitingQueuedTarget != 200 ||
 		searchIndex.QueuedTasks != 50 ||
 		searchIndex.CompletedTasks != 1000 ||
 		searchIndex.TotalTasks != 1050 {
 		t.Fatalf("search index task status from stats = %+v, want queued target wait", searchIndex)
+	}
+}
+
+func TestDatasourceTaskStatusesKeepFailureUnitsOutOfProgressTotals(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntimeWithAdminToken(t, BuildInfo{}, nil, "test-admin-token")
+	stats := catalog.AssetProcessingStatsSnapshot{
+		RefreshedAt: time.Now().UTC(),
+		Stats: []catalog.AssetProcessingStat{
+			{Stage: catalog.AssetProcessingStageEmbeddings, Status: catalog.AssetProcessingStatusReady, Count: 80, TotalCount: 100},
+			{Stage: catalog.AssetProcessingStageEmbeddings, Status: catalog.AssetProcessingStatusPending, Count: 19, TotalCount: 100},
+			{Stage: catalog.AssetProcessingStageEmbeddings, Status: catalog.AssetProcessingStatusFailed, Count: 1, TotalCount: 100},
+			{Stage: catalog.AssetProcessingStageSearchIndex, Status: catalog.AssetProcessingStatusReady, Count: 70, TotalCount: 80},
+			{Stage: catalog.AssetProcessingStageSearchIndex, Status: catalog.AssetProcessingStatusPending, Count: 10, TotalCount: 80},
+			{Stage: catalog.AssetProcessingStageSearchIndex, Status: catalog.AssetProcessingStatusFailed, Count: 1, TotalCount: 80},
+		},
+	}
+
+	tasks := runtime.datasourceTaskStatuses(context.Background(), nil, stats)
+	byPhase := map[string]DatasourceTaskStatus{}
+	for _, task := range tasks {
+		byPhase[task.Phase] = task
+	}
+	embeddings := byPhase["embeddings"]
+	if embeddings.QueuedTasks != 19 ||
+		embeddings.CompletedTasks != 80 ||
+		embeddings.TotalTasks != 100 ||
+		embeddings.FailedTasks != 1 ||
+		embeddings.FailureUnit != datasourceTaskFailureUnitItems {
+		t.Fatalf("embeddings task = %+v, want disjoint item counts", embeddings)
+	}
+	searchIndex := byPhase["search_index"]
+	if searchIndex.QueuedTasks != 10 ||
+		searchIndex.CompletedTasks != 70 ||
+		searchIndex.TotalTasks != 80 ||
+		searchIndex.FailedTasks != 1 ||
+		searchIndex.FailureUnit != datasourceTaskFailureUnitPublishJobs ||
+		!strings.Contains(searchIndex.Note, "Publishing can take several hours for a large library.") ||
+		!strings.Contains(searchIndex.Note, "An existing published index remains searchable while publishing runs.") ||
+		!strings.Contains(searchIndex.Note, "Failed publish jobs are retried automatically on the next eligible run.") {
+		t.Fatalf("search index task = %+v, want vector progress plus a separate failed publish job", searchIndex)
 	}
 }
 
@@ -5980,7 +6025,7 @@ func TestNormalizeDatasourceIndexingSnapshotPrefersSearchIndexWait(t *testing.T)
 	searchIndex := byPhase["search_index"]
 	if searchIndex.Status != "waiting" ||
 		searchIndex.WaitingReason != datasourceTaskWaitingQueuedTarget ||
-		searchIndex.WaitingQueuedTarget != 100 ||
+		searchIndex.WaitingQueuedTarget != 200 ||
 		searchIndex.QueuedTasks != 50 {
 		t.Fatalf("search index task from stale snapshot = %+v, want queued target wait", searchIndex)
 	}
@@ -5997,7 +6042,7 @@ func TestApplySemanticAggregateClearsStaleSearchIndexWait(t *testing.T) {
 		CompletedTasks:      1000,
 		TotalTasks:          1050,
 		WaitingReason:       datasourceTaskWaitingQueuedTarget,
-		WaitingQueuedTarget: 100,
+		WaitingQueuedTarget: 200,
 		NextRunAt:           &nextRunAt,
 		Status:              "waiting",
 	}}
@@ -6021,6 +6066,59 @@ func TestApplySemanticAggregateClearsStaleSearchIndexWait(t *testing.T) {
 		searchIndex.CompletedTasks != 1050 ||
 		searchIndex.TotalTasks != 1050 {
 		t.Fatalf("search index task status = %+v, want stale wait cleared", searchIndex)
+	}
+}
+
+func TestApplySemanticAggregateReplacesStaleEmbeddingFailureCount(t *testing.T) {
+	t.Parallel()
+
+	tasks := []DatasourceTaskStatus{{
+		Phase:       "embeddings",
+		Label:       "Embeddings",
+		FailedTasks: 2,
+		Status:      "attention",
+	}}
+	updated := applySemanticAggregateToDatasourceTasks(tasks, catalog.SemanticModelBackfillStatus{
+		ModelID:              "model-current",
+		VectorSpaceID:        "model-current/d4",
+		EligibleAssetCount:   10,
+		FailedVectorCount:    1,
+		RemainingVectorCount: 10,
+		Status:               catalog.SemanticBackfillStatusBackfilling,
+	}, 1)
+	byPhase := map[string]DatasourceTaskStatus{}
+	for _, task := range updated {
+		byPhase[task.Phase] = task
+	}
+	embeddings := byPhase["embeddings"]
+	if embeddings.QueuedTasks != 9 || embeddings.FailedTasks != 1 || embeddings.TotalTasks != 10 {
+		t.Fatalf("embeddings task = %+v, want current model queued/failed/total 9/1/10", embeddings)
+	}
+}
+
+func TestDatasourceSemanticTaskCountsIgnoreUnscopedLocalEmbeddingFailures(t *testing.T) {
+	t.Parallel()
+
+	var status DatasourceIndexingStatus
+	status.applyLocalStatus(catalog.LocalDatasourceScanStatus{
+		SourceKey:           "1111111111111111",
+		FailedEmbeddingJobs: 2,
+	})
+	if status.FailedEmbeddingJobs != 0 {
+		t.Fatalf("raw local FailedEmbeddingJobs = %d, want unscoped failures ignored", status.FailedEmbeddingJobs)
+	}
+	status.applySemanticBackfillStatus(catalog.SemanticModelBackfillStatus{
+		ModelID:              "model-current",
+		VectorSpaceID:        "model-current/d4",
+		EligibleAssetCount:   10,
+		FailedVectorCount:    1,
+		RemainingVectorCount: 10,
+		Status:               catalog.SemanticBackfillStatusBackfilling,
+	})
+
+	summary := datasourceSemanticTaskCounts([]DatasourceIndexingStatus{status})
+	if summary.embeddingQueued != 9 || summary.failedEmbeddingJobs != 1 || summary.eligible != 10 {
+		t.Fatalf("semantic task counts = %+v, want current model queued/failed/eligible 9/1/10", summary)
 	}
 }
 
@@ -6259,6 +6357,126 @@ func TestDatasourceTaskStatsSnapshotUpdatesTasksWithoutLiveStatus(t *testing.T) 
 		coverage.SearchableMedias.Count != 50 ||
 		coverage.Issues.Count != 3 {
 		t.Fatalf("coverage = %+v, want stats-derived datasource coverage", coverage)
+	}
+}
+
+func TestDatasourceTaskStatsSnapshotRejectsDifferentSemanticProfile(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "NAS Photos",
+		Kind:      config.DatasourceKindLocalFiles,
+		RootKey:   "nas-photos",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{
+			Key:  "nas-photos",
+			Path: rootPath,
+		}}
+	})
+	currentPack := runtimeSemanticPackForTest("current-stats-model")
+	installStoredRuntimeSemanticPackForTest(t, runtime, currentPack)
+	catalogService := runtime.catalogService()
+	if catalogService == nil {
+		t.Fatal("catalogService() = nil")
+	}
+	runtime.rememberDatasourceIndexingSnapshot(catalogService, DatasourceIndexingResponse{
+		Tasks: []DatasourceTaskStatus{{
+			Phase:  "embeddings",
+			Label:  "Embeddings",
+			Status: "idle",
+		}},
+		Datasources: []DatasourceIndexingStatus{{
+			SourceKey:     "1111111111111111",
+			Name:          "NAS Photos",
+			IngestionKind: datasourceIngestionFilesystem,
+			Status:        "idle",
+			Coverage: &DatasourceCoverage{
+				SearchableMedias: DatasourceCoverageMetric{Status: catalog.AssetProcessingStatusReady},
+			},
+		}},
+	})
+
+	oldVariant := assetProcessingSemanticVariantForRuntimeTest("old-stats-model", "old-stats-model/d4")
+	oldStats := catalog.AssetProcessingStatsSnapshot{
+		RefreshedAt: time.Now().UTC(),
+		Stats: []catalog.AssetProcessingStat{{
+			ScopeKey:   catalog.AssetProcessingScopeAll,
+			Stage:      catalog.AssetProcessingStageEmbeddings,
+			Variant:    oldVariant,
+			Status:     catalog.AssetProcessingStatusFailed,
+			Count:      1,
+			TotalCount: 1,
+		}, {
+			ScopeKey: catalog.AssetProcessingScopeAll,
+			Stage:    catalog.AssetProcessingStageSearchIndex,
+			Variant:  oldVariant,
+			Status:   catalog.AssetProcessingStatusReady,
+		}, {
+			ScopeKey:   "1111111111111111",
+			Stage:      catalog.AssetProcessingStageSearchable,
+			Variant:    oldVariant,
+			Status:     catalog.AssetProcessingStatusReady,
+			Count:      1,
+			TotalCount: 1,
+		}},
+	}
+	if runtime.assetProcessingStatsMatchCurrentSemanticProfile(oldStats) {
+		t.Fatal("assetProcessingStatsMatchCurrentSemanticProfile(old stats) = true, want false")
+	}
+	runtime.rememberDatasourceTaskStatsSnapshot(context.Background(), catalogService, oldStats)
+
+	snapshot, ok := runtime.datasourceIndexingSnapshot(context.Background(), catalogService)
+	if !ok {
+		t.Fatal("datasourceIndexingSnapshot() ok = false, want baseline snapshot")
+	}
+	if len(snapshot.Tasks) != 1 || snapshot.Tasks[0].FailedTasks != 0 || snapshot.Tasks[0].Status != "idle" {
+		t.Fatalf("tasks = %+v, want old-profile failures ignored", snapshot.Tasks)
+	}
+	if len(snapshot.Datasources) != 1 || snapshot.Datasources[0].Coverage == nil || snapshot.Datasources[0].Coverage.SearchableMedias.Count != 0 {
+		t.Fatalf("datasources = %+v, want old-profile searchable coverage ignored", snapshot.Datasources)
+	}
+}
+
+func TestCachedAssetProcessingStatsRejectsDifferentSemanticProfile(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "NAS Photos",
+		Kind:      config.DatasourceKindLocalFiles,
+		RootKey:   "nas-photos",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{
+			Key:  "nas-photos",
+			Path: rootPath,
+		}}
+	})
+	catalogService := runtime.catalogService()
+	if catalogService == nil {
+		t.Fatal("catalogService() = nil")
+	}
+	oldProfile := catalog.SemanticModelProfileStatus{
+		ModelID:       "cached-old-model",
+		VectorSpaceID: "cached-old-model/d4",
+		EmbeddingDim:  4,
+		ProfileKind:   catalog.SemanticProfileKindModelPack,
+		InputKind:     catalog.SemanticInputKindImage,
+	}
+	oldStats, err := catalogService.RefreshAssetProcessingStats(context.Background(), &oldProfile, 0)
+	if err != nil {
+		t.Fatalf("RefreshAssetProcessingStats(old profile) error = %v", err)
+	}
+	if oldStats.Empty() || !oldStats.MatchesSemanticProfile(&oldProfile) {
+		t.Fatalf("old stats = %+v, want persisted old-profile semantic rows", oldStats)
+	}
+
+	currentPack := runtimeSemanticPackForTest("cached-current-model")
+	installStoredRuntimeSemanticPackForTest(t, runtime, currentPack)
+	if got := runtime.cachedAssetProcessingStatsForAdmin(context.Background(), catalogService); !got.Empty() {
+		t.Fatalf("cachedAssetProcessingStatsForAdmin() = %+v, want old-profile snapshot rejected", got)
 	}
 }
 
@@ -6632,8 +6850,12 @@ func TestSemanticProgressSnapshotPreservesActiveEmbedding(t *testing.T) {
 	if got := byPhase["embeddings"]; got.ActiveTasks != 1 || got.Status != "running" || got.QueuedTasks != 20 {
 		t.Fatalf("embedding task = %+v, want progress update to preserve running activity", got)
 	}
-	if got := byPhase["search_index"]; got.ActiveTasks != 0 || got.Status != "queued" || got.QueuedTasks != 10 {
-		t.Fatalf("search index task = %+v, want progress update to preserve queued index work", got)
+	if got := byPhase["search_index"]; got.ActiveTasks != 0 ||
+		got.Status != "waiting" ||
+		got.WaitingReason != datasourceTaskWaitingQueuedTarget ||
+		got.WaitingQueuedTarget != 14 ||
+		got.QueuedTasks != 10 {
+		t.Fatalf("search index task = %+v, want progress update to expose 20%% publish wait", got)
 	}
 }
 
@@ -6974,6 +7196,121 @@ func TestDatasourceIndexingSnapshotRejectsPersistedConfigMismatch(t *testing.T) 
 	}
 }
 
+func TestDatasourceIndexingSnapshotRejectsPersistedSemanticProfileMismatch(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, nil, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{
+			Key:  "nas-photos",
+			Path: rootPath,
+		}}
+		cfg.Datasources = []config.DatasourceConfig{{
+			SourceKey: "1111111111111111",
+			Name:      "NAS Photos",
+			Kind:      config.DatasourceKindLocalFiles,
+			RootKey:   "nas-photos",
+		}}
+	})
+	catalogService := runtime.catalogService()
+	if catalogService == nil {
+		t.Fatal("catalogService() = nil")
+	}
+	oldPack := runtimeSemanticPackForTest("snapshot-old-model")
+	installStoredRuntimeSemanticPackForTest(t, runtime, oldPack)
+	if _, err := runtime.semanticModels.ActivatePack(oldPack.ID, oldPack.VectorSpaceID); err != nil {
+		t.Fatalf("ActivatePack(old) error = %v", err)
+	}
+	oldHash := runtime.datasourceIndexingConfigHash()
+	runtime.rememberDatasourceIndexingSnapshot(catalogService, DatasourceIndexingResponse{
+		Tasks: []DatasourceTaskStatus{{
+			Phase:       "embeddings",
+			Label:       "Embeddings",
+			FailedTasks: 1,
+			Status:      "attention",
+		}},
+	})
+
+	newPack := runtimeSemanticPackForTest("snapshot-new-model")
+	installStoredRuntimeSemanticPackForTest(t, runtime, newPack)
+	newHash := runtime.datasourceIndexingConfigHash()
+	if oldHash == newHash {
+		t.Fatalf("datasourceIndexingConfigHash() did not change across profiles: %q", oldHash)
+	}
+	runtime.datasourceTaskMu.Lock()
+	runtime.datasourceSnapshot = nil
+	runtime.datasourceSnapshotAt = time.Time{}
+	runtime.datasourceSnapshotHash = ""
+	runtime.datasourceSnapshotInvalid = false
+	runtime.datasourceTaskMu.Unlock()
+
+	ctx := context.Background()
+	if snapshot, ok := runtime.datasourceIndexingSnapshot(ctx, catalogService); ok {
+		t.Fatalf("datasourceIndexingSnapshot() = %+v, want old-profile snapshot rejected", snapshot)
+	}
+	if snapshot, ok, err := catalogService.AdminStatusSnapshot(ctx, datasourceIndexingStatusSnapshotKey); err != nil || ok {
+		t.Fatalf("AdminStatusSnapshot() after profile mismatch = snapshot:%+v ok:%v err:%v, want deleted", snapshot, ok, err)
+	}
+}
+
+func TestDatasourceIndexingSnapshotDoesNotRetagResponseAfterSemanticProfileChange(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, nil, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{
+			Key:  "nas-photos",
+			Path: rootPath,
+		}}
+		cfg.Datasources = []config.DatasourceConfig{{
+			SourceKey: "1111111111111111",
+			Name:      "NAS Photos",
+			Kind:      config.DatasourceKindLocalFiles,
+			RootKey:   "nas-photos",
+		}}
+	})
+	catalogService := runtime.catalogService()
+	if catalogService == nil {
+		t.Fatal("catalogService() = nil")
+	}
+	oldPack := runtimeSemanticPackForTest("snapshot-build-old-model")
+	installStoredRuntimeSemanticPackForTest(t, runtime, oldPack)
+	if _, err := runtime.semanticModels.ActivatePack(oldPack.ID, oldPack.VectorSpaceID); err != nil {
+		t.Fatalf("ActivatePack(old) error = %v", err)
+	}
+
+	response, err := runtime.buildDatasourceIndexingStatus(context.Background(), catalogService)
+	if err != nil {
+		t.Fatalf("buildDatasourceIndexingStatus(old profile) error = %v", err)
+	}
+	response.Tasks = []DatasourceTaskStatus{{
+		Phase:       "embeddings",
+		Label:       "Embeddings",
+		FailedTasks: 1,
+		Status:      "attention",
+	}}
+	buildHash := response.snapshotConfigHash
+	if buildHash == "" {
+		t.Fatal("response snapshotConfigHash is empty")
+	}
+
+	newPack := runtimeSemanticPackForTest("snapshot-build-new-model")
+	installStoredRuntimeSemanticPackForTest(t, runtime, newPack)
+	currentHash := runtime.datasourceIndexingConfigHash()
+	if currentHash == buildHash {
+		t.Fatalf("datasourceIndexingConfigHash() = build hash %q after profile change", buildHash)
+	}
+	if runtime.rememberDatasourceIndexingSnapshot(catalogService, response) {
+		t.Fatal("rememberDatasourceIndexingSnapshot(old response) = true, want rejected")
+	}
+	if snapshot, ok := runtime.datasourceIndexingSnapshot(context.Background(), catalogService); ok {
+		t.Fatalf("datasourceIndexingSnapshot() = %+v, want no retagged old-profile snapshot", snapshot)
+	}
+	if snapshot, ok, err := catalogService.AdminStatusSnapshot(context.Background(), datasourceIndexingStatusSnapshotKey); err != nil || ok {
+		t.Fatalf("AdminStatusSnapshot() = snapshot:%+v ok:%v err:%v, want no persisted old response", snapshot, ok, err)
+	}
+}
+
 func TestDatasourceIndexingSnapshotFallbackOnlyAllowsTimeouts(t *testing.T) {
 	t.Parallel()
 
@@ -7094,6 +7431,31 @@ func TestDatasourceTaskStatusesShowZeroDurationContentVerificationDisabled(t *te
 		if task.Phase == "content_verification" {
 			if task.Status != "disabled" || task.QueuedTasks != 0 {
 				t.Fatalf("content verification task = %+v, want disabled without queued work", task)
+			}
+			return
+		}
+	}
+	t.Fatal("content verification task is missing")
+}
+
+func TestDatasourceTaskStatusesShowContentVerificationNotApplicableWithoutLocalDatasource(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntimeWithAdminToken(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "Immich",
+		Kind:      config.DatasourceKindImmichIndexed,
+	}}, "test-admin-token")
+	tasks := runtime.datasourceTaskStatuses(context.Background(), []DatasourceIndexingStatus{{
+		SourceKey:       "1111111111111111",
+		Name:            "Immich",
+		IngestionKind:   datasourceIngestionRemoteAPI,
+		IndexingEnabled: true,
+	}})
+	for _, task := range tasks {
+		if task.Phase == "content_verification" {
+			if task.Status != "not_applicable" || task.QueuedTasks != 0 || task.LastRunStatus != "" {
+				t.Fatalf("content verification task = %+v, want not applicable without queued work or a synthetic run result", task)
 			}
 			return
 		}
@@ -7758,16 +8120,16 @@ func TestSemanticBackfillWorkSeparatesVectorAndPublishWork(t *testing.T) {
 		t.Fatalf("active role priority = %d, want 1", got)
 	}
 	if semanticPriorityIndexPublishDue(catalog.SemanticModelBackfillStatus{
-		CompletedVectorCount: 109,
+		CompletedVectorCount: 119,
 		IndexedVectorCount:   100,
 	}) {
-		t.Fatal("semanticPriorityIndexPublishDue(9 queued over 100 indexed) = true, want false")
+		t.Fatal("semanticPriorityIndexPublishDue(19 queued over 100 indexed) = true, want false")
 	}
 	if !semanticPriorityIndexPublishDue(catalog.SemanticModelBackfillStatus{
-		CompletedVectorCount: 110,
+		CompletedVectorCount: 120,
 		IndexedVectorCount:   100,
 	}) {
-		t.Fatal("semanticPriorityIndexPublishDue(10 queued over 100 indexed) = false, want true")
+		t.Fatal("semanticPriorityIndexPublishDue(20 queued over 100 indexed) = false, want true")
 	}
 	mixedSchedule := semanticIndexingSchedule{BatchSize: 10}
 	if got, ok := semanticMixedIndexingBatchSizeForStatus(mixedSchedule, catalog.SemanticModelBackfillStatus{
@@ -8532,6 +8894,28 @@ func runtimeSemanticPackForTest(modelID string) catalog.SemanticModelPackStatus 
 	}
 }
 
+func installStoredRuntimeSemanticPackForTest(t *testing.T, runtime *AgentRuntime, pack catalog.SemanticModelPackStatus) {
+	t.Helper()
+
+	artifact := runtimeSemanticPackArtifactForTest(t, pack)
+	sum := sha256.Sum256(artifact)
+	pack.Artifact.SHA256 = hex.EncodeToString(sum[:])
+	pack.Artifact.SizeBytes = int64(len(artifact))
+	pack.SizeBytes = int64(len(artifact))
+	result, err := runtime.semanticModels.InstallPack(context.Background(), pack, bytes.NewReader(artifact))
+	if err != nil {
+		t.Fatalf("InstallPack(%q) error = %v", pack.ID, err)
+	}
+	if err := runtime.semanticModels.FinalizePackInstall(pack.ID, pack.VectorSpaceID, result.InstallID); err != nil {
+		t.Fatalf("FinalizePackInstall(%q) error = %v", pack.ID, err)
+	}
+}
+
+func assetProcessingSemanticVariantForRuntimeTest(modelID string, vectorSpaceID string) string {
+	identity, _ := json.Marshal([2]string{modelID, vectorSpaceID})
+	return "semantic-profile-v1:" + string(identity)
+}
+
 func semanticRuntimePackArtifactForRuntimeTest(t *testing.T) []byte {
 	t.Helper()
 
@@ -8928,7 +9312,7 @@ func TestSemanticPriorityIndexPublishDue(t *testing.T) {
 		{
 			name: "below threshold waits",
 			status: catalog.SemanticModelBackfillStatus{
-				CompletedVectorCount: 109,
+				CompletedVectorCount: 119,
 				IndexedVectorCount:   100,
 				RemainingVectorCount: 0,
 			},
@@ -8946,9 +9330,9 @@ func TestSemanticPriorityIndexPublishDue(t *testing.T) {
 			name: "ongoing embeddings publish at threshold",
 			status: catalog.SemanticModelBackfillStatus{
 				EligibleAssetCount:   100,
-				CompletedVectorCount: 61,
+				CompletedVectorCount: 66,
 				IndexedVectorCount:   55,
-				RemainingVectorCount: 39,
+				RemainingVectorCount: 34,
 			},
 			want: true,
 		},
@@ -8987,5 +9371,39 @@ func TestSemanticPriorityIndexPublishDue(t *testing.T) {
 				t.Fatalf("semanticPriorityIndexPublishDue() = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestSemanticIndexPartialPublishQueuedThreshold(t *testing.T) {
+	t.Parallel()
+
+	maxInt := int(^uint(0) >> 1)
+	maxIntThreshold := maxInt / semanticIndexPartialPublishDivisor
+	if maxInt%semanticIndexPartialPublishDivisor != 0 {
+		maxIntThreshold++
+	}
+	tests := []struct {
+		indexed int
+		want    int
+	}{
+		{indexed: 0, want: 1},
+		{indexed: 1, want: 1},
+		{indexed: 5, want: 1},
+		{indexed: 6, want: 2},
+		{indexed: 100, want: 20},
+		{indexed: 101, want: 21},
+		{indexed: maxInt, want: maxIntThreshold},
+	}
+	for _, test := range tests {
+		if got := semanticIndexPartialPublishQueuedThreshold(test.indexed); got != test.want {
+			t.Fatalf("semanticIndexPartialPublishQueuedThreshold(%d) = %d, want %d", test.indexed, got, test.want)
+		}
+	}
+
+	if target, wait := semanticIndexPartialPublishWaitTarget(1000, 50, 450, 0); !wait || target != 200 {
+		t.Fatalf("semanticIndexPartialPublishWaitTarget(backfill) = %d, %t; want 200, true", target, wait)
+	}
+	if target, wait := semanticIndexPartialPublishWaitTarget(1000, 50, 0, 0); wait || target != 0 {
+		t.Fatalf("semanticIndexPartialPublishWaitTarget(final flush) = %d, %t; want 0, false", target, wait)
 	}
 }

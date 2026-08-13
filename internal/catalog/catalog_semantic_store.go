@@ -20,7 +20,7 @@ const (
 	semanticHNSWMaxNeighbors   = 16
 	semanticHNSWMaxLevel       = 5
 	semanticHNSWEfSearch       = 256
-	semanticHNSWEfConstruction = 512
+	semanticHNSWEfConstruction = 192
 
 	semanticDiversityMinCandidates               = 80
 	semanticDiversityCandidateMultiplier         = 4
@@ -132,6 +132,10 @@ func (s *semanticIndexTraversalSession) Advance(ctx context.Context, additionalV
 	}
 	s.Exhausted = exhausted
 	return scored, nil
+}
+
+func (s *semanticIndexTraversalSession) Done() bool {
+	return s == nil || s.Exhausted || s.traversal == nil
 }
 
 func (s *CatalogStore) SearchSemanticCapabilities(ctx context.Context, sourceKey string, profile semanticEmbeddingProfile) *AssetSearchSemanticCapabilities {
@@ -453,20 +457,22 @@ func (s *CatalogStore) SemanticBackfillStatus(ctx context.Context, sourceKey str
 		modelID,
 		vectorSpaceID,
 	)
-	completedCount, indexedCount, err := s.semanticVectorProgressCounts(ctx, sourceKey, modelID, vectorSpaceID, profile.InputKind)
+	completedCount, failedCount, indexedCount, err := s.semanticVectorProgressCounts(ctx, sourceKey, modelID, vectorSpaceID, profile.InputKind)
 	if err != nil {
 		return SemanticModelBackfillStatus{}, err
 	}
 	log.Printf(
-		"timich-agent catalog semantic backfill status step completed source_key=%s model=%s vector_space=%s step=vector_progress completed=%d indexed=%d elapsed=%s",
+		"timich-agent catalog semantic backfill status step completed source_key=%s model=%s vector_space=%s step=vector_progress completed=%d failed=%d indexed=%d elapsed=%s",
 		sourceKey,
 		modelID,
 		vectorSpaceID,
 		completedCount,
+		failedCount,
 		indexedCount,
 		time.Since(stepStarted).Round(time.Millisecond),
 	)
 	status.CompletedVectorCount = completedCount
+	status.FailedVectorCount = failedCount
 	status.IndexedVectorCount = indexedCount
 	eligibleNow, nextEligibleAt, err := s.semanticBackfillEligibilityState(ctx, sourceKey, profile, time.Now().UTC())
 	if err != nil {
@@ -631,33 +637,35 @@ func (s *CatalogStore) semanticBackfillEligibilityState(ctx context.Context, sou
 	return eligibleNow, &nextEligibleAt, nil
 }
 
-func (s *CatalogStore) semanticVectorProgressCounts(ctx context.Context, sourceKey string, modelID string, vectorSpaceID string, inputKind string) (int, int, error) {
+func (s *CatalogStore) semanticVectorProgressCounts(ctx context.Context, sourceKey string, modelID string, vectorSpaceID string, inputKind string) (int, int, int, error) {
 	db := s.queryDB()
 	var completed int
+	var failed int
 	var indexed int
 	where, args := semanticCatalogEligibilityWhere(sourceKey, inputKind, "a")
 	completedArgs := append(append([]any{}, args...), strings.TrimSpace(modelID), strings.TrimSpace(vectorSpaceID))
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+	if err := db.QueryRowContext(ctx, `SELECT
+			COALESCE(SUM(CASE WHEN v.status = 'ready' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN v.status = 'failed' THEN 1 ELSE 0 END), 0)
 		FROM catalog_assets a
 		JOIN semantic_vectors v
 			ON v.source_key = a.source_key
 			AND v.upstream_asset_id = a.upstream_asset_id
 		`+where+`
 			AND v.model_id = ?
-			AND v.vector_space_id = ?
-			AND v.status = 'ready'`,
+			AND v.vector_space_id = ?`,
 		completedArgs...,
-	).Scan(&completed); err != nil {
-		return 0, 0, fmt.Errorf("count semantic vector progress: %w", err)
+	).Scan(&completed, &failed); err != nil {
+		return 0, 0, 0, fmt.Errorf("count semantic vector progress: %w", err)
 	}
 	if err := db.QueryRowContext(ctx, `SELECT COALESCE(indexed_vector_count, 0)
 		FROM semantic_state
 		WHERE source_key = ? AND model_id = ? AND vector_space_id = ?`,
 		strings.TrimSpace(sourceKey), strings.TrimSpace(modelID), strings.TrimSpace(vectorSpaceID),
 	).Scan(&indexed); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, 0, fmt.Errorf("count indexed semantic vector progress: %w", err)
+		return 0, 0, 0, fmt.Errorf("count indexed semantic vector progress: %w", err)
 	}
-	return completed, indexed, nil
+	return completed, failed, indexed, nil
 }
 
 func (s *CatalogStore) semanticBackfillLastPublishedAt(ctx context.Context, sourceKey string, modelID string, vectorSpaceID string) (*time.Time, error) {
@@ -1171,7 +1179,7 @@ func (s *CatalogStore) PublishNextSemanticIndexJob(ctx context.Context, sourceKe
 	if err != nil {
 		return failJob(err)
 	}
-	completedAt, err := s.publishSemanticBackfillIndex(ctx, job, profile, builder)
+	completedAt, manifest, err := s.publishSemanticBackfillIndex(ctx, job, profile, builder)
 	if err != nil {
 		return failJob(err)
 	}
@@ -1187,7 +1195,7 @@ func (s *CatalogStore) PublishNextSemanticIndexJob(ctx context.Context, sourceKe
 	if err := s.finalizeSemanticIndexJob(transitionCtx, job, profile, status, completedAt); err != nil {
 		return failJob(err)
 	}
-	if err := s.activateSemanticBinaryIndex(ctx, job.SourceKey, profile, job.AssetGeneration); err != nil {
+	if err := s.activateSemanticBinaryManifest(ctx, job.SourceKey, profile, manifest); err != nil {
 		return failJob(err)
 	}
 	if cleanupErr := s.cleanupSemanticBinaryIndexGenerations(context.Background(), job.SourceKey, profile, &job.AssetGeneration, true); cleanupErr != nil {
@@ -1423,30 +1431,66 @@ func (s *CatalogStore) semanticIndexLeaseCheckpoint(job *semanticIndexJob) func(
 	}
 }
 
-func (s *CatalogStore) publishSemanticBackfillIndex(ctx context.Context, job *semanticIndexJob, profile semanticEmbeddingProfile, builder *semanticIndexBuilder) (time.Time, error) {
+func (s *CatalogStore) publishSemanticBackfillIndex(ctx context.Context, job *semanticIndexJob, profile semanticEmbeddingProfile, builder *semanticIndexBuilder) (time.Time, semanticBinaryActiveManifest, error) {
 	if job == nil {
-		return time.Time{}, ErrCatalogNotConfigured
+		return time.Time{}, semanticBinaryActiveManifest{}, ErrCatalogNotConfigured
 	}
 	if builder == nil {
-		return time.Time{}, ErrCatalogNotConfigured
+		return time.Time{}, semanticBinaryActiveManifest{}, ErrCatalogNotConfigured
 	}
+	nodeCount, err := builder.metaInt(ctx, builder.db, "node_count")
+	if err != nil {
+		return time.Time{}, semanticBinaryActiveManifest{}, err
+	}
+	resumeOrdinal, err := builder.metaInt(ctx, builder.db, "next_ordinal")
+	if err != nil {
+		return time.Time{}, semanticBinaryActiveManifest{}, err
+	}
+	buildStarted := time.Now()
 	if err := builder.Build(ctx); err != nil {
-		return time.Time{}, err
+		return time.Time{}, semanticBinaryActiveManifest{}, err
 	}
+	buildElapsed := time.Since(buildStarted)
 	var currentGeneration int64
 	if err := s.db.QueryRowContext(ctx, `SELECT asset_generation
 		FROM semantic_state
 		WHERE source_key = ? AND model_id = ?`, job.SourceKey, profile.ModelID()).Scan(&currentGeneration); err != nil {
-		return time.Time{}, fmt.Errorf("read semantic generation before publish: %w", err)
+		return time.Time{}, semanticBinaryActiveManifest{}, fmt.Errorf("read semantic generation before publish: %w", err)
 	}
 	if currentGeneration != job.AssetGeneration {
-		return time.Time{}, fmt.Errorf("semantic asset generation changed during publish: got %d want %d", currentGeneration, job.AssetGeneration)
+		return time.Time{}, semanticBinaryActiveManifest{}, fmt.Errorf("semantic asset generation changed during publish: got %d want %d", currentGeneration, job.AssetGeneration)
 	}
 	publishedAt := time.Now().UTC()
+	binaryStarted := time.Now()
 	if err := builder.WriteBinary(ctx, publishedAt); err != nil {
-		return time.Time{}, err
+		return time.Time{}, semanticBinaryActiveManifest{}, err
 	}
-	return publishedAt, nil
+	binaryElapsed := time.Since(binaryStarted)
+	metrics := builder.metrics()
+	log.Printf("timich-agent semantic hnsw build completed source_key=%s model=%s generation=%d nodes=%d resume_ordinal=%d ef_construction=%d synchronous=NORMAL build_elapsed=%s binary_elapsed=%s vector_cache_limit_bytes=%d vector_cache_peak_bytes=%d vector_cache_hits=%d vector_cache_misses=%d vector_prefetch_queries=%d vector_prefetched=%d",
+		job.SourceKey,
+		profile.ModelID(),
+		job.AssetGeneration,
+		nodeCount,
+		resumeOrdinal,
+		semanticHNSWEfConstruction,
+		buildElapsed.Round(time.Millisecond),
+		binaryElapsed.Round(time.Millisecond),
+		semanticIndexBuilderVectorCacheMaxBytes,
+		metrics.VectorCachePeakBytes,
+		metrics.VectorCacheHits,
+		metrics.VectorCacheMisses,
+		metrics.VectorPrefetchQueries,
+		metrics.VectorPrefetched,
+	)
+	manifest, err := s.prepareSemanticBinaryActiveManifest(ctx, job.SourceKey, profile, job.AssetGeneration)
+	if err != nil {
+		return time.Time{}, semanticBinaryActiveManifest{}, err
+	}
+	if err := s.ensureSemanticBinaryMembership(ctx, manifest); err != nil {
+		return time.Time{}, semanticBinaryActiveManifest{}, err
+	}
+	return publishedAt, manifest, nil
 }
 
 func (s *CatalogStore) upsertSemanticBackfillState(ctx context.Context, sourceKey string, profile semanticEmbeddingProfile, status SemanticModelBackfillStatus, now time.Time) error {

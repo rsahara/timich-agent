@@ -34,6 +34,7 @@ type schedulerWorkState struct {
 	SemanticMixedEmbeddingBatch   int
 	SemanticEligibleVectors       int
 	SemanticCompletedVectors      int
+	SemanticFailedVectors         int
 	SemanticIndexedVectors        int
 	SemanticPendingIndexJobs      int
 	SemanticFailedIndexJobs       int
@@ -286,6 +287,7 @@ func (s *schedulerWorkState) applySemanticBackfillStatus(candidate catalog.Seman
 	s.SemanticSelectedVectorSpaceID = candidate.VectorSpaceID
 	s.SemanticEligibleVectors = max(status.EligibleAssetCount, 0)
 	s.SemanticCompletedVectors = max(status.CompletedVectorCount, 0)
+	s.SemanticFailedVectors = max(status.FailedVectorCount, 0)
 	s.SemanticIndexedVectors = max(status.IndexedVectorCount, 0)
 	s.SemanticPendingIndexJobs = max(status.PendingIndexJobCount, 0)
 	s.SemanticFailedIndexJobs = max(status.FailedIndexJobCount, 0)
@@ -442,6 +444,7 @@ func (a *AgentRuntime) schedulerWorkStateApplySemanticStatusAfterEmbedding(statu
 	defer a.schedulerWorkStateMu.Unlock()
 	a.schedulerWorkState.SemanticEligibleVectors = max(status.EligibleAssetCount, 0)
 	a.schedulerWorkState.SemanticCompletedVectors = max(status.CompletedVectorCount, 0)
+	a.schedulerWorkState.SemanticFailedVectors = max(status.FailedVectorCount, 0)
 	a.schedulerWorkState.SemanticIndexedVectors = max(status.IndexedVectorCount, 0)
 	a.schedulerWorkState.SemanticPendingIndexJobs = max(status.PendingIndexJobCount, 0)
 	a.schedulerWorkState.SemanticFailedIndexJobs = max(status.FailedIndexJobCount, 0)

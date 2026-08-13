@@ -369,6 +369,7 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 		!bytes.Contains(body, []byte("result: skipped (")) ||
 		!bytes.Contains(body, []byte("root_identity_changed")) ||
 		!bytes.Contains(body, []byte("root changed")) ||
+		!bytes.Contains(body, []byte("not applicable (no local datasource)")) ||
 		!bytes.Contains(body, []byte("content verification is disabled")) ||
 		!bytes.Contains(body, []byte("task?.phase !== 'content_verification'")) ||
 		!bytes.Contains(body, []byte("datasourceContentVerificationEventAt(task)")) ||
@@ -550,6 +551,49 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 	}
 }
 
+func TestDashboardSeparatesDatasourceTaskFailureUnits(t *testing.T) {
+	t.Parallel()
+
+	failureText := dashboardSnippet(t, "function datasourceTaskFailureText", "function searchCoverageModelLabel")
+	for _, marker := range []string{
+		"publish jobs failed: ",
+		"items failed: ",
+		"unit === 'publish_jobs'",
+		"unit === 'items'",
+	} {
+		if !strings.Contains(failureText, marker) {
+			t.Fatalf("failure formatter is missing %q:\n%s", marker, failureText)
+		}
+	}
+
+	searchCoverage := dashboardSnippet(t, "function searchCoverageLine", "function searchCoverageNoticeHTML")
+	if !strings.Contains(searchCoverage, "datasourceTaskFailureText(task, formatCount(failed))") ||
+		strings.Contains(searchCoverage, "parts.push('failed: '") {
+		t.Fatalf("search coverage still renders an unscoped failure count:\n%s", searchCoverage)
+	}
+
+	taskStatus := dashboardSnippet(t, "function datasourceTaskStatusHTML", "function datasourceTaskNoteHTML")
+	if !strings.Contains(taskStatus, "datasourceTaskFailureText(task, 'unknown')") ||
+		!strings.Contains(taskStatus, "datasourceTaskFailureText(task, formatCount(task.failedTasks))") ||
+		!strings.Contains(taskStatus, "'failed files: ' + formatCount(task.lastFailedFiles)") {
+		t.Fatalf("datasource task status is missing scoped failure labels:\n%s", taskStatus)
+	}
+
+	failureLink := dashboardSnippet(t, "function datasourceTaskFailureLinkHTML", "function datasourceTaskStatusClass")
+	if !strings.Contains(failureLink, "task?.phase === 'metadata' || task?.phase === 'thumbnails'") ||
+		strings.Contains(failureLink, "search_index") ||
+		strings.Contains(failureLink, "embeddings") {
+		t.Fatalf("local failure CSV link is not limited to local item-only task phases:\n%s", failureLink)
+	}
+
+	taskNotes := dashboardSnippet(t, "const datasourceTaskNotes", "function datasourceTaskNote")
+	if !strings.Contains(taskNotes, "Publishing can take several hours for a large library.") ||
+		!strings.Contains(taskNotes, "An existing published index remains searchable while publishing runs.") ||
+		!strings.Contains(taskNotes, "Failed publish jobs are retried automatically on the next eligible run.") {
+		t.Fatalf("search index task note does not explain automatic publish retry:\n%s", taskNotes)
+	}
+}
+
 func TestDashboardDatasourceSaveFailureRestoresStatusBeforeError(t *testing.T) {
 	t.Parallel()
 
@@ -603,6 +647,30 @@ func TestDashboardWorkerSaveRefreshesSetupTasks(t *testing.T) {
 		"loadStatus(),",
 		"loadSemanticModels({ forceRefresh: true }),",
 		"workerRuntimeMessage.textContent = 'Saved worker settings';",
+	)
+}
+
+func TestDashboardContentVerificationNotApplicableDiscardsCachedResult(t *testing.T) {
+	t.Parallel()
+
+	mergeSnippet := dashboardSnippet(t,
+		"function mergeDatasourceTaskRow(task, previous)",
+		"function latestDatasourceTaskTimestamp(first, second)",
+	)
+	assertSnippetOrder(t, mergeSnippet,
+		"if (task?.phase === 'content_verification' && task?.status === 'not_applicable') return task;",
+		"if (!previous) return task;",
+		"const previousContentResultAt = Date.parse(datasourceContentVerificationEventAt(previous));",
+	)
+
+	statusSnippet := dashboardSnippet(t,
+		"function datasourceTaskStatusHTML(task)",
+		"function datasourceTaskNoteHTML(task)",
+	)
+	assertSnippetOrder(t, statusSnippet,
+		"if (task?.phase === 'content_verification' && rawStatus === 'not_applicable')",
+		"const lastAt = datasourceContentVerificationEventAt(task);",
+		"if (task?.lastRunStatus === 'skipped')",
 	)
 }
 
