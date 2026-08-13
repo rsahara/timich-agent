@@ -127,24 +127,194 @@ func TestRefreshAssetProcessingStatsReusesSemanticCountsForShortInterval(t *test
 	assertAssetProcessingScopedStat(t, recounted, "1111111111111111", AssetProcessingStageSearchable, AssetProcessingStatusReady, 2, 2)
 }
 
-func TestSemanticBackfillStatusFromAssetProcessingStatsKeepsPendingIndexJobsSeparate(t *testing.T) {
+func TestRefreshAssetProcessingStatsDoesNotReuseSemanticCountsAcrossProfiles(t *testing.T) {
 	t.Parallel()
 
-	snapshot := AssetProcessingStatsSnapshot{
-		RefreshedAt: time.Now().UTC(),
-		Stats: []AssetProcessingStat{
-			{Stage: AssetProcessingStageEmbeddings, Status: AssetProcessingStatusReady, Count: 1050, TotalCount: 1500},
-			{Stage: AssetProcessingStageEmbeddings, Status: AssetProcessingStatusPending, Count: 450, TotalCount: 1500},
-			{Stage: AssetProcessingStageSearchIndex, Status: AssetProcessingStatusReady, Count: 1000, TotalCount: 1050},
-			{Stage: AssetProcessingStageSearchIndex, Status: AssetProcessingStatusPending, Count: 50, TotalCount: 1050},
-		},
+	ctx := context.Background()
+	service := newAssetProcessingStatsTestService(t)
+	oldProfile := SemanticModelProfileStatus{
+		ModelID:       "model-shared",
+		VectorSpaceID: "model-shared/v1",
+		EmbeddingDim:  4,
+		ProfileKind:   semanticProfileKindModelPack,
+		InputKind:     semanticInputKindImage,
 	}
+	newVectorSpace := oldProfile
+	newVectorSpace.VectorSpaceID = "model-shared/v2"
+	newModel := oldProfile
+	newModel.ModelID = "model-new"
+	newModel.VectorSpaceID = "model-new/v1"
+
+	insertAssetProcessingStatsTestAsset(t, service, "asset-profile-switch", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ready")
+	insertAssetProcessingStatsTestRendition(t, service, "asset-profile-switch")
+	insertAssetProcessingStatsTestFailedVector(t, service, "asset-profile-switch", oldProfile)
+
+	oldSnapshot, err := service.RefreshAssetProcessingStats(ctx, &oldProfile, 0)
+	if err != nil {
+		t.Fatalf("RefreshAssetProcessingStats(old profile) error = %v", err)
+	}
+	assertAssetProcessingStat(t, oldSnapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusPending, 0, 1)
+	assertAssetProcessingStat(t, oldSnapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusFailed, 1, 1)
+	if status := SemanticBackfillStatusFromAssetProcessingStats(oldSnapshot, newVectorSpace); status != nil {
+		t.Fatalf("SemanticBackfillStatusFromAssetProcessingStats(old snapshot, new vector space) = %+v, want nil", status)
+	}
+
+	vectorSpaceSnapshot, err := service.RefreshAssetProcessingStats(ctx, &newVectorSpace, 0)
+	if err != nil {
+		t.Fatalf("RefreshAssetProcessingStats(new vector space) error = %v", err)
+	}
+	assertAssetProcessingStat(t, vectorSpaceSnapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusPending, 1, 1)
+	assertAssetProcessingStat(t, vectorSpaceSnapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusFailed, 0, 1)
+	assertAssetProcessingSemanticVariant(t, vectorSpaceSnapshot, newVectorSpace)
+
+	modelSnapshot, err := service.RefreshAssetProcessingStats(ctx, &newModel, time.Hour)
+	if err != nil {
+		t.Fatalf("RefreshAssetProcessingStats(new model within min age) error = %v", err)
+	}
+	assertAssetProcessingStat(t, modelSnapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusPending, 1, 1)
+	assertAssetProcessingStat(t, modelSnapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusFailed, 0, 1)
+	assertAssetProcessingSemanticVariant(t, modelSnapshot, newModel)
+
+	persisted, err := service.AssetProcessingStats(ctx)
+	if err != nil {
+		t.Fatalf("AssetProcessingStats() error = %v", err)
+	}
+	assertAssetProcessingSemanticVariant(t, persisted, newModel)
+	if !persisted.MatchesSemanticProfile(&newModel) {
+		t.Fatalf("persisted snapshot does not match new model: %+v", persisted)
+	}
+}
+
+func TestRefreshAssetProcessingStatsKeepsFailedEmbeddingsOutOfPending(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	service := newAssetProcessingStatsTestService(t)
 	profile := SemanticModelProfileStatus{
 		ModelID:       "model-a",
 		VectorSpaceID: "model-a/d4",
 		EmbeddingDim:  4,
 		ProfileKind:   semanticProfileKindModelPack,
 		InputKind:     semanticInputKindImage,
+	}
+
+	assets := []struct {
+		id   string
+		sha1 string
+	}{
+		{id: "asset-ready", sha1: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{id: "asset-failed", sha1: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		{id: "asset-pending", sha1: "cccccccccccccccccccccccccccccccccccccccc"},
+	}
+	for _, asset := range assets {
+		insertAssetProcessingStatsTestAsset(t, service, asset.id, asset.sha1, "ready")
+		insertAssetProcessingStatsTestRendition(t, service, asset.id)
+	}
+	insertAssetProcessingStatsTestVector(t, service, "asset-ready", profile, false)
+	now := formatCatalogTime(time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC))
+	insertSemanticVectorForTest(t,
+		service.catalog,
+		ctx,
+		"1111111111111111",
+		"asset-failed",
+		profile.ModelID,
+		profile.VectorSpaceID,
+		profile.EmbeddingDim,
+		[]float32{0, 1, 0, 0},
+		"test",
+		"failed",
+		"embedding failed",
+		now,
+		nil,
+	)
+
+	snapshot, err := service.RefreshAssetProcessingStats(ctx, &profile, 0)
+	if err != nil {
+		t.Fatalf("RefreshAssetProcessingStats() error = %v", err)
+	}
+	assertAssetProcessingStat(t, snapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusReady, 1, 3)
+	assertAssetProcessingStat(t, snapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusPending, 1, 3)
+	assertAssetProcessingStat(t, snapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusFailed, 1, 3)
+}
+
+func TestRefreshAssetProcessingStatsScopesFailedEmbeddingsToCurrentEligibleCorpus(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	service := newAssetProcessingStatsTestService(t)
+	profile := SemanticModelProfileStatus{
+		ModelID:       "model-current",
+		VectorSpaceID: "model-current/d4",
+		EmbeddingDim:  4,
+		ProfileKind:   semanticProfileKindModelPack,
+		InputKind:     semanticInputKindImage,
+	}
+	oldProfile := profile
+	oldProfile.ModelID = "model-old"
+	oldProfile.VectorSpaceID = "model-old/d4"
+
+	assets := []struct {
+		id   string
+		sha1 string
+	}{
+		{id: "asset-ready", sha1: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{id: "asset-failed", sha1: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		{id: "asset-old-model-failed", sha1: "cccccccccccccccccccccccccccccccccccccccc"},
+		{id: "asset-pending", sha1: "dddddddddddddddddddddddddddddddddddddddd"},
+		{id: "asset-out-of-scope-failed", sha1: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+	}
+	for _, asset := range assets {
+		insertAssetProcessingStatsTestAsset(t, service, asset.id, asset.sha1, "ready")
+		insertAssetProcessingStatsTestRendition(t, service, asset.id)
+	}
+	insertAssetProcessingStatsTestVector(t, service, "asset-ready", profile, false)
+	insertAssetProcessingStatsTestFailedVector(t, service, "asset-failed", profile)
+	insertAssetProcessingStatsTestFailedVector(t, service, "asset-old-model-failed", oldProfile)
+	insertAssetProcessingStatsTestFailedVector(t, service, "asset-out-of-scope-failed", profile)
+	if _, err := service.catalog.db.ExecContext(ctx, `UPDATE catalog_assets
+		SET visibility_status = 'missing'
+		WHERE source_key = ? AND upstream_asset_id = ?`,
+		"1111111111111111", "asset-out-of-scope-failed"); err != nil {
+		t.Fatalf("mark failed asset out of scope: %v", err)
+	}
+
+	snapshot, err := service.RefreshAssetProcessingStats(ctx, &profile, 0)
+	if err != nil {
+		t.Fatalf("RefreshAssetProcessingStats() error = %v", err)
+	}
+	assertAssetProcessingStat(t, snapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusReady, 1, 4)
+	assertAssetProcessingStat(t, snapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusPending, 2, 4)
+	assertAssetProcessingStat(t, snapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusFailed, 1, 4)
+
+	status, err := service.SemanticModelBackfillStatus(ctx, profile)
+	if err != nil {
+		t.Fatalf("SemanticModelBackfillStatus() error = %v", err)
+	}
+	if status == nil || status.EligibleAssetCount != 4 || status.CompletedVectorCount != 1 || status.FailedVectorCount != 1 {
+		t.Fatalf("SemanticModelBackfillStatus() = %+v, want current-profile eligible counts 4/1/1", status)
+	}
+}
+
+func TestSemanticBackfillStatusFromAssetProcessingStatsKeepsPendingIndexJobsSeparate(t *testing.T) {
+	t.Parallel()
+
+	profile := SemanticModelProfileStatus{
+		ModelID:       "model-a",
+		VectorSpaceID: "model-a/d4",
+		EmbeddingDim:  4,
+		ProfileKind:   semanticProfileKindModelPack,
+		InputKind:     semanticInputKindImage,
+	}
+	variant := assetProcessingSemanticVariant(&profile)
+	snapshot := AssetProcessingStatsSnapshot{
+		RefreshedAt: time.Now().UTC(),
+		Stats: []AssetProcessingStat{
+			{Stage: AssetProcessingStageEmbeddings, Variant: variant, Status: AssetProcessingStatusReady, Count: 1050, TotalCount: 1500},
+			{Stage: AssetProcessingStageEmbeddings, Variant: variant, Status: AssetProcessingStatusPending, Count: 449, TotalCount: 1500},
+			{Stage: AssetProcessingStageEmbeddings, Variant: variant, Status: AssetProcessingStatusFailed, Count: 1, TotalCount: 1500},
+			{Stage: AssetProcessingStageSearchIndex, Variant: variant, Status: AssetProcessingStatusReady, Count: 1000, TotalCount: 1050},
+			{Stage: AssetProcessingStageSearchIndex, Variant: variant, Status: AssetProcessingStatusPending, Count: 50, TotalCount: 1050},
+		},
 	}
 
 	status := SemanticBackfillStatusFromAssetProcessingStats(snapshot, profile)
@@ -154,8 +324,8 @@ func TestSemanticBackfillStatusFromAssetProcessingStatsKeepsPendingIndexJobsSepa
 	if status.PendingIndexJobCount != 0 {
 		t.Fatalf("PendingIndexJobCount = %d, want 0 because search_index pending is unindexed vectors, not queued publish jobs", status.PendingIndexJobCount)
 	}
-	if status.CompletedVectorCount != 1050 || status.IndexedVectorCount != 1000 {
-		t.Fatalf("semantic counts = completed %d indexed %d, want 1050/1000", status.CompletedVectorCount, status.IndexedVectorCount)
+	if status.CompletedVectorCount != 1050 || status.FailedVectorCount != 1 || status.IndexedVectorCount != 1000 {
+		t.Fatalf("semantic counts = completed %d failed %d indexed %d, want 1050/1/1000", status.CompletedVectorCount, status.FailedVectorCount, status.IndexedVectorCount)
 	}
 }
 
@@ -331,6 +501,27 @@ func insertAssetProcessingStatsTestVector(t *testing.T, service *Service, assetI
 	}
 }
 
+func insertAssetProcessingStatsTestFailedVector(t *testing.T, service *Service, assetID string, profile SemanticModelProfileStatus) {
+	t.Helper()
+
+	now := formatCatalogTime(time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC))
+	insertSemanticVectorForTest(t,
+		service.catalog,
+		context.Background(),
+		"1111111111111111",
+		assetID,
+		profile.ModelID,
+		profile.VectorSpaceID,
+		profile.EmbeddingDim,
+		[]float32{0, 1, 0, 0},
+		"test",
+		"failed",
+		"embedding failed",
+		now,
+		nil,
+	)
+}
+
 func insertAssetProcessingStatsTestJob(t *testing.T, service *Service, kind string, status string) {
 	t.Helper()
 
@@ -369,5 +560,19 @@ func assertAssetProcessingScopedStat(t *testing.T, snapshot AssetProcessingStats
 	}
 	if got := snapshot.TotalForScope(scopeKey, stage); got != total {
 		t.Fatalf("%s/%s total = %d, want %d; snapshot=%+v", scopeKey, stage, got, total, snapshot)
+	}
+}
+
+func assertAssetProcessingSemanticVariant(t *testing.T, snapshot AssetProcessingStatsSnapshot, profile SemanticModelProfileStatus) {
+	t.Helper()
+
+	want := assetProcessingSemanticVariant(&profile)
+	for _, stat := range snapshot.Stats {
+		switch stat.Stage {
+		case AssetProcessingStageEmbeddings, AssetProcessingStageSearchIndex, AssetProcessingStageSearchable:
+			if stat.Variant != want {
+				t.Fatalf("%s/%s variant = %q, want %q; snapshot=%+v", stat.ScopeKey, stat.Stage, stat.Variant, want, snapshot)
+			}
+		}
 	}
 }

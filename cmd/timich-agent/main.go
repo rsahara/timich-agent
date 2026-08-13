@@ -33,6 +33,7 @@ var (
 	releaseTag               = ""
 	updateManifestURL        = ""
 	semanticModelManifestURL = ""
+	migratePreReleaseCatalog = catalog.MigratePreReleaseCatalogV2ToV3
 )
 
 func main() {
@@ -58,9 +59,45 @@ func runCLI(args []string, stdout io.Writer, stderr io.Writer) error {
 		return initConfig(args[1:], stdout, stderr)
 	case "semantic-index-check":
 		return semanticIndexCheck(args[1:], stdout, stderr)
+	case "pre-release-migrate-catalog-v2-v3":
+		return preReleaseMigrateCatalogV2ToV3(args[1:], stdout, stderr)
 	default:
 		return serve(args, stderr)
 	}
+}
+
+func preReleaseMigrateCatalogV2ToV3(args []string, stdout io.Writer, stderr io.Writer) error {
+	flags := flag.NewFlagSet("timich-agent pre-release-migrate-catalog-v2-v3", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dataDir := flags.String("data-dir", "", "Timich Agent data directory containing catalog-state-v1")
+	backupPath := flags.String("backup", "", "new path for the pre-migration catalog.db backup")
+	confirmStopped := flags.Bool("confirm-agent-stopped", false, "confirm that Timich Agent is stopped")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if strings.TrimSpace(*dataDir) == "" {
+		return errors.New("data-dir is required")
+	}
+	if !*confirmStopped {
+		return errors.New("confirm-agent-stopped is required for the offline migration")
+	}
+	result, err := migratePreReleaseCatalog(context.Background(), *dataDir, *backupPath)
+	if err != nil {
+		return err
+	}
+	payload := struct {
+		catalog.CatalogPreReleaseMigrationResult
+		AgentVersion string `json:"agentVersion"`
+		AgentCommit  string `json:"agentCommit"`
+	}{
+		CatalogPreReleaseMigrationResult: result,
+		AgentVersion:                     version,
+		AgentCommit:                      commit,
+	}
+	return json.NewEncoder(stdout).Encode(payload)
 }
 
 func initConfig(args []string, stdout io.Writer, stderr io.Writer) error {

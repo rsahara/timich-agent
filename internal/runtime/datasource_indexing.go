@@ -34,8 +34,8 @@ const (
 	datasourceTaskNoteContentVerification = "At the configured daily time, uses an idle heavy-task worker to compare saved content hashes. If no worker is idle, that day's run is skipped. The default duration is 30 minutes; set contentVerificationDuration to 0 to disable it."
 	datasourceTaskNoteMetadata            = "Registers media information in the media database. Recently added or changed files remain settling before metadata processing (2 minutes by default). Requeue failed moves failed metadata jobs back to the queue at repair priority. Processing starts after settling when a worker is available, and jobs that fail again return to failed."
 	datasourceTaskNoteThumbnails          = "Generates thumbnails so media can be previewed quickly. Requeue failed moves failed thumbnails back to the queue at repair priority. Processing starts when a worker is available, and items that fail again return to failed."
-	datasourceTaskNoteEmbeddings          = "Analyzes media features so visual search can find matching photos and videos. Search becomes available after the Search index processes the embeddings."
-	datasourceTaskNoteSearchIndex         = "Updates the search index so media can be searched."
+	datasourceTaskNoteEmbeddings          = "Analyzes media features for visual search. Within each datasource, first-attempt work is prioritized ahead of eligible retries, so the failed count may remain unchanged while new embeddings complete. Search becomes available after the Search index processes the embeddings."
+	datasourceTaskNoteSearchIndex         = "Updates the search index so media can be searched. Publishing can take several hours for a large library. An existing published index remains searchable while publishing runs. Failed publish jobs are retried automatically on the next eligible run."
 	datasourceTaskNoteSearchModelRequired = "Install and activate a semantic model in the Search tab to enable it."
 	datasourceTaskSetupSearchModel        = "search_model"
 	datasourceTaskWaitingSearchIndex      = "search_index"
@@ -43,6 +43,8 @@ const (
 	datasourceTaskWaitingWorker           = "worker"
 	datasourceTaskWaitingQueuedTarget     = "queued_target"
 	datasourceTaskWaitingScheduled        = "scheduled"
+	datasourceTaskFailureUnitItems        = "items"
+	datasourceTaskFailureUnitPublishJobs  = "publish_jobs"
 )
 
 type datasourceIndexingSnapshotPayload struct {
@@ -59,6 +61,7 @@ type DatasourceIndexingResponse struct {
 	Datasources        []DatasourceIndexingStatus `json:"datasources"`
 	StatusSnapshotAt   *time.Time                 `json:"statusSnapshotAt,omitempty"`
 	StatusSnapshotUsed bool                       `json:"statusSnapshotUsed,omitempty"`
+	snapshotConfigHash string
 }
 
 // DatasourceTaskStatus summarizes active and remaining work by scan/index phase.
@@ -74,6 +77,7 @@ type DatasourceTaskStatus struct {
 	TotalTasks           int        `json:"totalTasks,omitempty"`
 	FailedTasks          int        `json:"failedTasks,omitempty"`
 	FailedTasksUnknown   bool       `json:"failedTasksUnknown,omitempty"`
+	FailureUnit          string     `json:"failureUnit,omitempty"`
 	Status               string     `json:"status"`
 	Note                 string     `json:"note,omitempty"`
 	SetupRequired        string     `json:"setupRequired,omitempty"`
@@ -324,14 +328,16 @@ func (a *AgentRuntime) CachedDatasourceIndexingStatus(ctx context.Context) (Data
 }
 
 func (a *AgentRuntime) buildDatasourceIndexingStatus(ctx context.Context, catalogService *catalog.Service) (DatasourceIndexingResponse, error) {
+	snapshotConfigHash := a.datasourceIndexingConfigHash()
 	roots := a.LocalMediaRootStatuses()
 	a.mu.RLock()
 	summaries := a.datasourceSummariesLocked()
 	a.mu.RUnlock()
 
 	response := DatasourceIndexingResponse{
-		Roots:       roots,
-		Datasources: make([]DatasourceIndexingStatus, 0, len(summaries)),
+		Roots:              roots,
+		Datasources:        make([]DatasourceIndexingStatus, 0, len(summaries)),
+		snapshotConfigHash: snapshotConfigHash,
 	}
 	if catalogService == nil {
 		for _, summary := range summaries {
@@ -404,13 +410,13 @@ func (a *AgentRuntime) refreshAssetProcessingStatsForAdmin(ctx context.Context, 
 	refreshCtx, cancel := context.WithTimeout(ctx, assetProcessingStatsRefreshTimeout)
 	stats, err := catalogService.RefreshAssetProcessingStats(refreshCtx, profile, assetProcessingStatsRefreshMinAge)
 	cancel()
-	if err == nil && !stats.Empty() {
+	if err == nil && !stats.Empty() && a.assetProcessingStatsMatchCurrentSemanticProfile(stats) {
 		return stats
 	}
 	loadCtx, cancelLoad := context.WithTimeout(ctx, datasourceIndexingSnapshotSaveTimeout)
 	defer cancelLoad()
 	stats, err = catalogService.AssetProcessingStats(loadCtx)
-	if err != nil {
+	if err != nil || !a.assetProcessingStatsMatchCurrentSemanticProfile(stats) {
 		return catalog.AssetProcessingStatsSnapshot{}
 	}
 	return stats
@@ -437,10 +443,31 @@ func (a *AgentRuntime) cachedAssetProcessingStatsForAdmin(ctx context.Context, c
 	loadCtx, cancel := context.WithTimeout(ctx, datasourceIndexingSnapshotSaveTimeout)
 	defer cancel()
 	stats, err := catalogService.AssetProcessingStats(loadCtx)
-	if err != nil {
+	if err != nil || !a.assetProcessingStatsMatchCurrentSemanticProfile(stats) {
 		return catalog.AssetProcessingStatsSnapshot{}
 	}
 	return stats
+}
+
+func (a *AgentRuntime) assetProcessingStatsMatchCurrentSemanticProfile(stats catalog.AssetProcessingStatsSnapshot) bool {
+	return stats.MatchesSemanticProfile(a.datasourceIndexingSemanticProfile())
+}
+
+// datasourceIndexingSemanticProfile returns the same durable semantic role
+// preferred by datasource coverage without probing model runtimes or querying
+// live catalog state. A candidate is indexed before it can replace the active
+// model, so its read-model identity takes precedence while both are installed.
+func (a *AgentRuntime) datasourceIndexingSemanticProfile() *catalog.SemanticModelProfileStatus {
+	if a == nil || a.semanticModels == nil {
+		return nil
+	}
+	if candidate, ok := a.semanticModels.InstalledCandidateProfile(); ok {
+		return &candidate
+	}
+	if active, ok := a.semanticModels.InstalledActiveProfile(); ok {
+		return &active
+	}
+	return nil
 }
 
 func (a *AgentRuntime) refreshDatasourceIndexingSnapshot(ctx context.Context, catalogService *catalog.Service) (DatasourceIndexingResponse, error) {
@@ -455,7 +482,9 @@ func (a *AgentRuntime) refreshDatasourceIndexingSnapshot(ctx context.Context, ca
 		a.invalidateDatasourceIndexingSnapshot(catalogService)
 		return response, err
 	}
-	a.rememberDatasourceIndexingSnapshot(catalogService, response)
+	if !a.rememberDatasourceIndexingSnapshot(catalogService, response) {
+		return a.emptyDatasourceIndexingResponse(), nil
+	}
 	return response, nil
 }
 
@@ -555,6 +584,7 @@ func (a *AgentRuntime) datasourceIndexingSnapshot(ctx context.Context, catalogSe
 		return DatasourceIndexingResponse{}, false
 	}
 	snapshot := a.normalizePersistedDatasourceIndexingSnapshot(payload.Response)
+	snapshot.snapshotConfigHash = payload.ConfigHash
 	if !stored.UpdatedAt.IsZero() {
 		snapshot.StatusSnapshotAt = timePtr(stored.UpdatedAt)
 	}
@@ -636,50 +666,68 @@ func (a *AgentRuntime) normalizePersistedDatasourceIndexingSnapshot(response Dat
 	return a.normalizeDatasourceIndexingSnapshot(response)
 }
 
-func (a *AgentRuntime) rememberDatasourceIndexingSnapshot(catalogService *catalog.Service, response DatasourceIndexingResponse) {
+func (a *AgentRuntime) rememberDatasourceIndexingSnapshot(catalogService *catalog.Service, response DatasourceIndexingResponse) bool {
 	if a == nil {
-		return
+		return false
 	}
-	a.rememberDatasourceIndexingSnapshotAt(catalogService, response, time.Now().UTC())
+	return a.rememberDatasourceIndexingSnapshotAt(catalogService, response, time.Now().UTC())
 }
 
-func (a *AgentRuntime) rememberDatasourceIndexingSnapshotAt(catalogService *catalog.Service, response DatasourceIndexingResponse, snapshotAt time.Time) {
+func (a *AgentRuntime) rememberDatasourceIndexingSnapshotAt(catalogService *catalog.Service, response DatasourceIndexingResponse, snapshotAt time.Time) bool {
 	if a == nil {
-		return
+		return false
 	}
 	if snapshotAt.IsZero() {
 		snapshotAt = time.Now().UTC()
 	}
+	if strings.TrimSpace(response.snapshotConfigHash) == "" {
+		response.snapshotConfigHash = a.datasourceIndexingConfigHash()
+	}
+	expectedConfigHash := response.snapshotConfigHash
+	if expectedConfigHash == "" || expectedConfigHash != a.datasourceIndexingConfigHash() {
+		return false
+	}
 	snapshot, ok := a.rememberDatasourceIndexingSnapshotInMemory(response, snapshotAt)
 	if !ok {
-		return
+		return false
 	}
 
 	if catalogService == nil {
-		return
+		return expectedConfigHash == a.datasourceIndexingConfigHash()
 	}
 	persistedSnapshot, ok := cloneDatasourceIndexingResponse(snapshot)
 	if !ok {
-		return
+		return false
 	}
 	persistedSnapshot = a.normalizePersistedDatasourceIndexingSnapshot(persistedSnapshot)
 	persistedSnapshot.StatusSnapshotAt = nil
 	persistedSnapshot.StatusSnapshotUsed = false
 	payload, err := json.Marshal(datasourceIndexingSnapshotPayload{
 		Version:    1,
-		ConfigHash: a.datasourceIndexingConfigHash(),
+		ConfigHash: expectedConfigHash,
 		Response:   persistedSnapshot,
 	})
 	if err != nil {
-		return
+		return false
+	}
+	if expectedConfigHash != a.datasourceIndexingConfigHash() {
+		return false
 	}
 	saveCtx, cancel := context.WithTimeout(context.Background(), datasourceIndexingSnapshotSaveTimeout)
 	defer cancel()
 	_ = catalogService.SaveAdminStatusSnapshot(saveCtx, datasourceIndexingStatusSnapshotKey, payload, snapshotAt)
+	return expectedConfigHash == a.datasourceIndexingConfigHash()
 }
 
 func (a *AgentRuntime) rememberDatasourceIndexingSnapshotInMemory(response DatasourceIndexingResponse, snapshotAt time.Time) (DatasourceIndexingResponse, bool) {
 	if a == nil {
+		return DatasourceIndexingResponse{}, false
+	}
+	if strings.TrimSpace(response.snapshotConfigHash) == "" {
+		response.snapshotConfigHash = a.datasourceIndexingConfigHash()
+	}
+	expectedConfigHash := response.snapshotConfigHash
+	if expectedConfigHash == "" || expectedConfigHash != a.datasourceIndexingConfigHash() {
 		return DatasourceIndexingResponse{}, false
 	}
 	response.StatusSnapshotAt = timePtr(snapshotAt)
@@ -693,7 +741,7 @@ func (a *AgentRuntime) rememberDatasourceIndexingSnapshotInMemory(response Datas
 	a.datasourceTaskMu.Lock()
 	a.datasourceSnapshot = &snapshot
 	a.datasourceSnapshotAt = snapshotAt
-	a.datasourceSnapshotHash = a.datasourceIndexingConfigHash()
+	a.datasourceSnapshotHash = expectedConfigHash
 	a.datasourceSnapshotInvalid = false
 	a.datasourceTaskMu.Unlock()
 	return snapshot, true
@@ -710,7 +758,7 @@ func (a *AgentRuntime) rememberDatasourceTaskReadModel(catalogService *catalog.S
 }
 
 func (a *AgentRuntime) rememberDatasourceTaskStatsSnapshot(ctx context.Context, catalogService *catalog.Service, stats catalog.AssetProcessingStatsSnapshot) {
-	if a == nil || stats.Empty() {
+	if a == nil || stats.Empty() || (catalogService != nil && !a.assetProcessingStatsMatchCurrentSemanticProfile(stats)) {
 		return
 	}
 	response, ok := a.datasourceIndexingSnapshot(ctx, catalogService)
@@ -794,6 +842,7 @@ func (a *AgentRuntime) datasourceDiscoveryCompletionSnapshot() (*time.Time, *tim
 }
 
 func cloneDatasourceIndexingResponse(response DatasourceIndexingResponse) (DatasourceIndexingResponse, bool) {
+	snapshotConfigHash := response.snapshotConfigHash
 	payload, err := json.Marshal(response)
 	if err != nil {
 		return DatasourceIndexingResponse{}, false
@@ -802,6 +851,7 @@ func cloneDatasourceIndexingResponse(response DatasourceIndexingResponse) (Datas
 	if err := json.Unmarshal(payload, &cloned); err != nil {
 		return DatasourceIndexingResponse{}, false
 	}
+	cloned.snapshotConfigHash = snapshotConfigHash
 	return cloned, true
 }
 
@@ -859,7 +909,20 @@ func (a *AgentRuntime) datasourceIndexingConfigHash() string {
 	roots := append([]config.LocalMediaRootConfig(nil), a.config.LocalMediaRoots...)
 	a.mu.RUnlock()
 
-	parts := make([]string, 0, len(datasources)+len(roots))
+	parts := make([]string, 0, len(datasources)+len(roots)+2)
+	parts = append(parts, "snapshot_schema\x00semantic-profile-v1")
+	semanticProfile := a.datasourceIndexingSemanticProfile()
+	semanticModelID := ""
+	semanticVectorSpaceID := ""
+	if semanticProfile != nil {
+		semanticModelID = strings.TrimSpace(semanticProfile.ModelID)
+		semanticVectorSpaceID = strings.TrimSpace(semanticProfile.VectorSpaceID)
+	}
+	parts = append(parts, strings.Join([]string{
+		"semantic_profile",
+		semanticModelID,
+		semanticVectorSpaceID,
+	}, "\x00"))
 	for _, datasource := range datasources {
 		kind := normalizedDatasourceKind(datasource.Kind)
 		parts = append(parts, strings.Join([]string{
@@ -1123,7 +1186,6 @@ func (s *DatasourceIndexingStatus) applyLocalStatus(status catalog.LocalDatasour
 	s.EmbeddingEligible = status.EmbeddingEligible
 	s.EmbeddingCompleted = status.EmbeddingCompleted
 	s.EmbeddingIndexed = status.EmbeddingIndexed
-	s.FailedEmbeddingJobs = status.FailedEmbeddingJobs
 	s.EmbeddingRemaining = status.EmbeddingRemaining
 	s.EmbeddingLastError = status.EmbeddingLastError
 	s.LastError = status.LastError
@@ -1157,6 +1219,7 @@ func (s *DatasourceIndexingStatus) applySemanticBackfillStatus(status catalog.Se
 	s.EmbeddingEligible = status.EligibleAssetCount
 	s.EmbeddingCompleted = status.CompletedVectorCount
 	s.EmbeddingIndexed = status.IndexedVectorCount
+	s.FailedEmbeddingJobs = status.FailedVectorCount
 	s.EmbeddingPendingIndexJobs = status.PendingIndexJobCount
 	s.EmbeddingFailedIndexJobs = status.FailedIndexJobCount
 	s.EmbeddingLastPublishedAt = status.LastPublishedAt
@@ -1343,8 +1406,9 @@ func (a *AgentRuntime) emptyDatasourceIndexingResponse() DatasourceIndexingRespo
 	summaries := a.datasourceSummariesLocked()
 	a.mu.RUnlock()
 	response := DatasourceIndexingResponse{
-		Roots:       a.LocalMediaRootStatuses(),
-		Datasources: make([]DatasourceIndexingStatus, 0, len(summaries)),
+		Roots:              a.LocalMediaRootStatuses(),
+		Datasources:        make([]DatasourceIndexingStatus, 0, len(summaries)),
+		snapshotConfigHash: a.datasourceIndexingConfigHash(),
 	}
 	for _, summary := range summaries {
 		response.Datasources = append(response.Datasources, datasourceIndexingStatusFromSummary(summary))
@@ -1362,6 +1426,7 @@ func semanticBackfillStatusEmpty(status catalog.SemanticModelBackfillStatus) boo
 		status.CompletedVectorCount == 0 &&
 		status.IndexedVectorCount == 0 &&
 		status.RemainingVectorCount == 0 &&
+		status.FailedVectorCount == 0 &&
 		status.PendingIndexJobCount == 0 &&
 		status.FailedIndexJobCount == 0
 }
@@ -1397,7 +1462,8 @@ func applySemanticAggregateToDatasourceTasks(tasks []DatasourceTaskStatus, statu
 	embeddingActive := max(embeddingTask.ActiveTasks, 0)
 	embeddingTask.ActiveTasks = embeddingActive
 	embeddingTask.ActiveTasksUnknown = false
-	embeddingTask.QueuedTasks = max(status.EligibleAssetCount-status.CompletedVectorCount, 0)
+	embeddingTask.FailedTasks = max(status.FailedVectorCount, 0)
+	embeddingTask.QueuedTasks = max(status.EligibleAssetCount-status.CompletedVectorCount-embeddingTask.FailedTasks, 0)
 	embeddingTask.QueuedTasksUnknown = false
 	embeddingTask.CompletedTasks = status.CompletedVectorCount
 	embeddingTask.TotalTasks = status.EligibleAssetCount
@@ -1530,7 +1596,9 @@ func (a *AgentRuntime) datasourceTaskStatuses(ctx context.Context, datasources [
 			break
 		}
 	}
-	if localDatasourceCount > 0 && !contentVerificationEnabled {
+	if localDatasourceCount == 0 {
+		tasks[5].Status = "not_applicable"
+	} else if !contentVerificationEnabled {
 		tasks[5].Status = "disabled"
 	}
 	if active := a.datasourceDiscoveryActiveCount(); active > remoteActiveFromStatus {
@@ -1554,7 +1622,7 @@ func (a *AgentRuntime) datasourceTaskStatuses(ctx context.Context, datasources [
 		semanticTaskCounts = statsSummary
 	}
 	if semanticTaskCounts.known {
-		tasks[3].QueuedTasks = max(semanticTaskCounts.eligible-semanticTaskCounts.completed, 0)
+		tasks[3].QueuedTasks = semanticTaskCounts.embeddingQueued
 		tasks[3].CompletedTasks = semanticTaskCounts.completed
 		tasks[3].TotalTasks = semanticTaskCounts.eligible
 		tasks[3].FailedTasks = semanticTaskCounts.failedEmbeddingJobs
@@ -1654,7 +1722,9 @@ func applySchedulerWorkStateToDatasourceTasks(tasks []DatasourceTaskStatus, stat
 	}
 	if index, ok := byPhase["embeddings"]; ok && state.SemanticScheduled {
 		if state.SemanticEligibleVectors > 0 || state.SemanticCompletedVectors > 0 {
-			tasks[index].QueuedTasks = max(state.SemanticEligibleVectors-state.SemanticCompletedVectors, 0)
+			tasks[index].FailedTasks = max(state.SemanticFailedVectors, 0)
+			tasks[index].FailedTasksUnknown = false
+			tasks[index].QueuedTasks = max(state.SemanticEligibleVectors-state.SemanticCompletedVectors-tasks[index].FailedTasks, 0)
 			tasks[index].CompletedTasks = max(state.SemanticCompletedVectors, 0)
 			tasks[index].TotalTasks = max(state.SemanticEligibleVectors, 0)
 			tasks[index].QueuedTasksUnknown = false
@@ -1880,9 +1950,21 @@ func normalizeDatasourceTaskDependencies(tasks []DatasourceTaskStatus) []Datasou
 		}
 	}
 	for index := range tasks {
+		tasks[index].FailureUnit = datasourceTaskFailureUnitForPhase(tasks[index].Phase)
 		tasks[index].Status = datasourceTaskStatus(tasks[index])
 	}
 	return tasks
+}
+
+func datasourceTaskFailureUnitForPhase(phase string) string {
+	switch phase {
+	case "metadata", "thumbnails", "embeddings":
+		return datasourceTaskFailureUnitItems
+	case "search_index":
+		return datasourceTaskFailureUnitPublishJobs
+	default:
+		return ""
+	}
 }
 
 type datasourceSemanticTaskCountSummary struct {
@@ -1912,8 +1994,11 @@ func datasourceSemanticTaskCountsFromAssetStats(stats catalog.AssetProcessingSta
 		summary.completed = stats.Ready(catalog.AssetProcessingStageEmbeddings)
 		summary.embeddingQueued = stats.Pending(catalog.AssetProcessingStageEmbeddings)
 		summary.failedEmbeddingJobs = stats.Failed(catalog.AssetProcessingStageEmbeddings)
-		if summary.eligible < summary.completed+summary.embeddingQueued+summary.failedEmbeddingJobs {
-			summary.eligible = summary.completed + summary.embeddingQueued + summary.failedEmbeddingJobs
+		if summary.eligible < summary.completed+summary.embeddingQueued {
+			summary.eligible = summary.completed + summary.embeddingQueued
+		}
+		if summary.eligible < summary.completed+summary.failedEmbeddingJobs {
+			summary.eligible = summary.completed + summary.failedEmbeddingJobs
 		}
 	}
 	if stats.HasStage(catalog.AssetProcessingStageSearchIndex) {
@@ -1924,8 +2009,8 @@ func datasourceSemanticTaskCountsFromAssetStats(stats catalog.AssetProcessingSta
 		if summary.completed < searchTotal {
 			summary.completed = searchTotal
 		}
-		if summary.completed < summary.indexed+summary.unindexed+summary.failedIndexJobs {
-			summary.completed = summary.indexed + summary.unindexed + summary.failedIndexJobs
+		if summary.completed < summary.indexed+summary.unindexed {
+			summary.completed = summary.indexed + summary.unindexed
 		}
 		if summary.eligible < summary.completed {
 			summary.eligible = summary.completed
@@ -1952,7 +2037,9 @@ func datasourceSemanticTaskCounts(datasources []DatasourceIndexingStatus) dataso
 		summary.eligible += datasource.EmbeddingEligible
 		summary.completed += datasource.EmbeddingCompleted
 		summary.indexed += datasource.EmbeddingIndexed
-		embeddingQueued := max(datasource.EmbeddingRemaining, datasource.EmbeddingEligible-datasource.EmbeddingCompleted)
+		failedEmbeddings := max(datasource.FailedEmbeddingJobs, 0)
+		summary.failedEmbeddingJobs += failedEmbeddings
+		embeddingQueued := max(datasource.EmbeddingRemaining-failedEmbeddings, datasource.EmbeddingEligible-datasource.EmbeddingCompleted-failedEmbeddings)
 		if embeddingQueued > 0 {
 			summary.embeddingQueued += embeddingQueued
 		}
@@ -1996,6 +2083,8 @@ func datasourceHasSemanticCoverage(datasource DatasourceIndexingStatus) bool {
 
 func datasourceTaskStatus(task DatasourceTaskStatus) string {
 	switch {
+	case task.Status == "not_applicable" && task.ActiveTasks <= 0:
+		return "not_applicable"
 	case task.Status == "disabled" && task.ActiveTasks <= 0:
 		return "disabled"
 	case task.FailedTasks > 0:

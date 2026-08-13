@@ -66,6 +66,8 @@ func (s *Service) GarbageCollectSemanticModelCorpora(ctx context.Context, reacha
 		}
 		for _, statement := range []string{
 			`DELETE FROM semantic_index_jobs WHERE model_id = ? AND vector_space_id = ?`,
+			`DELETE FROM semantic_index_membership WHERE model_id = ? AND vector_space_id = ?`,
+			`DELETE FROM semantic_index_membership_state WHERE model_id = ? AND vector_space_id = ?`,
 			`DELETE FROM semantic_vectors WHERE model_id = ? AND vector_space_id = ?`,
 			`DELETE FROM semantic_state WHERE model_id = ? AND vector_space_id = ?`,
 		} {

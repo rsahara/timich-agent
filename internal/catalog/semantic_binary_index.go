@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -272,24 +273,46 @@ func sameSemanticBinaryFileInfo(left os.FileInfo, right os.FileInfo) bool {
 }
 
 func (s *CatalogStore) activateSemanticBinaryIndex(ctx context.Context, sourceKey string, profile semanticEmbeddingProfile, assetGeneration int64) error {
-	if err := ctx.Err(); err != nil {
+	manifest, err := s.prepareSemanticBinaryActiveManifest(ctx, sourceKey, profile, assetGeneration)
+	if err != nil {
 		return err
+	}
+	return s.activateSemanticBinaryManifest(ctx, sourceKey, profile, manifest)
+}
+
+func (s *CatalogStore) prepareSemanticBinaryActiveManifest(ctx context.Context, sourceKey string, profile semanticEmbeddingProfile, assetGeneration int64) (semanticBinaryActiveManifest, error) {
+	if err := ctx.Err(); err != nil {
+		return semanticBinaryActiveManifest{}, err
 	}
 	path := s.semanticBinaryIndexPath(sourceKey, profile, assetGeneration)
 	header, fileSize, digest, err := inspectSemanticBinaryIndexFile(ctx, path, true)
 	if err != nil {
-		return fmt.Errorf("read semantic binary generation before activation: %w", err)
+		return semanticBinaryActiveManifest{}, fmt.Errorf("read semantic binary generation before activation: %w", err)
 	}
 	if err := validateSemanticBinaryIndexHeaderIdentity(header, sourceKey, profile); err != nil {
-		return err
+		return semanticBinaryActiveManifest{}, err
 	}
 	if header.AssetGeneration != assetGeneration {
-		return errSemanticBinaryIndexUnavailable
+		return semanticBinaryActiveManifest{}, errSemanticBinaryIndexUnavailable
 	}
 	manifest := semanticBinaryActiveManifest{
 		Header:     header,
 		FileSize:   fileSize,
 		FileSHA256: digest,
+	}
+	if info, statErr := os.Stat(path); statErr == nil {
+		s.rememberSemanticBinaryIntegrity(path, info, digest)
+	}
+	return manifest, nil
+}
+
+func (s *CatalogStore) activateSemanticBinaryManifest(ctx context.Context, sourceKey string, profile semanticEmbeddingProfile, manifest semanticBinaryActiveManifest) error {
+	header := manifest.Header
+	if err := validateSemanticBinaryIndexHeaderIdentity(header, sourceKey, profile); err != nil {
+		return err
+	}
+	if err := s.ensureSemanticBinaryMembership(ctx, manifest); err != nil {
+		return err
 	}
 	raw, err := json.Marshal(manifest)
 	if err != nil {
@@ -298,8 +321,212 @@ func (s *CatalogStore) activateSemanticBinaryIndex(ctx context.Context, sourceKe
 	if err := atomicfile.WriteFile(s.semanticBinaryActiveManifestPath(sourceKey, profile), raw, 0o600); err != nil {
 		return fmt.Errorf("publish semantic binary active manifest: %w", err)
 	}
-	if info, statErr := os.Stat(path); statErr == nil {
-		s.rememberSemanticBinaryIntegrity(path, info, digest)
+	if err := s.cleanupSemanticBinaryMembership(ctx, header); err != nil {
+		log.Printf("timich-agent semantic binary membership cleanup failed source_key=%s model=%s generation=%d error=%v", sourceKey, profile.ModelID(), header.AssetGeneration, err)
+	}
+	return nil
+}
+
+func (s *CatalogStore) ensureSemanticBinaryMembership(ctx context.Context, manifest semanticBinaryActiveManifest) error {
+	matches, err := s.semanticBinaryMembershipMatches(ctx, manifest)
+	if err != nil || matches {
+		return err
+	}
+	header := manifest.Header
+	profile := semanticIndexFileProfile{
+		modelID:       header.ModelID,
+		vectorSpaceID: header.VectorSpaceID,
+		embeddingDim:  header.EmbeddingDim,
+	}
+	path := s.semanticBinaryIndexPath(header.SourceKey, profile, header.AssetGeneration)
+	if err := s.verifySemanticBinaryActiveFile(ctx, path, manifest, false); err != nil {
+		return err
+	}
+	reader, err := s.openSemanticBinaryIndexFileForGeneration(ctx, header.SourceKey, profile, header.AssetGeneration)
+	if err != nil {
+		return err
+	}
+	if reader.header != header {
+		_ = reader.Close()
+		return errSemanticBinaryIndexUnavailable
+	}
+	err = s.replaceSemanticBinaryMembership(ctx, reader, manifest)
+	if closeErr := reader.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func (s *CatalogStore) reconcileSemanticBinaryMemberships(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return ErrCatalogNotConfigured
+	}
+	root := filepath.Join(s.root, semanticBinaryIndexDirName)
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read semantic binary memberships: %w", err)
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".active.json") {
+			continue
+		}
+		manifest, err := readSemanticBinaryActiveManifest(filepath.Join(root, entry.Name()))
+		if err != nil {
+			log.Printf("timich-agent semantic binary membership reconcile skipped manifest=%s error=%v", entry.Name(), err)
+			continue
+		}
+		header := manifest.Header
+		profile := semanticIndexFileProfile{
+			modelID:       header.ModelID,
+			vectorSpaceID: header.VectorSpaceID,
+			embeddingDim:  header.EmbeddingDim,
+		}
+		if err := validateSemanticBinaryIndexHeaderIdentity(header, header.SourceKey, profile); err != nil {
+			log.Printf("timich-agent semantic binary membership reconcile skipped manifest=%s error=%v", entry.Name(), err)
+			continue
+		}
+		if err := s.ensureSemanticBinaryMembership(ctx, manifest); err != nil {
+			log.Printf("timich-agent semantic binary membership reconcile skipped manifest=%s error=%v", entry.Name(), err)
+			continue
+		}
+		if err := s.cleanupSemanticBinaryMembership(ctx, header); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *CatalogStore) semanticBinaryMembershipMatches(ctx context.Context, manifest semanticBinaryActiveManifest) (bool, error) {
+	header := manifest.Header
+	var digest string
+	var fileSize int64
+	var nodeCount int
+	var builtAt string
+	err := s.db.QueryRowContext(ctx, `SELECT binary_sha256, binary_size_bytes, node_count, built_at
+		FROM semantic_index_membership_state
+		WHERE source_key = ? AND model_id = ? AND vector_space_id = ? AND asset_generation = ?`,
+		header.SourceKey,
+		header.ModelID,
+		header.VectorSpaceID,
+		header.AssetGeneration,
+	).Scan(&digest, &fileSize, &nodeCount, &builtAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read semantic binary membership identity: %w", err)
+	}
+	if digest != manifest.FileSHA256 || fileSize != manifest.FileSize ||
+		nodeCount != header.NodeCount || builtAt != header.BuiltAt {
+		return false, nil
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM semantic_index_membership
+		WHERE source_key = ? AND model_id = ? AND vector_space_id = ? AND asset_generation = ?`,
+		header.SourceKey,
+		header.ModelID,
+		header.VectorSpaceID,
+		header.AssetGeneration,
+	).Scan(&count); err != nil {
+		return false, fmt.Errorf("count semantic binary membership: %w", err)
+	}
+	return count == header.NodeCount, nil
+}
+
+func (s *CatalogStore) replaceSemanticBinaryMembership(ctx context.Context, reader *semanticBinaryIndexReader, manifest semanticBinaryActiveManifest) error {
+	if s == nil || s.db == nil || reader == nil || reader.file == nil {
+		return ErrCatalogNotConfigured
+	}
+	header := reader.header
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin semantic binary membership replacement: %w", err)
+	}
+	defer tx.Rollback()
+	if reader.header != manifest.Header {
+		return errSemanticBinaryIndexUnavailable
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_index_membership_state
+		WHERE source_key = ? AND model_id = ? AND vector_space_id = ? AND asset_generation = ?`,
+		header.SourceKey,
+		header.ModelID,
+		header.VectorSpaceID,
+		header.AssetGeneration,
+	); err != nil {
+		return fmt.Errorf("clear semantic binary membership identity: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO semantic_index_membership_state (
+			source_key, model_id, vector_space_id, asset_generation,
+			binary_sha256, binary_size_bytes, node_count, built_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		header.SourceKey,
+		header.ModelID,
+		header.VectorSpaceID,
+		header.AssetGeneration,
+		manifest.FileSHA256,
+		manifest.FileSize,
+		header.NodeCount,
+		header.BuiltAt,
+	); err != nil {
+		return fmt.Errorf("insert semantic binary membership identity: %w", err)
+	}
+	statement, err := tx.PrepareContext(ctx, `INSERT INTO semantic_index_membership (
+			source_key, model_id, vector_space_id, asset_generation, upstream_asset_id, ordinal
+		) VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("prepare semantic binary membership insert: %w", err)
+	}
+	for ordinal := range reader.nodes {
+		if ordinal%512 == 0 {
+			if err := ctx.Err(); err != nil {
+				_ = statement.Close()
+				return err
+			}
+		}
+		assetID, err := reader.assetIDForOrdinal(ctx, uint32(ordinal))
+		if err != nil {
+			_ = statement.Close()
+			return err
+		}
+		if _, err := statement.ExecContext(
+			ctx,
+			header.SourceKey,
+			header.ModelID,
+			header.VectorSpaceID,
+			header.AssetGeneration,
+			assetID,
+			ordinal,
+		); err != nil {
+			_ = statement.Close()
+			return fmt.Errorf("insert semantic binary membership %q: %w", assetID, err)
+		}
+	}
+	if err := statement.Close(); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit semantic binary membership replacement: %w", err)
+	}
+	return nil
+}
+
+func (s *CatalogStore) cleanupSemanticBinaryMembership(ctx context.Context, header semanticBinaryIndexHeader) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM semantic_index_membership_state
+		WHERE source_key = ? AND model_id = ? AND vector_space_id = ? AND asset_generation <> ?`,
+		header.SourceKey,
+		header.ModelID,
+		header.VectorSpaceID,
+		header.AssetGeneration,
+	)
+	if err != nil {
+		return fmt.Errorf("cleanup semantic binary membership: %w", err)
 	}
 	return nil
 }
@@ -886,6 +1113,32 @@ func (r *semanticBinaryIndexReader) assetForOrdinal(ctx context.Context, ordinal
 	}
 	asset.Vector = vector
 	return asset, nil
+}
+
+func (r *semanticBinaryIndexReader) assetIDForOrdinal(ctx context.Context, ordinal uint32) (string, error) {
+	if int(ordinal) >= len(r.nodes) {
+		return "", errSemanticBinaryIndexUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	node := r.nodes[ordinal]
+	if node.StringLength < 16 {
+		return "", errSemanticBinaryIndexUnavailable
+	}
+	header := make([]byte, 4)
+	if _, err := r.file.ReadAt(header, node.StringOffset); err != nil {
+		return "", fmt.Errorf("read semantic binary asset id length: %w", err)
+	}
+	idLength := int(binary.LittleEndian.Uint32(header))
+	if idLength <= 0 || idLength > int(node.StringLength)-16 {
+		return "", errSemanticBinaryIndexUnavailable
+	}
+	raw := make([]byte, idLength)
+	if _, err := r.file.ReadAt(raw, node.StringOffset+16); err != nil {
+		return "", fmt.Errorf("read semantic binary asset id: %w", err)
+	}
+	return string(raw), nil
 }
 
 func (r *semanticBinaryIndexReader) vectorForOrdinal(ctx context.Context, ordinal uint32) ([]float32, error) {

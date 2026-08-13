@@ -18,12 +18,16 @@ const (
 	defaultSemanticIndexingBatchSize = 100
 	semanticIndexingMaxBatchSize     = 100
 	semanticIndexingTimeout          = 10 * time.Minute
-	backgroundWorkerActiveDelay      = 500 * time.Millisecond
-	mixedMetadataWeightMultiplier    = 3.0
-	mixedThumbnailWeightMultiplier   = 5.0
-	mixedMetadataQueueWeightCap      = 300
-	mixedThumbnailQueueWeightCap     = 300
-	mixedEmbeddingQueueWeightCap     = 500
+	// During continuous embedding backfill, rebuild after one fifth of the
+	// published corpus is ready. A drained embedding queue still takes the
+	// normal publish path below this threshold.
+	semanticIndexPartialPublishDivisor = 5
+	backgroundWorkerActiveDelay        = 500 * time.Millisecond
+	mixedMetadataWeightMultiplier      = 3.0
+	mixedThumbnailWeightMultiplier     = 5.0
+	mixedMetadataQueueWeightCap        = 300
+	mixedThumbnailQueueWeightCap       = 300
+	mixedEmbeddingQueueWeightCap       = 500
 )
 
 type semanticIndexingSchedule struct {
@@ -917,7 +921,11 @@ func semanticIndexPartialPublishQueuedThreshold(indexedVectorCount int) int {
 	if indexedVectorCount <= 0 {
 		return 1
 	}
-	return max((indexedVectorCount+9)/10, 1)
+	threshold := indexedVectorCount / semanticIndexPartialPublishDivisor
+	if indexedVectorCount%semanticIndexPartialPublishDivisor != 0 {
+		threshold++
+	}
+	return max(threshold, 1)
 }
 
 func semanticIndexPartialPublishQueuedTarget(indexedVectorCount, queuedVectorCount, queuedEmbeddingCount int) int {

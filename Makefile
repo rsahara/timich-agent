@@ -596,6 +596,47 @@ dist:
 		"# configure the datasource, and run Remote Browsing checks." \
 		"\`\`\`" \
 		"" \
+		"One-time pre-release V2 catalog migration:" \
+		"" \
+		"Skip this section unless this installation is explicitly known to use the" \
+		"unreleased catalog schema V2. Normal startup never migrates it. The command" \
+		"below is part of this exact versioned timich-agent binary and refuses any" \
+		"schema other than V2 or the already-current V3." \
+		"" \
+		"For Docker Compose, stop the old Agent, extract this complete new bundle," \
+		"build without starting, then migrate the mounted state:" \
+		"" \
+		"\`\`\`sh" \
+		"compose_args=(-f compose.yaml -f compose.immich-network.yaml)" \
+		"if [ -f compose.local-media.yaml ]; then compose_args+=(-f compose.local-media.yaml); fi" \
+		'docker compose "$${compose_args[@]}" down' \
+		'# Extract the new complete bundle before continuing.' \
+		'docker compose "$${compose_args[@]}" build timich-agent' \
+		'docker compose "$${compose_args[@]}" run --rm --no-deps \' \
+		'  --entrypoint /usr/local/bin/timich-agent timich-agent \' \
+		'  pre-release-migrate-catalog-v2-v3 \' \
+		'  --data-dir /var/lib/timich-agent/state \' \
+		'  --backup /var/lib/timich-agent/backups/catalog-v2-before-v3.db \' \
+		'  --confirm-agent-stopped' \
+		'docker compose "$${compose_args[@]}" up -d' \
+		'docker compose "$${compose_args[@]}" logs -f' \
+		"\`\`\`" \
+		"" \
+		"For a stopped native service, use the exact configured data directory:" \
+		"" \
+		"\`\`\`sh" \
+		"state_root=/var/lib/timich-agent" \
+		'install -d -m 0700 "$$state_root/backups"' \
+		'./timich-agent pre-release-migrate-catalog-v2-v3 \' \
+		'  --data-dir "$$state_root/state" \' \
+		'  --backup "$$state_root/backups/catalog-v2-before-v3.db" \' \
+		'  --confirm-agent-stopped' \
+		"\`\`\`" \
+		"" \
+		"Success reports the exact Agent version and commit, fromVersion 2, toVersion 3," \
+		"and preserved asset/semantic counts. Keep the exclusive backup and previous" \
+		"bundle until Gallery browsing and semantic search are verified." \
+		"" \
 		"Compose updates must use the exact same -f file list for down, up, and logs." \
 		"Local datasource installations must include compose.local-media.yaml in every" \
 		"one of those commands so /media/photos remains mounted." \

@@ -1430,62 +1430,357 @@ func TestCatalogSemanticSearchContinuesPastLargeCanonicalFilteredPrefix(t *testi
 	}
 }
 
-func TestCatalogSemanticSearchUsesFixedCandidateSnapshotAcrossPageSizes(t *testing.T) {
+func TestCatalogSemanticSearchRanksBoundedCandidateSnapshotAcrossChunks(t *testing.T) {
 	t.Parallel()
 
 	const sourceKey = "1111111111111111"
 	builtAt := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
-	assets := make([]semanticAsset, 0, 301)
-	for index := 0; index < 300; index++ {
-		assetID := fmt.Sprintf("ordinary-%03d", index)
-		assets = append(assets, semanticAsset{
+	assets := make([]semanticAsset, 0, semanticHNSWEfSearch*2)
+	scored := make([]semanticScoredAsset, 0, semanticHNSWEfSearch*2)
+	for index := 0; index < semanticHNSWEfSearch*2; index++ {
+		assetID := fmt.Sprintf("asset-%03d", index)
+		asset := semanticAsset{
 			SourceKey:  sourceKey,
 			ID:         assetID,
 			MediaType:  "image",
 			Filename:   assetID + ".jpg",
 			CapturedAt: builtAt.Add(time.Duration(index) * time.Second),
-			Vector:     []float32{0, 0.5, 0.5, 0},
-		})
+			Vector:     []float32{0, 0, 0, 0},
+		}
+		assets = append(assets, asset)
+		similarity := 1 - float32(index)/1000
+		if index == semanticHNSWEfSearch*2-1 {
+			similarity = 2
+		}
+		scored = append(scored, semanticScoredAsset{Asset: asset, Similarity: similarity})
 	}
-	assets = append(assets, semanticAsset{
-		SourceKey:  sourceKey,
-		ID:         "late-best",
-		MediaType:  "image",
-		Filename:   "late-best.jpg",
-		CapturedAt: builtAt.Add(301 * time.Second),
-		Vector:     []float32{0, 1, 0, 0},
-	})
 	service := newCatalogSemanticSearchBinaryFixture(t, sourceKey, assets, builtAt)
 
-	search := func(pageSize int) AssetSearchPage {
+	search := func(pageIndex int, pageSize int, filters AssetSearchFilters) (catalogSemanticResolvedPage, catalogSemanticTraversalStats, *scriptedCatalogSemanticTraversal) {
+		t.Helper()
+		normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+			Collection: AssetCollectionRequest{
+				Kind:    CollectionKindSearch,
+				Query:   &AssetSearchQuery{Text: "beach", Mode: QueryModeSemantic},
+				Filters: filters,
+			},
+			Page: AssetSearchPageRequest{Index: pageIndex, Size: pageSize},
+		})
+		if err != nil {
+			t.Fatalf("normalizeAssetSearchRequest(page %d size %d) error = %v", pageIndex, pageSize, err)
+		}
+		traversal := &scriptedCatalogSemanticTraversal{candidates: append([]semanticScoredAsset(nil), scored...)}
+		page, stats, err := service.resolveCatalogSemanticTraversalPage(
+			context.Background(),
+			normalized,
+			[]catalogSemanticSourceTraversal{{traversal: traversal}},
+			nil,
+			false,
+		)
+		if err != nil {
+			t.Fatalf("resolveCatalogSemanticTraversalPage(page %d size %d) error = %v", pageIndex, pageSize, err)
+		}
+		return page, stats, traversal
+	}
+
+	first, firstStats, firstTraversal := search(0, 200, AssetSearchFilters{})
+	if firstStats.CandidateVisits != semanticHNSWEfSearch*2 || firstStats.Rounds != 2 ||
+		len(firstTraversal.calls) != 2 || firstTraversal.calls[0] != semanticHNSWEfSearch || firstTraversal.calls[1] != semanticHNSWEfSearch {
+		t.Fatalf("first-page traversal stats=%#v calls=%v, want the complete bounded candidate snapshot", firstStats, firstTraversal.calls)
+	}
+	if len(first.Items) != 200 || first.Items[0].ID != "asset-511" || first.Items[1].ID != "asset-000" || first.Items[199].ID != "asset-198" || !first.HasMore {
+		t.Fatalf("first globally ranked semantic page = %#v", first)
+	}
+
+	second, secondStats, secondTraversal := search(1, 200, AssetSearchFilters{})
+	if secondStats.CandidateVisits != semanticHNSWEfSearch*2 || secondStats.Rounds != 2 ||
+		len(secondTraversal.calls) != 2 || secondTraversal.calls[0] != semanticHNSWEfSearch || secondTraversal.calls[1] != semanticHNSWEfSearch {
+		t.Fatalf("second-page traversal stats=%#v calls=%v, want the same complete candidate snapshot", secondStats, secondTraversal.calls)
+	}
+	if len(second.Items) != 200 || second.Items[0].ID != "asset-199" || second.Items[199].ID != "asset-398" {
+		t.Fatalf("second globally ranked semantic page = %#v", second.Items)
+	}
+	firstIDs := make(map[string]struct{}, len(first.Items))
+	for _, item := range first.Items {
+		firstIDs[item.ID] = struct{}{}
+	}
+	for _, item := range second.Items {
+		if _, duplicate := firstIDs[item.ID]; duplicate {
+			t.Fatalf("globally ranked semantic pages overlap at %q", item.ID)
+		}
+	}
+
+	from := builtAt.Add(510 * time.Second)
+	to := builtAt.Add(512 * time.Second)
+	filtered, filteredStats, _ := search(0, 1, AssetSearchFilters{CapturedAt: &AssetSearchCapturedTime{From: &from, To: &to}})
+	if filteredStats.CandidateVisits != semanticHNSWEfSearch*2 || filteredStats.Rounds != 2 {
+		t.Fatalf("filtered traversal stats = %#v, want expansion through two candidate rounds", filteredStats)
+	}
+	if len(filtered.Items) != 1 || filtered.Items[0].ID != "asset-511" || !filtered.HasMore {
+		t.Fatalf("filtered globally ranked semantic page = %#v", filtered)
+	}
+}
+
+func TestCatalogSemanticAutoSearchPromotesMetadataBeyondInitialTraversalChunk(t *testing.T) {
+	t.Parallel()
+
+	const sourceKey = "1111111111111111"
+	builtAt := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	assets := make([]semanticAsset, 0, semanticHNSWEfSearch+1)
+	scored := make([]semanticScoredAsset, 0, semanticHNSWEfSearch+1)
+	for index := 0; index <= semanticHNSWEfSearch; index++ {
+		assetID := fmt.Sprintf("asset-%03d", index)
+		filename := assetID + ".jpg"
+		if index == semanticHNSWEfSearch {
+			assetID = "metadata-match"
+			filename = "Kyoto exact match.jpg"
+		}
+		asset := semanticAsset{
+			SourceKey:  sourceKey,
+			ID:         assetID,
+			MediaType:  "image",
+			Filename:   filename,
+			CapturedAt: builtAt.Add(time.Duration(index) * time.Second),
+			Vector:     []float32{0, 1, 0, 0},
+		}
+		assets = append(assets, asset)
+		scored = append(scored, semanticScoredAsset{
+			Asset:      asset,
+			Similarity: 1 - float32(index)/1000,
+		})
+	}
+	service := newCatalogSemanticSearchBinaryFixture(t, sourceKey, assets, builtAt)
+	normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind:  CollectionKindSearch,
+			Query: &AssetSearchQuery{Text: "Kyoto", Mode: QueryModeAuto},
+		},
+		Page: AssetSearchPageRequest{Index: 0, Size: 1},
+	})
+	if err != nil {
+		t.Fatalf("normalizeAssetSearchRequest() error = %v", err)
+	}
+	metadataSession, ok, err := service.catalog.openSemanticIndexTraversal(
+		context.Background(),
+		sourceKey,
+		testImageSemanticProfile{},
+		[]float32{0, 1, 0, 0},
+	)
+	if err != nil || !ok || metadataSession == nil || metadataSession.reader == nil {
+		t.Fatalf("open metadata semantic traversal = session:%#v ok:%t error:%v", metadataSession, ok, err)
+	}
+	defer metadataSession.Close()
+	metadataCandidates, err := service.catalogSemanticMetadataCandidates(
+		context.Background(),
+		normalized,
+		[]float32{0, 1, 0, 0},
+		[]catalogSemanticSourceTraversal{{
+			traversal: metadataSession,
+			sourceKey: sourceKey,
+			reader:    metadataSession.reader,
+		}},
+	)
+	if err != nil {
+		t.Fatalf("catalogSemanticMetadataCandidates() error = %v", err)
+	}
+	traversal := &scriptedCatalogSemanticTraversal{candidates: scored}
+	page, stats, err := service.resolveCatalogSemanticTraversalPage(
+		context.Background(),
+		normalized,
+		[]catalogSemanticSourceTraversal{{traversal: traversal}},
+		metadataCandidates,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("resolveCatalogSemanticTraversalPage() error = %v", err)
+	}
+	if len(metadataCandidates) != 1 || stats.MetadataCandidates != 1 {
+		t.Fatalf("metadata candidates=%d stats=%#v, want one independent match", len(metadataCandidates), stats)
+	}
+	if stats.CandidateVisits != semanticHNSWEfSearch+1 || stats.Rounds != 2 ||
+		len(traversal.calls) != 2 || traversal.calls[0] != semanticHNSWEfSearch || traversal.calls[1] != semanticHNSWEfSearch {
+		t.Fatalf("auto traversal stats=%#v calls=%v, want the complete bounded candidate snapshot", stats, traversal.calls)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != "metadata-match" || !page.HasMore {
+		t.Fatalf("auto metadata page=%#v, want the match beyond the initial semantic chunk", page)
+	}
+}
+
+type scriptedCatalogSemanticTraversal struct {
+	candidates []semanticScoredAsset
+	offset     int
+	calls      []int
+}
+
+func (s *scriptedCatalogSemanticTraversal) Advance(ctx context.Context, additionalVisits int) ([]semanticScoredAsset, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.calls = append(s.calls, additionalVisits)
+	end := min(s.offset+additionalVisits, len(s.candidates))
+	batch := append([]semanticScoredAsset(nil), s.candidates[s.offset:end]...)
+	s.offset = end
+	return batch, nil
+}
+
+func (s *scriptedCatalogSemanticTraversal) Close() error {
+	return nil
+}
+
+func (s *scriptedCatalogSemanticTraversal) Done() bool {
+	return s == nil || s.offset >= len(s.candidates)
+}
+
+func TestCatalogSemanticResultPageUsesGalleryProjectionIncrementally(t *testing.T) {
+	t.Parallel()
+
+	const sourceKey = "1111111111111111"
+	builtAt := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	assets := make([]semanticAsset, 0, 250)
+	scored := make([]semanticScoredAsset, 0, 250)
+	for index := 0; index < 250; index++ {
+		assetID := fmt.Sprintf("asset-%03d", index)
+		asset := semanticAsset{
+			SourceKey:  sourceKey,
+			ID:         assetID,
+			MediaType:  "image",
+			Filename:   assetID + ".jpg",
+			CapturedAt: builtAt.Add(time.Duration(index) * time.Second),
+			Vector:     []float32{0, 1, 0, 0},
+		}
+		assets = append(assets, asset)
+		scored = append(scored, semanticScoredAsset{
+			Asset:      asset,
+			Similarity: 1 - float32(index)/1000,
+		})
+	}
+	service := newCatalogSemanticSearchBinaryFixture(t, sourceKey, assets, builtAt)
+
+	resolve := func(pageIndex int) catalogSemanticResolvedPage {
 		t.Helper()
 		normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
 			Collection: AssetCollectionRequest{
 				Kind:  CollectionKindSearch,
 				Query: &AssetSearchQuery{Text: "beach", Mode: QueryModeSemantic},
 			},
-			Page: AssetSearchPageRequest{Index: 0, Size: pageSize},
+			Page: AssetSearchPageRequest{Index: pageIndex, Size: 60},
 		})
 		if err != nil {
-			t.Fatalf("normalizeAssetSearchRequest(page size %d) error = %v", pageSize, err)
+			t.Fatalf("normalizeAssetSearchRequest(page %d) error = %v", pageIndex, err)
 		}
-		page, err := service.searchCatalogSemanticAssets(context.Background(), normalized, testImageSemanticProfile{}, AssetSearchOptions{})
+		page, err := service.resolveCatalogSemanticResultPage(context.Background(), normalized, scored, false)
 		if err != nil {
-			t.Fatalf("searchCatalogSemanticAssets(page size %d) error = %v", pageSize, err)
+			t.Fatalf("resolveCatalogSemanticResultPage(page %d) error = %v", pageIndex, err)
 		}
 		return page
 	}
 
-	smallPage := search(1)
-	largePage := search(200)
-	if len(smallPage.Items) != 1 || len(largePage.Items) == 0 {
-		t.Fatalf("semantic page sizes returned small=%d large=%d items", len(smallPage.Items), len(largePage.Items))
+	first := resolve(0)
+	if first.Projection != catalogSemanticResultProjectionGallery || first.CandidateCount != 64 ||
+		first.Total != 61 || !first.HasMore || len(first.Items) != 60 ||
+		first.Items[0].ID != "asset-000" || first.Items[59].ID != "asset-059" {
+		t.Fatalf("first incremental semantic page = %#v", first)
 	}
-	if smallPage.Items[0].ID != "late-best" || largePage.Items[0].ID != "late-best" {
-		t.Fatalf("semantic snapshot prefixes = %q/%q, want late-best for both page sizes", smallPage.Items[0].ID, largePage.Items[0].ID)
+	for _, item := range first.Items {
+		if item.SemanticScore != nil {
+			t.Fatalf("first incremental semantic score = %v, want omitted", *item.SemanticScore)
+		}
 	}
-	if smallPage.NextPageIndex == nil {
-		t.Fatal("small semantic page nextPageIndex = nil with more items in the fixed snapshot")
+
+	second := resolve(1)
+	if second.Projection != catalogSemanticResultProjectionGallery || second.CandidateCount != 128 ||
+		second.Total != 121 || !second.HasMore || len(second.Items) != 60 ||
+		second.Items[0].ID != "asset-060" || second.Items[59].ID != "asset-119" {
+		t.Fatalf("second incremental semantic page = %#v", second)
+	}
+
+	last := resolve(4)
+	if last.Projection != catalogSemanticResultProjectionGallery || last.CandidateCount != 250 ||
+		last.Total != 250 || last.HasMore || len(last.Items) != 10 ||
+		last.Items[0].ID != "asset-240" || last.Items[9].ID != "asset-249" {
+		t.Fatalf("last incremental semantic page = %#v", last)
+	}
+}
+
+func TestCatalogSemanticResultPageFallsBackFromStaleGalleryGeneration(t *testing.T) {
+	t.Parallel()
+
+	const sourceKey = "1111111111111111"
+	builtAt := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	assets := make([]semanticAsset, 0, 80)
+	scored := make([]semanticScoredAsset, 0, 80)
+	for index := 0; index < 80; index++ {
+		assetID := fmt.Sprintf("asset-%03d", index)
+		asset := semanticAsset{
+			SourceKey:  sourceKey,
+			ID:         assetID,
+			MediaType:  "image",
+			Filename:   assetID + ".jpg",
+			CapturedAt: builtAt.Add(time.Duration(index) * time.Second),
+			Vector:     []float32{0, 1, 0, 0},
+		}
+		assets = append(assets, asset)
+		scored = append(scored, semanticScoredAsset{Asset: asset, Similarity: 1 - float32(index)/1000})
+	}
+	service := newCatalogSemanticSearchBinaryFixture(t, sourceKey, assets, builtAt)
+	if _, err := service.catalog.db.ExecContext(context.Background(), `UPDATE catalog_canonical_state
+		SET generation = generation + 1
+		WHERE singleton_id = ?`, catalogGalleryTimelineStateID); err != nil {
+		t.Fatalf("make Gallery generation stale: %v", err)
+	}
+	normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind:  CollectionKindSearch,
+			Query: &AssetSearchQuery{Text: "beach", Mode: QueryModeSemantic},
+		},
+		Page: AssetSearchPageRequest{Index: 0, Size: 60},
+	})
+	if err != nil {
+		t.Fatalf("normalizeAssetSearchRequest() error = %v", err)
+	}
+	page, err := service.resolveCatalogSemanticResultPage(context.Background(), normalized, scored, false)
+	if err != nil {
+		t.Fatalf("resolveCatalogSemanticResultPage() error = %v", err)
+	}
+	if page.Projection != catalogSemanticResultProjectionCanonical || page.CandidateCount != 80 ||
+		page.Total != 61 || !page.HasMore || len(page.Items) != 60 || page.Items[0].ID != "asset-000" {
+		t.Fatalf("stale-generation semantic fallback page = %#v", page)
+	}
+}
+
+func TestCatalogSemanticResultPageHandlesMaximumNormalizedPage(t *testing.T) {
+	t.Parallel()
+
+	const sourceKey = "1111111111111111"
+	builtAt := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	asset := semanticAsset{
+		SourceKey:  sourceKey,
+		ID:         "asset-001",
+		MediaType:  "image",
+		Filename:   "asset-001.jpg",
+		CapturedAt: builtAt,
+		Vector:     []float32{0, 1, 0, 0},
+	}
+	service := newCatalogSemanticSearchBinaryFixture(t, sourceKey, []semanticAsset{asset}, builtAt)
+	normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind:  CollectionKindSearch,
+			Query: &AssetSearchQuery{Text: "beach", Mode: QueryModeSemantic},
+		},
+		Page: AssetSearchPageRequest{Index: math.MaxInt - 1, Size: 1},
+	})
+	if err != nil {
+		t.Fatalf("normalizeAssetSearchRequest() error = %v", err)
+	}
+	page, err := service.resolveCatalogSemanticResultPage(context.Background(), normalized, []semanticScoredAsset{{
+		Asset:      asset,
+		Similarity: 1,
+	}}, false)
+	if err != nil {
+		t.Fatalf("resolveCatalogSemanticResultPage() error = %v", err)
+	}
+	if page.Total != 1 || page.HasMore || len(page.Items) != 0 || page.CandidateCount != 1 {
+		t.Fatalf("maximum normalized semantic page = %#v, want past-end result without overflow", page)
 	}
 }
 
@@ -1611,6 +1906,314 @@ func TestCatalogSemanticAutoSearchPromotesMetadataMatches(t *testing.T) {
 	auto := search(QueryModeAuto)
 	if len(auto.Items) != 2 || auto.Items[0].ID != "metadata-match" {
 		t.Fatalf("auto page = %#v, want filename metadata match promoted", auto.Items)
+	}
+}
+
+func TestCatalogSemanticAutoSearchExcludesUnpublishedReadyMetadataMatch(t *testing.T) {
+	t.Parallel()
+
+	const sourceKey = "1111111111111111"
+	builtAt := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	assets := []semanticAsset{
+		{
+			SourceKey:  sourceKey,
+			ID:         "semantic-best",
+			MediaType:  "image",
+			Filename:   "plain.jpg",
+			CapturedAt: builtAt,
+			Vector:     []float32{1, 0, 0, 0},
+		},
+		{
+			SourceKey:  sourceKey,
+			ID:         "published-metadata-match",
+			MediaType:  "image",
+			Filename:   "Kyoto published.jpg",
+			CapturedAt: builtAt.Add(time.Second),
+			Vector:     []float32{0.8, 0.6, 0, 0},
+		},
+	}
+	service := newCatalogSemanticSearchBinaryFixture(t, sourceKey, assets, builtAt)
+	ctx := context.Background()
+	unpublished := semanticAsset{
+		SourceKey:  sourceKey,
+		ID:         "unpublished-metadata-match",
+		MediaType:  "image",
+		Filename:   "Kyoto unpublished.jpg",
+		CapturedAt: builtAt.Add(2 * time.Hour),
+		Vector:     []float32{1, 0, 0, 0},
+	}
+	nowText := formatCatalogTime(unpublished.CapturedAt)
+	if _, err := service.catalog.db.ExecContext(ctx, `INSERT INTO catalog_assets (
+			source_key, datasource_kind, upstream_asset_id, media_type, filename,
+			captured_at, duration, visibility_status, source_updated_at, is_favorite,
+			content_sha1_hex, content_size_bytes, place_label, description, first_seen_at, updated_at
+		) VALUES (?, 'immich', ?, 'image', ?, ?, NULL, 'active', ?, 0, ?, 25000, NULL, NULL, ?, ?)`,
+		sourceKey,
+		unpublished.ID,
+		unpublished.Filename,
+		nowText,
+		nowText,
+		strings.Repeat("f", 40),
+		nowText,
+		nowText,
+	); err != nil {
+		t.Fatalf("insert unpublished metadata asset: %v", err)
+	}
+	if _, err := service.catalog.RebuildCatalogCanonicalAssets(ctx); err != nil {
+		t.Fatalf("rebuild canonical assets with unpublished match: %v", err)
+	}
+	if err := service.catalog.upsertSemanticVectors(
+		ctx,
+		sourceKey,
+		testImageSemanticProfile{},
+		[]semanticAsset{unpublished},
+		unpublished.CapturedAt,
+	); err != nil {
+		t.Fatalf("upsert unpublished ready vector: %v", err)
+	}
+
+	normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind:  CollectionKindSearch,
+			Query: &AssetSearchQuery{Text: "Kyoto", Mode: QueryModeAuto},
+		},
+		Page: AssetSearchPageRequest{Index: 0, Size: 1},
+	})
+	if err != nil {
+		t.Fatalf("normalizeAssetSearchRequest() error = %v", err)
+	}
+	page, err := service.searchCatalogSemanticAssets(ctx, normalized, testImageSemanticProfile{}, AssetSearchOptions{})
+	if err != nil {
+		t.Fatalf("searchCatalogSemanticAssets() error = %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != "published-metadata-match" {
+		t.Fatalf("auto page = %#v, want only the metadata match in the active binary", page.Items)
+	}
+}
+
+func TestCatalogSemanticMetadataCandidateDiscoveryIsBoundedBeforeVectorReads(t *testing.T) {
+	const sourceKey = "1111111111111111"
+	service, err := NewServiceWithOptions([]config.DatasourceConfig{{
+		SourceKey:   sourceKey,
+		Name:        "Home Immich",
+		Kind:        config.DatasourceKindImmichIndexed,
+		URL:         "http://immich.test",
+		AccessToken: "test-key",
+	}}, ServiceOptions{DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	defer service.Close()
+
+	ctx := context.Background()
+	header := semanticBinaryIndexHeader{
+		SourceKey:       sourceKey,
+		ModelID:         "test-image-profile",
+		VectorSpaceID:   "test-image-profile/d4",
+		AssetGeneration: 7,
+	}
+	if _, err := service.catalog.db.ExecContext(ctx, `INSERT INTO semantic_index_membership_state (
+			source_key, model_id, vector_space_id, asset_generation,
+			binary_sha256, binary_size_bytes, node_count, built_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		header.SourceKey,
+		header.ModelID,
+		header.VectorSpaceID,
+		header.AssetGeneration,
+		strings.Repeat("a", 64),
+		semanticBinaryIndexHeaderBytes,
+		semanticSearchVisitBudget+128,
+		formatCatalogTime(time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)),
+	); err != nil {
+		t.Fatalf("insert metadata membership identity: %v", err)
+	}
+	tx, err := service.catalog.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin metadata candidate fixture: %v", err)
+	}
+	assetStatement, err := tx.PrepareContext(ctx, `INSERT INTO catalog_assets (
+			source_key, datasource_kind, upstream_asset_id, media_type, filename,
+			captured_at, duration, visibility_status, source_updated_at, is_favorite,
+			content_sha1_hex, content_size_bytes, place_label, description, first_seen_at, updated_at
+		) VALUES (?, 'immich', ?, 'image', ?, ?, NULL, 'active', ?, 1, ?, 25000, 'Kyoto 京都', NULL, ?, ?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("prepare metadata asset insert: %v", err)
+	}
+	membershipStatement, err := tx.PrepareContext(ctx, `INSERT INTO semantic_index_membership (
+			source_key, model_id, vector_space_id, asset_generation, upstream_asset_id, ordinal
+		) VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		_ = assetStatement.Close()
+		_ = tx.Rollback()
+		t.Fatalf("prepare metadata membership insert: %v", err)
+	}
+	baseTime := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	for index := 0; index < semanticSearchVisitBudget+128; index++ {
+		assetID := fmt.Sprintf("broad-match-%05d", index)
+		filename := assetID + ".jpg"
+		if index == semanticSearchVisitBudget {
+			assetID = "boundary-match-after-limit"
+			filename = "東京 exact match.jpg"
+		}
+		nowText := formatCatalogTime(baseTime.Add(time.Duration(index) * time.Second))
+		if _, err := assetStatement.ExecContext(
+			ctx,
+			sourceKey,
+			assetID,
+			filename,
+			nowText,
+			nowText,
+			fmt.Sprintf("%040x", index+1),
+			nowText,
+			nowText,
+		); err != nil {
+			_ = membershipStatement.Close()
+			_ = assetStatement.Close()
+			_ = tx.Rollback()
+			t.Fatalf("insert broad metadata asset %d: %v", index, err)
+		}
+		if _, err := membershipStatement.ExecContext(
+			ctx,
+			sourceKey,
+			header.ModelID,
+			header.VectorSpaceID,
+			header.AssetGeneration,
+			assetID,
+			index,
+		); err != nil {
+			_ = membershipStatement.Close()
+			_ = assetStatement.Close()
+			_ = tx.Rollback()
+			t.Fatalf("insert broad metadata membership %d: %v", index, err)
+		}
+	}
+	if err := membershipStatement.Close(); err != nil {
+		_ = assetStatement.Close()
+		_ = tx.Rollback()
+		t.Fatalf("close metadata membership insert: %v", err)
+	}
+	if err := assetStatement.Close(); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("close metadata asset insert: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit metadata candidate fixture: %v", err)
+	}
+
+	for _, query := range []string{"favorites", "Kyoto", "京都"} {
+		normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+			Collection: AssetCollectionRequest{
+				Kind:  CollectionKindSearch,
+				Query: &AssetSearchQuery{Text: query, Mode: QueryModeAuto},
+			},
+			Page: AssetSearchPageRequest{Index: 0, Size: 1},
+		})
+		if err != nil {
+			t.Fatalf("normalizeAssetSearchRequest(%q) error = %v", query, err)
+		}
+		refs, err := service.catalogSemanticMetadataCandidateRefs(ctx, normalized, query, header)
+		if err != nil {
+			t.Fatalf("catalogSemanticMetadataCandidateRefs(%q) error = %v", query, err)
+		}
+		if len(refs) != semanticSearchVisitBudget {
+			t.Fatalf("metadata refs for %q = %d, want bounded %d before vector reads", query, len(refs), semanticSearchVisitBudget)
+		}
+	}
+
+	from := baseTime.Add(semanticSearchVisitBudget * time.Second)
+	to := from.Add(time.Second)
+	for _, query := range []string{"Kyoto", "favorites"} {
+		filtered, err := normalizeAssetSearchRequest(AssetSearchRequest{
+			Collection: AssetCollectionRequest{
+				Kind:  CollectionKindSearch,
+				Query: &AssetSearchQuery{Text: query, Mode: QueryModeAuto},
+				Filters: AssetSearchFilters{CapturedAt: &AssetSearchCapturedTime{
+					From: &from,
+					To:   &to,
+				}},
+			},
+			Page: AssetSearchPageRequest{Index: 0, Size: 1},
+		})
+		if err != nil {
+			t.Fatalf("normalize filtered metadata request %q: %v", query, err)
+		}
+		refs, err := service.catalogSemanticMetadataCandidateRefs(ctx, filtered, query, header)
+		if err != nil {
+			t.Fatalf("catalogSemanticMetadataCandidateRefs(filtered %q) error = %v", query, err)
+		}
+		if len(refs) != 1 || refs[0].AssetID != "boundary-match-after-limit" || refs[0].Ordinal != semanticSearchVisitBudget {
+			t.Fatalf("filtered metadata refs for %q = %#v, want the only in-range match after the branch limit", query, refs)
+		}
+	}
+
+	short, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind:  CollectionKindSearch,
+			Query: &AssetSearchQuery{Text: "東京", Mode: QueryModeAuto},
+		},
+		Page: AssetSearchPageRequest{Index: 0, Size: 1},
+	})
+	if err != nil {
+		t.Fatalf("normalize short metadata request: %v", err)
+	}
+	refs, err := service.catalogSemanticMetadataCandidateRefs(ctx, short, "東京", header)
+	if err != nil {
+		t.Fatalf("catalogSemanticMetadataCandidateRefs(short Tokyo) error = %v", err)
+	}
+	if len(refs) != 1 || refs[0].AssetID != "boundary-match-after-limit" || refs[0].Ordinal != semanticSearchVisitBudget {
+		t.Fatalf("short metadata refs = %#v, want the exact match after the ordinal prefix", refs)
+	}
+}
+
+func TestCatalogSemanticAutoSearchDoesNotWaitForWriterConnection(t *testing.T) {
+	t.Parallel()
+
+	const sourceKey = "1111111111111111"
+	builtAt := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	assets := []semanticAsset{
+		{
+			SourceKey:  sourceKey,
+			ID:         "semantic-best",
+			MediaType:  "image",
+			Filename:   "plain.jpg",
+			CapturedAt: builtAt,
+			Vector:     []float32{0, 1, 0, 0},
+		},
+		{
+			SourceKey:  sourceKey,
+			ID:         "metadata-match",
+			MediaType:  "image",
+			Filename:   "Beach evening.jpg",
+			CapturedAt: builtAt.Add(time.Second),
+			Vector:     []float32{0, 0.8, 0.6, 0},
+		},
+	}
+	service := newCatalogSemanticSearchBinaryFixture(t, sourceKey, assets, builtAt)
+	writer, err := service.catalog.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin held catalog writer: %v", err)
+	}
+	defer writer.Rollback()
+
+	normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind:  CollectionKindSearch,
+			Query: &AssetSearchQuery{Text: "Beach", Mode: QueryModeAuto},
+		},
+		Page: AssetSearchPageRequest{Index: 0, Size: 2},
+	})
+	if err != nil {
+		t.Fatalf("normalizeAssetSearchRequest() error = %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	page, err := service.searchCatalogSemanticAssets(ctx, normalized, testImageSemanticProfile{}, AssetSearchOptions{})
+	if err != nil {
+		t.Fatalf("searchCatalogSemanticAssets() with held writer error = %v", err)
+	}
+	if len(page.Items) != 2 || page.Items[0].ID != "metadata-match" {
+		t.Fatalf("semantic auto page with held writer = %#v, want metadata match promoted", page.Items)
 	}
 }
 

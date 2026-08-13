@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	semanticVectorPayloadDirName    = "semantic-vector-payloads"
-	semanticVectorPayloadExt        = ".vecs"
-	semanticVectorPayloadCacheLimit = 32
+	semanticVectorPayloadDirName       = "semantic-vector-payloads"
+	semanticVectorPayloadExt           = ".vecs"
+	semanticVectorPayloadCacheMaxBytes = 32 << 20
+	semanticVectorPayloadCacheMaxItems = 128
 )
 
 var semanticVectorPayloadHashBufferPool = sync.Pool{New: func() any {
@@ -270,6 +271,7 @@ func (s *CatalogStore) loadSemanticVectorPayloadBatch(ctx context.Context, batch
 	if !forceVerify {
 		s.semanticVectorPayloadCacheMu.Lock()
 		if raw := s.semanticVectorPayloadCache[batchID]; raw != nil {
+			s.touchSemanticVectorPayloadCacheLocked(batchID)
 			s.semanticVectorPayloadCacheMu.Unlock()
 			return raw, nil
 		}
@@ -313,17 +315,28 @@ func (s *CatalogStore) loadSemanticVectorPayloadBatch(ctx context.Context, batch
 	s.semanticVectorPayloadCacheMu.Lock()
 	if existing := s.semanticVectorPayloadCache[batchID]; existing != nil {
 		raw = existing
+		s.touchSemanticVectorPayloadCacheLocked(batchID)
 	} else {
 		if s.semanticVectorPayloadCache == nil {
 			s.semanticVectorPayloadCache = make(map[string][]byte)
 		}
-		if len(s.semanticVectorPayloadOrder) >= semanticVectorPayloadCacheLimit {
-			oldest := s.semanticVectorPayloadOrder[0]
-			delete(s.semanticVectorPayloadCache, oldest)
-			s.semanticVectorPayloadOrder = s.semanticVectorPayloadOrder[1:]
+		maxBytes := s.semanticVectorPayloadMaxBytes
+		if maxBytes <= 0 {
+			maxBytes = semanticVectorPayloadCacheMaxBytes
 		}
-		s.semanticVectorPayloadCache[batchID] = raw
-		s.semanticVectorPayloadOrder = append(s.semanticVectorPayloadOrder, batchID)
+		maxItems := s.semanticVectorPayloadMaxItems
+		if maxItems <= 0 {
+			maxItems = semanticVectorPayloadCacheMaxItems
+		}
+		for len(s.semanticVectorPayloadOrder) > 0 &&
+			(len(s.semanticVectorPayloadOrder) >= maxItems || s.semanticVectorPayloadBytes+int64(len(raw)) > maxBytes) {
+			s.evictOldestSemanticVectorPayloadLocked()
+		}
+		if int64(len(raw)) <= maxBytes {
+			s.semanticVectorPayloadCache[batchID] = raw
+			s.semanticVectorPayloadOrder = append(s.semanticVectorPayloadOrder, batchID)
+			s.semanticVectorPayloadBytes += int64(len(raw))
+		}
 	}
 	s.semanticVectorPayloadCacheMu.Unlock()
 	return raw, nil
@@ -595,6 +608,12 @@ func (s *CatalogStore) cleanupUnreferencedSemanticVectorPayloadsLocked(ctx conte
 func (s *CatalogStore) dropSemanticVectorPayloadCache(batchID string) {
 	s.semanticVectorPayloadCacheMu.Lock()
 	defer s.semanticVectorPayloadCacheMu.Unlock()
+	if raw := s.semanticVectorPayloadCache[batchID]; raw != nil {
+		s.semanticVectorPayloadBytes -= int64(len(raw))
+		if s.semanticVectorPayloadBytes < 0 {
+			s.semanticVectorPayloadBytes = 0
+		}
+	}
 	delete(s.semanticVectorPayloadCache, batchID)
 	for index, cachedID := range s.semanticVectorPayloadOrder {
 		if cachedID == batchID {
@@ -602,4 +621,30 @@ func (s *CatalogStore) dropSemanticVectorPayloadCache(batchID string) {
 			break
 		}
 	}
+}
+
+func (s *CatalogStore) touchSemanticVectorPayloadCacheLocked(batchID string) {
+	for index, cachedID := range s.semanticVectorPayloadOrder {
+		if cachedID != batchID {
+			continue
+		}
+		copy(s.semanticVectorPayloadOrder[index:], s.semanticVectorPayloadOrder[index+1:])
+		s.semanticVectorPayloadOrder[len(s.semanticVectorPayloadOrder)-1] = batchID
+		return
+	}
+}
+
+func (s *CatalogStore) evictOldestSemanticVectorPayloadLocked() {
+	if len(s.semanticVectorPayloadOrder) == 0 {
+		return
+	}
+	oldest := s.semanticVectorPayloadOrder[0]
+	s.semanticVectorPayloadOrder = s.semanticVectorPayloadOrder[1:]
+	if raw := s.semanticVectorPayloadCache[oldest]; raw != nil {
+		s.semanticVectorPayloadBytes -= int64(len(raw))
+		if s.semanticVectorPayloadBytes < 0 {
+			s.semanticVectorPayloadBytes = 0
+		}
+	}
+	delete(s.semanticVectorPayloadCache, oldest)
 }

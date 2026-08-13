@@ -1313,6 +1313,9 @@ func (a *AgentRuntime) enrichDatasourceEmbeddingCoverageWithProfile(ctx context.
 	if a == nil || catalogService == nil || len(statuses) == 0 {
 		return nil
 	}
+	for index := range statuses {
+		statuses[index].FailedEmbeddingJobs = 0
+	}
 	if profile == nil {
 		return nil
 	}
@@ -1336,6 +1339,7 @@ func (a *AgentRuntime) enrichDatasourceEmbeddingCoverageWithProfile(ctx context.
 		statuses[index].EmbeddingEligible = backfill.EligibleAssetCount
 		statuses[index].EmbeddingCompleted = backfill.CompletedVectorCount
 		statuses[index].EmbeddingIndexed = backfill.IndexedVectorCount
+		statuses[index].FailedEmbeddingJobs = backfill.FailedVectorCount
 		statuses[index].EmbeddingPendingIndexJobs = backfill.PendingIndexJobCount
 		statuses[index].EmbeddingFailedIndexJobs = backfill.FailedIndexJobCount
 		statuses[index].EmbeddingLastPublishedAt = backfill.LastPublishedAt
@@ -1347,6 +1351,12 @@ func (a *AgentRuntime) enrichDatasourceEmbeddingCoverageWithProfile(ctx context.
 func (a *AgentRuntime) enrichLocalDatasourceEmbeddingCoverage(ctx context.Context, catalogService *catalog.Service, statuses []catalog.LocalDatasourceScanStatus) error {
 	if a == nil || catalogService == nil || len(statuses) == 0 {
 		return nil
+	}
+	for index := range statuses {
+		// Local scan status has no semantic profile input, so its raw failure
+		// count can include vectors from older models. Only expose failures
+		// after the current profile-specific backfill status is available.
+		statuses[index].FailedEmbeddingJobs = 0
 	}
 	profile := a.semanticEmbeddingCoverageProfile(ctx, catalogService)
 	if profile == nil {
@@ -1371,6 +1381,7 @@ func (a *AgentRuntime) enrichLocalDatasourceEmbeddingCoverage(ctx context.Contex
 		statuses[index].EmbeddingEligible = backfill.EligibleAssetCount
 		statuses[index].EmbeddingCompleted = backfill.CompletedVectorCount
 		statuses[index].EmbeddingIndexed = backfill.IndexedVectorCount
+		statuses[index].FailedEmbeddingJobs = backfill.FailedVectorCount
 		statuses[index].EmbeddingRemaining = backfill.RemainingVectorCount
 	}
 	return nil

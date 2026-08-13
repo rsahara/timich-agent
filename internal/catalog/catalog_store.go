@@ -22,7 +22,7 @@ const (
 	catalogDatabaseName                = "catalog.db"
 	catalogAdminDBName                 = "catalog-admin.db"
 	catalogReadConns                   = 4
-	catalogSchemaVersion               = 2
+	catalogSchemaVersion               = 3
 	catalogGallerySourceCanonicalIndex = "idx_catalog_assets_gallery_source_canonical"
 	// "TMCH" identifies the final Timich catalog format. Earlier unreleased
 	// development databases reused user_version=1 without this marker.
@@ -107,20 +107,23 @@ type MirrorSyncResult struct {
 }
 
 type CatalogStore struct {
-	root                         string
-	path                         string
-	db                           *sql.DB
-	readDB                       *sql.DB
-	semanticBinaryIntegrityMu    sync.Mutex
-	semanticBinaryIntegrity      map[string]semanticBinaryIntegrityCacheEntry
-	semanticVectorPayloadMu      sync.Mutex
-	semanticVectorPayloadCacheMu sync.Mutex
-	semanticVectorPayloadCache   map[string][]byte
-	semanticVectorPayloadOrder   []string
-	galleryTotalMu               sync.Mutex
-	galleryTotalCache            map[string]int
-	datasourceState              *atomic.Pointer[serviceDatasourceState]
-	standaloneGalleryReadiness   atomic.Pointer[catalogGalleryReadiness]
+	root                          string
+	path                          string
+	db                            *sql.DB
+	readDB                        *sql.DB
+	semanticBinaryIntegrityMu     sync.Mutex
+	semanticBinaryIntegrity       map[string]semanticBinaryIntegrityCacheEntry
+	semanticVectorPayloadMu       sync.Mutex
+	semanticVectorPayloadCacheMu  sync.Mutex
+	semanticVectorPayloadCache    map[string][]byte
+	semanticVectorPayloadOrder    []string
+	semanticVectorPayloadBytes    int64
+	semanticVectorPayloadMaxBytes int64
+	semanticVectorPayloadMaxItems int
+	galleryTotalMu                sync.Mutex
+	galleryTotalCache             map[string]int
+	datasourceState               *atomic.Pointer[serviceDatasourceState]
+	standaloneGalleryReadiness    atomic.Pointer[catalogGalleryReadiness]
 }
 
 func (s *CatalogStore) galleryReadinessSnapshot() catalogGalleryReadiness {
@@ -163,18 +166,28 @@ func LoadOrCreateCatalogStore(dataDir string) (*CatalogStore, error) {
 	}
 	db.SetMaxOpenConns(1)
 	store := &CatalogStore{
-		root:                       root,
-		path:                       path,
-		db:                         db,
-		semanticBinaryIntegrity:    make(map[string]semanticBinaryIntegrityCacheEntry),
-		semanticVectorPayloadCache: make(map[string][]byte),
-		galleryTotalCache:          make(map[string]int),
+		root:                          root,
+		path:                          path,
+		db:                            db,
+		semanticBinaryIntegrity:       make(map[string]semanticBinaryIntegrityCacheEntry),
+		semanticVectorPayloadCache:    make(map[string][]byte),
+		semanticVectorPayloadMaxBytes: semanticVectorPayloadCacheMaxBytes,
+		semanticVectorPayloadMaxItems: semanticVectorPayloadCacheMaxItems,
+		galleryTotalCache:             make(map[string]int),
 	}
 	if err := store.ensureCatalogSchema(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.ensureCatalogQueryIndexes(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := cleanupSemanticIndexCrashTemps(filepath.Join(root, semanticBinaryIndexDirName)); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.reconcileSemanticBinaryMemberships(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -482,6 +495,9 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 			if !hasStringPrefix(indexColumns, requiredPrefix) {
 				return fmt.Errorf("%w: catalog schema has an outdated local work index %q; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, indexName, s.root)
 			}
+		}
+		if err := s.validateCatalogSearchProjectionSchema(context.Background()); err != nil {
+			return err
 		}
 		if err := s.ensureCatalogQueryIndexes(context.Background()); err != nil {
 			return err
@@ -864,6 +880,7 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 			source_key TEXT PRIMARY KEY
 		)`,
 	}
+	statements = append(statements, catalogSearchProjectionSchemaStatements()...)
 	return createCatalogSchema(context.Background(), s.db, statements)
 }
 
@@ -918,6 +935,103 @@ func (s *CatalogStore) ensureCatalogQueryIndexes(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, statement.sql); err != nil {
 			return fmt.Errorf("ensure catalog query index %s: %w", statement.name, err)
 		}
+	}
+	return nil
+}
+
+func catalogSearchProjectionSchemaStatements() []string {
+	return []string{
+		`CREATE TABLE IF NOT EXISTS semantic_index_membership_state (
+			source_key TEXT NOT NULL,
+			model_id TEXT NOT NULL,
+			vector_space_id TEXT NOT NULL,
+			asset_generation INTEGER NOT NULL,
+			binary_sha256 TEXT NOT NULL CHECK(length(binary_sha256) = 64),
+			binary_size_bytes INTEGER NOT NULL CHECK(binary_size_bytes > 0),
+			node_count INTEGER NOT NULL CHECK(node_count >= 0),
+			built_at TEXT NOT NULL,
+			PRIMARY KEY(source_key, model_id, vector_space_id, asset_generation)
+		)`,
+		`CREATE TABLE IF NOT EXISTS semantic_index_membership (
+			source_key TEXT NOT NULL,
+			model_id TEXT NOT NULL,
+			vector_space_id TEXT NOT NULL,
+			asset_generation INTEGER NOT NULL,
+			upstream_asset_id TEXT NOT NULL,
+			ordinal INTEGER NOT NULL,
+			PRIMARY KEY(source_key, model_id, vector_space_id, asset_generation, upstream_asset_id),
+			UNIQUE(source_key, model_id, vector_space_id, asset_generation, ordinal),
+			FOREIGN KEY(source_key, model_id, vector_space_id, asset_generation)
+				REFERENCES semantic_index_membership_state(source_key, model_id, vector_space_id, asset_generation)
+				ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_catalog_assets_metadata_favorite
+			ON catalog_assets(source_key, visibility_status, is_favorite, captured_at DESC, upstream_asset_id)`,
+		`CREATE VIRTUAL TABLE IF NOT EXISTS catalog_assets_metadata_fts USING fts5(
+			filename,
+			place_label,
+			description,
+			content = 'catalog_assets',
+			content_rowid = 'rowid',
+			tokenize = 'trigram'
+		)`,
+		`CREATE TRIGGER IF NOT EXISTS catalog_assets_metadata_fts_insert
+			AFTER INSERT ON catalog_assets BEGIN
+				INSERT INTO catalog_assets_metadata_fts(rowid, filename, place_label, description)
+				VALUES (new.rowid, new.filename, new.place_label, new.description);
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS catalog_assets_metadata_fts_delete
+			AFTER DELETE ON catalog_assets BEGIN
+				INSERT INTO catalog_assets_metadata_fts(catalog_assets_metadata_fts, rowid, filename, place_label, description)
+				VALUES ('delete', old.rowid, old.filename, old.place_label, old.description);
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS catalog_assets_metadata_fts_update
+			AFTER UPDATE OF filename, place_label, description ON catalog_assets BEGIN
+				INSERT INTO catalog_assets_metadata_fts(catalog_assets_metadata_fts, rowid, filename, place_label, description)
+				VALUES ('delete', old.rowid, old.filename, old.place_label, old.description);
+				INSERT INTO catalog_assets_metadata_fts(rowid, filename, place_label, description)
+				VALUES (new.rowid, new.filename, new.place_label, new.description);
+			END`,
+	}
+}
+
+func (s *CatalogStore) validateCatalogSearchProjectionSchema(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return ErrCatalogNotConfigured
+	}
+	stateColumns, err := s.tableColumns("semantic_index_membership_state")
+	if err != nil {
+		return err
+	}
+	membershipColumns, err := s.tableColumns("semantic_index_membership")
+	if err != nil {
+		return err
+	}
+	if !stateColumns["binary_sha256"] || !stateColumns["binary_size_bytes"] ||
+		!stateColumns["node_count"] || !stateColumns["built_at"] ||
+		!membershipColumns["upstream_asset_id"] || !membershipColumns["ordinal"] {
+		return fmt.Errorf("%w: catalog schema is missing the current semantic membership projection; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, s.root)
+	}
+	var ftsCount int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'catalog_assets_metadata_fts'`).Scan(&ftsCount); err != nil {
+		return fmt.Errorf("inspect catalog metadata search table: %w", err)
+	}
+	var triggerCount int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'trigger' AND name IN (
+			'catalog_assets_metadata_fts_insert',
+			'catalog_assets_metadata_fts_delete',
+			'catalog_assets_metadata_fts_update'
+		)`).Scan(&triggerCount); err != nil {
+		return fmt.Errorf("inspect catalog metadata search triggers: %w", err)
+	}
+	favoriteIndex, err := s.indexColumns("idx_catalog_assets_metadata_favorite")
+	if err != nil {
+		return err
+	}
+	if ftsCount != 1 || triggerCount != 3 || !hasStringPrefix(favoriteIndex, []string{"source_key", "visibility_status", "is_favorite", "captured_at", "upstream_asset_id"}) {
+		return fmt.Errorf("%w: catalog schema is missing the current metadata search projection; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, s.root)
 	}
 	return nil
 }

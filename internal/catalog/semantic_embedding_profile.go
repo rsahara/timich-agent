@@ -156,6 +156,7 @@ type SemanticModelBackfillStatus struct {
 	EmbeddingDim                  int        `json:"embeddingDim,omitempty"`
 	EligibleAssetCount            int        `json:"eligibleAssetCount"`
 	CompletedVectorCount          int        `json:"completedVectorCount"`
+	FailedVectorCount             int        `json:"failedVectorCount,omitempty"`
 	IndexedVectorCount            int        `json:"indexedVectorCount"`
 	RemainingVectorCount          int        `json:"remainingVectorCount"`
 	PendingIndexJobCount          int        `json:"pendingIndexJobCount,omitempty"`

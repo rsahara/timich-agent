@@ -308,8 +308,8 @@ func TestSchedulerWorkStateSemanticStatusKeepsWaitTargetWithPendingPublishJob(t 
 	})
 
 	state := runtime.schedulerWorkState
-	if state.SemanticWaitingQueuedTarget != 100 {
-		t.Fatalf("SemanticWaitingQueuedTarget = %d, want 100 even with a pending publish job", state.SemanticWaitingQueuedTarget)
+	if state.SemanticWaitingQueuedTarget != 200 {
+		t.Fatalf("SemanticWaitingQueuedTarget = %d, want 200 even with a pending publish job", state.SemanticWaitingQueuedTarget)
 	}
 	if !state.SemanticPublishReady {
 		t.Fatal("SemanticPublishReady = false, want true for pending publish job")
@@ -518,15 +518,37 @@ func TestApplySchedulerWorkStatePrefersSearchIndexWaitOverPendingPublishQueue(t 
 		SemanticIndexedVectors:       1000,
 		SemanticMixedEmbeddingQueued: 450,
 		SemanticPendingIndexJobs:     1,
-		SemanticWaitingQueuedTarget:  100,
+		SemanticWaitingQueuedTarget:  200,
 	})
 	tasks = normalizeDatasourceTaskDependencies(tasks)
 
 	got := tasks[0]
 	if got.Status != "waiting" ||
 		got.WaitingReason != datasourceTaskWaitingQueuedTarget ||
-		got.WaitingQueuedTarget != 100 ||
+		got.WaitingQueuedTarget != 200 ||
 		got.QueuedTasks != 50 {
 		t.Fatalf("search index task = %+v, want waiting queued target over pending publish queue", got)
+	}
+}
+
+func TestApplySchedulerWorkStateReplacesStaleEmbeddingFailureCount(t *testing.T) {
+	tasks := []DatasourceTaskStatus{{
+		Phase:       "embeddings",
+		Label:       "Embeddings",
+		FailedTasks: 2,
+		Status:      "attention",
+	}}
+
+	applySchedulerWorkStateToDatasourceTasks(tasks, schedulerWorkState{
+		SemanticScheduled:        true,
+		SemanticEligibleVectors:  10,
+		SemanticFailedVectors:    1,
+		SemanticCompletedVectors: 0,
+	})
+	tasks = normalizeDatasourceTaskDependencies(tasks)
+
+	got := tasks[0]
+	if got.QueuedTasks != 9 || got.FailedTasks != 1 || got.TotalTasks != 10 {
+		t.Fatalf("embeddings task = %+v, want current model queued/failed/total 9/1/10", got)
 	}
 }
