@@ -777,29 +777,71 @@ func (s *Service) SearchAssetsWithOptionsContext(ctx context.Context, searchRequ
 		return AssetSearchPage{}, ErrCatalogNotConfigured
 	}
 	if normalized.Resolved.QueryMode == QueryModeSemantic {
-		profile := s.semanticSearchProfile(ctx, options)
-		if profile == nil {
+		selection := s.semanticSearchProfileSelection(ctx, options)
+		if selection.profile == nil {
 			return s.searchCatalogWithoutSemanticProfile(ctx, normalized)
 		}
-		return s.searchCatalogSemanticAssets(ctx, normalized, profile, options)
+		if !selection.published {
+			semantic := s.semanticSearchUnavailableStatus(ctx, selection.profile)
+			return s.searchCatalogWithoutUsableSemanticIndex(ctx, normalized, semantic, selection.profile)
+		}
+		return s.searchCatalogSemanticAssets(ctx, normalized, selection.profile, options)
 	}
 	return s.catalog.SearchCatalogAssets(ctx, normalized)
 }
 
+type semanticSearchProfileSelection struct {
+	profile   semanticEmbeddingProfile
+	published bool
+}
+
 func (s *Service) semanticSearchProfile(ctx context.Context, options AssetSearchOptions) semanticEmbeddingProfile {
+	return s.semanticSearchProfileSelection(ctx, options).profile
+}
+
+func (s *Service) semanticSearchProfileSelection(ctx context.Context, options AssetSearchOptions) semanticSearchProfileSelection {
 	if profile := s.preferredSemanticSearchCandidateProfile(ctx, options); profile != nil {
-		return cachedSemanticTextProfileFor(profile, s.semanticText)
+		return semanticSearchProfileSelection{
+			profile:   cachedSemanticTextProfileFor(profile, s.semanticText),
+			published: s.semanticSearchHasPublishedIndex(ctx, profile),
+		}
 	}
-	if profile := s.semanticSearchActiveProfile(ctx); semanticSearchableImageProfile(profile) {
-		return cachedSemanticTextProfileFor(profile, s.semanticText)
+	active := s.semanticSearchActiveProfile(ctx)
+	if semanticSearchableImageProfile(active) {
+		if s.semanticSearchHasPublishedIndex(ctx, active) {
+			return semanticSearchProfileSelection{
+				profile:   cachedSemanticTextProfileFor(active, s.semanticText),
+				published: true,
+			}
+		}
 	}
-	if profile := s.semanticSearchCandidateProfile(ctx, options); profile != nil {
-		return cachedSemanticTextProfileFor(profile, s.semanticText)
+	candidate := s.semanticSearchCandidateProfile(ctx, options)
+	if candidate != nil && (active == nil || candidate.ModelID() != active.ModelID() || candidate.VectorSpaceID() != active.VectorSpaceID()) {
+		if s.semanticSearchHasPublishedIndex(ctx, candidate) {
+			return semanticSearchProfileSelection{
+				profile:   cachedSemanticTextProfileFor(candidate, s.semanticText),
+				published: true,
+			}
+		}
 	}
-	if profile := s.semanticSearchActiveProfile(ctx); profile != nil {
-		return cachedSemanticTextProfileFor(profile, s.semanticText)
+	if active != nil && !semanticSearchableImageProfile(active) {
+		if s.semanticSearchHasPublishedIndex(ctx, active) {
+			return semanticSearchProfileSelection{
+				profile:   cachedSemanticTextProfileFor(active, s.semanticText),
+				published: true,
+			}
+		}
 	}
-	return nil
+	if semanticSearchableImageProfile(active) {
+		return semanticSearchProfileSelection{profile: cachedSemanticTextProfileFor(active, s.semanticText)}
+	}
+	if candidate != nil && (active == nil || candidate.ModelID() != active.ModelID() || candidate.VectorSpaceID() != active.VectorSpaceID()) {
+		return semanticSearchProfileSelection{profile: cachedSemanticTextProfileFor(candidate, s.semanticText)}
+	}
+	if active != nil {
+		return semanticSearchProfileSelection{profile: cachedSemanticTextProfileFor(active, s.semanticText)}
+	}
+	return semanticSearchProfileSelection{}
 }
 
 func semanticSearchableImageProfile(profile semanticEmbeddingProfile) bool {
@@ -830,20 +872,12 @@ func (s *Service) semanticSearchCandidateProfile(ctx context.Context, options As
 		)
 		return nil
 	}
-	status, err := s.SemanticModelBackfillStatus(ctx, candidate)
-	if err != nil || status == nil || status.IndexedVectorCount == 0 {
-		log.Printf(
-			"timich-agent semantic search candidate profile unavailable model=%s vector_space=%s elapsed=%s err=%v status=%s indexed=%d completed=%d",
-			candidate.ModelID,
-			candidate.VectorSpaceID,
-			time.Since(candidateStarted).Round(time.Millisecond),
-			err,
-			semanticBackfillStatusLogValue(status),
-			semanticBackfillIndexedLogValue(status),
-			semanticBackfillCompletedLogValue(status),
-		)
-		return nil
-	}
+	log.Printf(
+		"timich-agent semantic search candidate runtime profile selected model=%s vector_space=%s elapsed=%s",
+		candidate.ModelID,
+		candidate.VectorSpaceID,
+		time.Since(candidateStarted).Round(time.Millisecond),
+	)
 	return profile
 }
 
@@ -861,27 +895,6 @@ func (s *Service) semanticSearchActiveProfile(ctx context.Context) semanticEmbed
 		)
 		return nil
 	}
-	log.Printf(
-		"timich-agent semantic search active profile backfill status started model=%s vector_space=%s input=%s elapsed=%s",
-		active.ModelID,
-		active.VectorSpaceID,
-		active.InputKind,
-		time.Since(started).Round(time.Millisecond),
-	)
-	status, err := s.SemanticModelBackfillStatus(ctx, active)
-	if err != nil || status == nil {
-		log.Printf(
-			"timich-agent semantic search active profile backfill status unavailable model=%s vector_space=%s elapsed=%s err=%v status=%s indexed=%d completed=%d",
-			active.ModelID,
-			active.VectorSpaceID,
-			time.Since(started).Round(time.Millisecond),
-			err,
-			semanticBackfillStatusLogValue(status),
-			semanticBackfillIndexedLogValue(status),
-			semanticBackfillCompletedLogValue(status),
-		)
-		return nil
-	}
 	profile, ok := s.semanticModels.ActiveEmbeddingProfileWithContext(ctx)
 	if !ok {
 		log.Printf(
@@ -893,15 +906,78 @@ func (s *Service) semanticSearchActiveProfile(ctx context.Context) semanticEmbed
 		return nil
 	}
 	log.Printf(
-		"timich-agent semantic search active profile selected model=%s vector_space=%s status=%s indexed=%d completed=%d elapsed=%s",
+		"timich-agent semantic search active runtime profile selected model=%s vector_space=%s elapsed=%s",
 		active.ModelID,
 		active.VectorSpaceID,
-		semanticBackfillStatusLogValue(status),
-		semanticBackfillIndexedLogValue(status),
-		semanticBackfillCompletedLogValue(status),
 		time.Since(started).Round(time.Millisecond),
 	)
 	return profile
+}
+
+func (s *Service) semanticSearchHasPublishedIndex(ctx context.Context, profile semanticEmbeddingProfile) bool {
+	if s == nil || s.catalog == nil || profile == nil {
+		return false
+	}
+	for _, sourceKey := range s.semanticDatasourceSourceKeys() {
+		available, err := s.catalog.hasPublishedSemanticBinaryIndex(ctx, sourceKey, profile)
+		if err != nil {
+			log.Printf(
+				"timich-agent semantic search published index unavailable source_key=%s model=%s vector_space=%s error=%v",
+				sourceKey,
+				profile.ModelID(),
+				profile.VectorSpaceID(),
+				err,
+			)
+			continue
+		}
+		if available {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) semanticSearchUnavailableStatus(ctx context.Context, profile semanticEmbeddingProfile) CatalogSemanticStatus {
+	semantic := baseCatalogSemanticStatus(profile)
+	directStatusSeen := false
+	directStatusAllReady := true
+	statusReadSucceeded := false
+	for _, sourceKey := range s.semanticDatasourceSourceKeys() {
+		current, err := s.catalog.semanticStatusForBinarySearch(ctx, sourceKey, profile)
+		if err != nil {
+			log.Printf(
+				"timich-agent semantic search unavailable status skipped source_key=%s model=%s vector_space=%s error=%v",
+				sourceKey,
+				profile.ModelID(),
+				profile.VectorSpaceID(),
+				err,
+			)
+			continue
+		}
+		statusReadSucceeded = true
+		status := strings.TrimSpace(current.Status)
+		contributes := current.CompletedVectorCount > 0 ||
+			current.IndexedVectorCount > 0 ||
+			(status != "" && status != "missing")
+		if contributes {
+			directStatusSeen = true
+			if status != semanticBackfillStatusReady {
+				directStatusAllReady = false
+			}
+		}
+		semantic.CompletedVectorCount += current.CompletedVectorCount
+		semantic.IndexedVectorCount += current.IndexedVectorCount
+		if current.BuiltAt != nil && (semantic.BuiltAt == nil || current.BuiltAt.After(*semantic.BuiltAt)) {
+			builtAt := current.BuiltAt.UTC()
+			semantic.BuiltAt = &builtAt
+		}
+	}
+	if !statusReadSucceeded {
+		semantic.Status = "unavailable"
+		return normalizeCatalogSemanticStatus(semantic, profile)
+	}
+	semantic = finalizeCatalogSemanticDirectStatus(semantic, directStatusSeen, directStatusAllReady, profile)
+	return semanticBinaryUnavailableSearchStatus(semantic, profile)
 }
 
 func semanticBackfillStatusLogValue(status *SemanticModelBackfillStatus) string {

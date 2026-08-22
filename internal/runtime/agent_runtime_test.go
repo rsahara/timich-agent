@@ -5371,8 +5371,10 @@ func TestDatasourceTaskStatusesIncludeFailedEmbeddings(t *testing.T) {
 	if byPhase["embeddings"].FailedTasks != 1 || byPhase["embeddings"].Status != "attention" {
 		t.Fatalf("embedding task status = %+v, want failed attention", byPhase["embeddings"])
 	}
-	if note := byPhase["embeddings"].Note; !strings.Contains(note, "Within each datasource, first-attempt work is prioritized ahead of eligible retries, so the failed count may remain unchanged while new embeddings complete.") {
-		t.Fatalf("embedding task note = %q, want datasource-scoped deferred retry guidance", note)
+	if note := byPhase["embeddings"].Note; !strings.Contains(note, "first-attempt work within the same datasource stays ahead of retries") ||
+		!strings.Contains(note, "Failed media remains browsable but is excluded from semantic search") ||
+		!strings.Contains(note, "Automatic retry becomes eligible after 30 minutes") {
+		t.Fatalf("embedding task note = %q, want failure impact and datasource-scoped retry guidance", note)
 	}
 }
 

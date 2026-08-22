@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -71,6 +72,8 @@ func NewMuxWithOptions(runtime *runtimestate.AgentRuntime, options Options) http
 	mux.HandleFunc("/v1/datasources/local/immich-fallback", api.requireAdmin(api.localDatasourceImmichFallback))
 	mux.HandleFunc("/v1/datasources/local/phase0-diagnostics.csv", api.requireAdmin(api.localDatasourcePhase0DiagnosticsCSV))
 	mux.HandleFunc("/v1/datasources/local/failure-diagnostics.csv", api.requireAdmin(api.localDatasourceFailureDiagnosticsCSV))
+	mux.HandleFunc("/v1/datasources/embeddings/failures.csv", api.requireAdmin(api.semanticEmbeddingFailureDiagnosticsCSV))
+	mux.HandleFunc("/v1/datasources/embeddings/retry-failed", api.requireAdmin(api.semanticEmbeddingFailureRetry))
 	mux.HandleFunc("/v1/datasources/local/metadata/repair", api.requireAdmin(api.localDatasourceMetadataRequeue))
 	mux.HandleFunc("/v1/datasources/local/thumbnails/repair", api.requireAdmin(api.localDatasourceThumbnailRepair))
 	mux.HandleFunc("/v1/datasources/local/embeddings/repair", api.requireAdmin(api.localDatasourceEmbeddingRepair))
@@ -600,6 +603,63 @@ func (s *server) localDatasourceFailureDiagnosticsCSV(w http.ResponseWriter, r *
 		}
 	}
 	writer.Flush()
+}
+
+func (s *server) semanticEmbeddingFailureDiagnosticsCSV(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, "Use GET to export embedding failure diagnostics.")
+		return
+	}
+	diagnostics, err := s.runtime.OpenSemanticEmbeddingFailureDiagnostics(r.Context())
+	if err != nil {
+		writeSemanticIndexingError(w, err)
+		return
+	}
+	defer diagnostics.Close()
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="timich-embedding-failures.csv"`)
+	writer := csv.NewWriter(w)
+	if err := writer.Write(catalog.SemanticEmbeddingFailureDiagnosticCSVHeader()); err != nil {
+		return
+	}
+	written := 0
+	for {
+		row, ok, err := diagnostics.Next()
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("timich-agent stream semantic embedding failure diagnostics failed error=%v", err)
+			}
+			return
+		}
+		if !ok {
+			break
+		}
+		if err := writer.Write(row.CSVRecord()); err != nil {
+			return
+		}
+		written++
+		if written%256 == 0 {
+			writer.Flush()
+			if writer.Error() != nil {
+				return
+			}
+		}
+	}
+	writer.Flush()
+}
+
+func (s *server) semanticEmbeddingFailureRetry(w http.ResponseWriter, r *http.Request) {
+	if !requirePost(w, r, "Use POST to retry failed embeddings.") {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	result, err := s.runtime.RetryFailedSemanticEmbeddings(ctx)
+	if err != nil {
+		writeSemanticIndexingError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *server) localDatasourceThumbnailRepair(w http.ResponseWriter, r *http.Request) {

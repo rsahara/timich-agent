@@ -182,7 +182,11 @@ First-run setup in the Admin UI:
 3. Indexed modes only: run media discovery, then install and activate a model
    from Semantic Models. Background vector indexing continues through
    Datasource Tasks. Immich Passthrough uses Immich's existing search index and
-   does not require these local indexing steps.
+   does not require these local indexing steps. If Embeddings reports failed
+   items, download the failure details from that task row before repairing or
+   replacing the source media. Failed items remain browsable but are excluded
+   from semantic search; they become eligible for automatic retry after 30
+   minutes, or you can make them immediately eligible from the same row.
 4. Pair an app device. Use Nearby Link when the app supports it, or create a
    manual pairing code and enter it in the Timich iOS app.
 5. Confirm the app can load the gallery on the trusted LAN.
@@ -592,6 +596,8 @@ Admin API:
 - `POST http://AGENT_LAN_HOST:8081/v1/datasources/local/scan`
 - `GET http://AGENT_LAN_HOST:8081/v1/datasources/local/phase0-diagnostics.csv`
 - `GET http://AGENT_LAN_HOST:8081/v1/datasources/local/failure-diagnostics.csv`
+- `GET http://AGENT_LAN_HOST:8081/v1/datasources/embeddings/failures.csv`
+- `POST http://AGENT_LAN_HOST:8081/v1/datasources/embeddings/retry-failed`
 - `POST http://AGENT_LAN_HOST:8081/v1/datasources/local/metadata/repair`
 - `POST http://AGENT_LAN_HOST:8081/v1/datasources/local/thumbnails/repair`
 - `POST http://AGENT_LAN_HOST:8081/v1/datasources/local/embeddings/repair`

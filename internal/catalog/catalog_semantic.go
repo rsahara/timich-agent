@@ -36,16 +36,20 @@ type catalogSemanticMetadataCandidateRef struct {
 }
 
 func (s *Service) searchCatalogWithoutSemanticProfile(ctx context.Context, normalized normalizedAssetSearch) (AssetSearchPage, error) {
-	semantic := CatalogSemanticStatus{Status: "missing"}
+	return s.searchCatalogWithoutUsableSemanticIndex(ctx, normalized, CatalogSemanticStatus{Status: "missing"}, nil)
+}
+
+func (s *Service) searchCatalogWithoutUsableSemanticIndex(ctx context.Context, normalized normalizedAssetSearch, semantic CatalogSemanticStatus, profile semanticEmbeddingProfile) (AssetSearchPage, error) {
+	semantic = normalizeCatalogSemanticStatus(semantic, profile)
 	if semanticAutoRequested(normalized) {
-		fallback, err := semanticFilenameFallback(normalized, semantic, nil)
+		fallback, err := semanticFilenameFallback(normalized, semantic, profile)
 		if err != nil {
 			return AssetSearchPage{}, err
 		}
 		return s.catalog.SearchCatalogAssets(ctx, fallback)
 	}
 	resolved := normalized.Resolved
-	resolved.Semantic = semanticResolution(semantic, false, nil)
+	resolved.Semantic = semanticResolution(semantic, false, profile)
 	return AssetSearchPage{
 		CollectionKey: normalized.CollectionKey,
 		Page:          normalized.Request.Page,
@@ -84,6 +88,7 @@ func (s *Service) searchCatalogSemanticAssets(ctx context.Context, normalized no
 	semantic = baseCatalogSemanticStatus(profile)
 	directStatusSeen = false
 	directStatusAllReady = true
+	usableIndexSeen := false
 	traversals := make([]catalogSemanticSourceTraversal, 0, len(sourceKeys))
 	defer func() {
 		for _, traversal := range traversals {
@@ -105,6 +110,9 @@ func (s *Service) searchCatalogSemanticAssets(ctx context.Context, normalized no
 			sourceKey: sourceKey,
 			reader:    session.reader,
 		})
+		if session.reader != nil && session.traversal != nil {
+			usableIndexSeen = true
+		}
 		if directIndexStatus {
 			status := strings.TrimSpace(session.Semantic.Status)
 			contributes := session.Semantic.CompletedVectorCount > 0 ||
@@ -124,6 +132,18 @@ func (s *Service) searchCatalogSemanticAssets(ctx context.Context, normalized no
 			}
 		}
 	}
+	if !usableIndexSeen {
+		semantic = finalizeCatalogSemanticDirectStatus(semantic, directStatusSeen, directStatusAllReady, profile)
+		log.Printf(
+			"timich-agent catalog semantic search %s unavailable; using configured fallback model=%s vector_space=%s status=%s elapsed=%s",
+			statusMode,
+			profile.ModelID(),
+			profile.VectorSpaceID(),
+			semantic.Status,
+			time.Since(directStatusStarted).Round(time.Millisecond),
+		)
+		return s.searchCatalogWithoutUsableSemanticIndex(ctx, normalized, semantic, profile)
+	}
 	metadataCandidates := []semanticScoredAsset{}
 	if semanticAutoRequested(normalized) {
 		metadataCandidates, err = s.catalogSemanticMetadataCandidates(ctx, normalized, queryVector, traversals)
@@ -142,17 +162,7 @@ func (s *Service) searchCatalogSemanticAssets(ctx context.Context, normalized no
 		return AssetSearchPage{}, err
 	}
 	candidateSeen := traversalStats.CandidateVisits > 0 || traversalStats.MetadataCandidates > 0
-	switch {
-	case semantic.CompletedVectorCount > 0 && semantic.IndexedVectorCount == 0:
-		semantic.Status = "backfilling"
-	case semantic.IndexedVectorCount == 0:
-		semantic.Status = "missing"
-	case directStatusSeen && directStatusAllReady:
-		semantic.Status = "ready"
-	default:
-		semantic.Status = "backfilling"
-	}
-	semantic = normalizeCatalogSemanticStatus(semantic, profile)
+	semantic = finalizeCatalogSemanticDirectStatus(semantic, directStatusSeen, directStatusAllReady, profile)
 	log.Printf(
 		"timich-agent catalog semantic search %s status completed model=%s vector_space=%s status=%s completed=%d indexed=%d metadata_candidates=%d visits=%d rounds=%d elapsed=%s",
 		statusMode,
@@ -204,6 +214,22 @@ func (s *Service) searchCatalogSemanticAssets(ctx context.Context, normalized no
 		Boundary:      searchBoundary(normalized.Request.Page, len(resolvedPage.Items)),
 		Resolved:      resolved,
 	}, nil
+}
+
+func finalizeCatalogSemanticDirectStatus(semantic CatalogSemanticStatus, directStatusSeen bool, directStatusAllReady bool, profile semanticEmbeddingProfile) CatalogSemanticStatus {
+	switch {
+	case semantic.CompletedVectorCount > 0 && semantic.IndexedVectorCount == 0:
+		semantic.Status = "backfilling"
+	case semantic.IndexedVectorCount == 0 && directStatusSeen:
+		semantic.Status = "backfilling"
+	case semantic.IndexedVectorCount == 0:
+		semantic.Status = "missing"
+	case directStatusSeen && directStatusAllReady:
+		semantic.Status = "ready"
+	default:
+		semantic.Status = "backfilling"
+	}
+	return normalizeCatalogSemanticStatus(semantic, profile)
 }
 
 func (s *Service) resolveCatalogSemanticTraversalPage(

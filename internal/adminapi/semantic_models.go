@@ -398,7 +398,7 @@ func writeSemanticIndexingError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "semantic_candidate_unavailable", "Install a semantic model before starting indexing.")
 	case errors.Is(err, runtimestate.ErrSemanticCandidateRuntimeUnavailable):
 		writeError(w, http.StatusConflict, "semantic_candidate_runtime_unavailable", "The semantic model candidate runtime is not ready to embed.")
-	case errors.Is(err, catalog.ErrCatalogNotConfigured):
+	case errors.Is(err, catalog.ErrCatalogNotConfigured), errors.Is(err, catalog.ErrNoDatasourceConfigured):
 		writeError(w, http.StatusBadRequest, "datasource_not_configured", "No indexed datasource is configured.")
 	case errors.Is(err, catalog.ErrSemanticModelPackInvalid):
 		writeError(w, http.StatusBadRequest, "semantic_model_invalid", "Semantic model pack metadata is invalid.")

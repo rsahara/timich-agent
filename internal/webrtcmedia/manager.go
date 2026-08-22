@@ -32,6 +32,12 @@ const (
 
 type OriginalLoader func(request *http.Request, assetID string) (*catalog.UpstreamMediaResponse, error)
 
+type dataChannel interface {
+	SendText(string) error
+	Send([]byte) error
+	BufferedAmount() uint64
+}
+
 type Manager struct {
 	original OriginalLoader
 
@@ -251,7 +257,7 @@ func (m *Manager) AnswerOffer(ctx context.Context, request OfferRequest) (OfferR
 	}, nil
 }
 
-func (m *Manager) handleMediaRequest(active *session, channel *webrtc.DataChannel, request mediaRequest) {
+func (m *Manager) handleMediaRequest(active *session, channel dataChannel, request mediaRequest) {
 	startedAt := time.Now()
 	requestID := strings.TrimSpace(request.RequestID)
 	if requestID == "" || strings.TrimSpace(request.AssetID) == "" {
@@ -639,7 +645,7 @@ func (s *session) cancelAllMediaRequests(reason string) {
 	log.Printf("webrtc media cancelled active requests session_id=%q count=%d reason=%q", s.id, len(requests), reason)
 }
 
-func (s *session) sendJSON(channel *webrtc.DataChannel, payload any) {
+func (s *session) sendJSON(channel dataChannel, payload any) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return
@@ -649,7 +655,7 @@ func (s *session) sendJSON(channel *webrtc.DataChannel, payload any) {
 	_ = channel.SendText(string(body))
 }
 
-func (s *session) waitForSendBudget(ctx context.Context, channel *webrtc.DataChannel) error {
+func (s *session) waitForSendBudget(ctx context.Context, channel dataChannel) error {
 	for channel.BufferedAmount() > maxDataChannelBufferedAmount {
 		select {
 		case <-ctx.Done():
@@ -660,7 +666,7 @@ func (s *session) waitForSendBudget(ctx context.Context, channel *webrtc.DataCha
 	return nil
 }
 
-func (s *session) sendBinary(ctx context.Context, channel *webrtc.DataChannel, payload []byte) (sendMetrics, error) {
+func (s *session) sendBinary(ctx context.Context, channel dataChannel, payload []byte) (sendMetrics, error) {
 	if err := s.waitForSendBudget(ctx, channel); err != nil {
 		return sendMetrics{}, err
 	}

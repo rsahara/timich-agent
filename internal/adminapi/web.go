@@ -1489,10 +1489,18 @@ const dashboardHTML = `<!doctype html>
         const disabled = options.hasLocalDatasource && failed > 0 && !datasourceTaskActionPendingForPhase(phase) ? '' : ' disabled';
         return '<button type="button" data-datasource-task-action="requeue-thumbnails"' + disabled + '>Requeue failed</button>' + failureLink;
       }
+      if (phase === 'embeddings') {
+        const failed = Number(task.failedTasks || 0);
+        const disabled = failed > 0 && !datasourceTaskActionPendingForPhase(phase) ? '' : ' disabled';
+        return '<button type="button" data-datasource-task-action="retry-embeddings"' + disabled + '>Retry failed now</button>' + failureLink;
+      }
       return failureLink;
     }
 
     function datasourceTaskFailureLinkHTML(task, options) {
+      if (task?.phase === 'embeddings' && Number(task?.failedTasks || 0) > 0) {
+        return '<div class="muted task-action-link"><a href="/v1/datasources/embeddings/failures.csv" target="_blank" rel="noreferrer">Download failure details</a></div>';
+      }
       const hasLocalItemDiagnostics = task?.phase === 'metadata' || task?.phase === 'thumbnails';
       if (!options.hasLocalDatasource || !hasLocalItemDiagnostics || Number(task?.failedTasks || 0) <= 0) return '';
       return '<div class="muted task-action-link"><a href="/v1/datasources/local/failure-diagnostics.csv" target="_blank" rel="noreferrer">Download failures CSV</a></div>';
@@ -1681,7 +1689,7 @@ const dashboardHTML = `<!doctype html>
       content_verification: 'At the configured daily time, re-hashes the least recently verified media with an idle heavy-task worker. If no worker is idle, that day is skipped. The default duration is 30 minutes; a duration of 0 disables this task.',
       metadata: 'Registers media information in the media database. Recently added or changed files remain settling before metadata processing (2 minutes by default). Requeue failed moves failed metadata jobs back to the queue at repair priority. Processing starts after settling when a worker is available, and jobs that fail again return to failed.',
       thumbnails: 'Generates thumbnails so media can be previewed quickly. Requeue failed moves failed thumbnails back to the queue at repair priority. Processing starts when a worker is available, and items that fail again return to failed.',
-      embeddings: 'Analyzes media features for visual search. Within each datasource, first-attempt work is prioritized ahead of eligible retries, so the failed count may remain unchanged while new embeddings complete. Search becomes available after the Search index processes the embeddings.',
+      embeddings: 'Analyzes media features for visual search. Failed media remains browsable but is excluded from semantic search. Automatic retry becomes eligible after 30 minutes; first-attempt work within the same datasource stays ahead of retries. Download failure details to inspect the asset and error, or request an immediate retry after repairing the source media.',
       search_index: 'Updates the search index so media can be searched. Publishing can take several hours for a large library. An existing published index remains searchable while publishing runs. Failed publish jobs are retried automatically on the next eligible run.'
     };
 
@@ -1748,6 +1756,7 @@ const dashboardHTML = `<!doctype html>
       if (action === 'media-discovery') return 'phase0';
       if (action === 'requeue-metadata') return 'metadata';
       if (action === 'requeue-thumbnails') return 'thumbnails';
+      if (action === 'retry-embeddings') return 'embeddings';
       return '';
     }
 
@@ -1755,6 +1764,7 @@ const dashboardHTML = `<!doctype html>
       if (phase === 'phase0') return 'media-discovery';
       if (phase === 'metadata') return 'requeue-metadata';
       if (phase === 'thumbnails') return 'requeue-thumbnails';
+      if (phase === 'embeddings') return 'retry-embeddings';
       return '';
     }
 
@@ -1791,7 +1801,7 @@ const dashboardHTML = `<!doctype html>
       if (!found) {
         nextTasks.push(applyDatasourceTaskPendingOverlay({
           phase,
-          label: phase === 'phase0' ? 'Media discovery' : (phase === 'metadata' ? 'Metadata' : 'Thumbnails'),
+          label: phase === 'phase0' ? 'Media discovery' : (phase === 'metadata' ? 'Metadata' : (phase === 'thumbnails' ? 'Thumbnails' : 'Embeddings')),
           status: 'running',
           activeTasks: phase === 'phase0' ? 1 : 0,
           queuedTasks: 0,
@@ -3092,6 +3102,11 @@ const dashboardHTML = `<!doctype html>
           await loadDatasourceIndexingStatus({ preserveOnError: true, forceRefresh: true });
         } else if (action === 'requeue-metadata') {
           await api('/v1/datasources/local/metadata/repair', { method: 'POST' });
+          await loadDatasourceIndexingStatus({ preserveOnError: true, forceRefresh: true });
+        } else if (action === 'retry-embeddings') {
+          const result = await api('/v1/datasources/embeddings/retry-failed', { method: 'POST' });
+          datasourceIndexingMessage.textContent = 'Retry requested for ' + formatCount(result?.requestedCount || 0) + ' failed embedding item(s).';
+          datasourceIndexingMessage.className = 'status-ok';
           await loadDatasourceIndexingStatus({ preserveOnError: true, forceRefresh: true });
         }
       } catch (error) {

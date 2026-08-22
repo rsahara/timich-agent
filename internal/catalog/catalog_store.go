@@ -183,6 +183,10 @@ func LoadOrCreateCatalogStore(dataDir string) (*CatalogStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.ensureSemanticFailureRetrySchema(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := cleanupSemanticIndexCrashTemps(filepath.Join(root, semanticBinaryIndexDirName)); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -935,6 +939,25 @@ func (s *CatalogStore) ensureCatalogQueryIndexes(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, statement.sql); err != nil {
 			return fmt.Errorf("ensure catalog query index %s: %w", statement.name, err)
 		}
+	}
+	return nil
+}
+
+func (s *CatalogStore) ensureSemanticFailureRetrySchema(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return ErrCatalogNotConfigured
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS semantic_vector_retry_requests (
+		source_key TEXT NOT NULL,
+		upstream_asset_id TEXT NOT NULL,
+		model_id TEXT NOT NULL,
+		requested_at TEXT NOT NULL,
+		PRIMARY KEY(source_key, upstream_asset_id, model_id),
+		FOREIGN KEY(source_key, upstream_asset_id, model_id)
+			REFERENCES semantic_vectors(source_key, upstream_asset_id, model_id)
+			ON DELETE CASCADE
+	)`); err != nil {
+		return fmt.Errorf("ensure semantic vector retry request schema: %w", err)
 	}
 	return nil
 }

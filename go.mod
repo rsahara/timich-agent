@@ -7,9 +7,10 @@ require (
 	github.com/pion/webrtc/v4 v4.2.12
 	github.com/rsahara/timich-agent/packages/contracts v0.0.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+	github.com/tphakala/simd v1.8.0
 	golang.org/x/image v0.39.0
 	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.42.0
+	golang.org/x/sys v0.45.0
 	google.golang.org/grpc v1.80.0
 	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.51.0

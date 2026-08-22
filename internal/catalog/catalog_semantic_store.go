@@ -40,16 +40,17 @@ const (
 )
 
 type semanticAsset struct {
-	SourceKey     string
-	ID            string
-	MediaType     string
-	Filename      string
-	CapturedAt    time.Time
-	Duration      *string
-	Vector        []float32
-	VectorInput   string
-	VectorPayload semanticVectorPayloadRef
-	MaxLevel      int
+	SourceKey                string
+	ID                       string
+	MediaType                string
+	Filename                 string
+	CapturedAt               time.Time
+	Duration                 *string
+	Vector                   []float32
+	VectorInput              string
+	VectorPayload            semanticVectorPayloadRef
+	MaxLevel                 int
+	SelectedRetryRequestedAt string
 }
 
 type semanticScoredAsset struct {
@@ -167,7 +168,7 @@ func scanSemanticAssets(rows *sql.Rows, label string) ([]semanticAsset, error) {
 		var asset semanticAsset
 		var capturedAtText string
 		var duration sql.NullString
-		if err := rows.Scan(&asset.SourceKey, &asset.ID, &asset.MediaType, &asset.Filename, &capturedAtText, &duration); err != nil {
+		if err := rows.Scan(&asset.SourceKey, &asset.ID, &asset.MediaType, &asset.Filename, &capturedAtText, &duration, &asset.SelectedRetryRequestedAt); err != nil {
 			return nil, fmt.Errorf("scan catalog semantic %s asset: %w", label, err)
 		}
 		asset.SourceKey = strings.TrimSpace(asset.SourceKey)
@@ -601,12 +602,17 @@ func (s *CatalogStore) semanticBackfillEligibilityState(ctx context.Context, sou
 				v.vector_space_id,
 				v.embedding_dim,
 				v.status,
-				v.generated_at
+				v.generated_at,
+				r.requested_at AS retry_requested_at
 			FROM catalog_assets a
 			LEFT JOIN semantic_vectors v
 				ON v.source_key = a.source_key
 				AND v.upstream_asset_id = a.upstream_asset_id
 				AND v.model_id = ?
+			LEFT JOIN semantic_vector_retry_requests r
+				ON r.source_key = v.source_key
+				AND r.upstream_asset_id = v.upstream_asset_id
+				AND r.model_id = v.model_id
 			`+where+`
 		)
 		SELECT COALESCE(SUM(CASE WHEN
@@ -614,12 +620,13 @@ func (s *CatalogStore) semanticBackfillEligibilityState(ctx context.Context, sou
 				OR vector_space_id != ?
 				OR embedding_dim != ?
 				OR status NOT IN ('ready', 'failed')
-				OR (status = 'failed' AND (generated_at IS NULL OR generated_at <= ?))
+				OR (status = 'failed' AND (retry_requested_at IS NOT NULL OR generated_at IS NULL OR generated_at <= ?))
 			THEN 1 ELSE 0 END), 0),
 			MIN(CASE WHEN
 				vector_space_id = ?
 				AND embedding_dim = ?
 				AND status = 'failed'
+				AND retry_requested_at IS NULL
 				AND generated_at > ?
 			THEN generated_at END)
 		FROM candidates`, args...).Scan(&eligibleNow, &firstDeferredFailure)
@@ -983,9 +990,9 @@ func (s *CatalogStore) SemanticIndexPublishNeeded(ctx context.Context, sourceKey
 func (s *CatalogStore) semanticIndexPublishNeeded(ctx context.Context, sourceKey string, profile semanticEmbeddingProfile, status SemanticModelBackfillStatus, allowPartial bool) bool {
 	if status.AssetGeneration != status.IndexedGeneration {
 		if status.CompletedVectorCount == 0 {
-			return status.EligibleAssetCount == 0
+			return semanticVectorBackfillSettled(status)
 		}
-		return allowPartial || status.CompletedVectorCount >= status.EligibleAssetCount
+		return allowPartial || semanticVectorBackfillSettled(status)
 	}
 	if status.IndexedVectorCount >= status.CompletedVectorCount {
 		return !s.semanticBinaryIndexMatchesBackfillStatus(ctx, sourceKey, profile, status)
@@ -993,7 +1000,18 @@ func (s *CatalogStore) semanticIndexPublishNeeded(ctx context.Context, sourceKey
 	if allowPartial {
 		return true
 	}
-	return status.CompletedVectorCount >= status.EligibleAssetCount
+	return semanticVectorBackfillSettled(status)
+}
+
+// semanticVectorBackfillSettled reports whether every eligible asset has
+// either a ready vector or a persisted asset-specific failure. Failed rows stay
+// retryable, but they must not hold ready vectors outside the active index.
+func semanticVectorBackfillSettled(status SemanticModelBackfillStatus) bool {
+	if status.CompletedVectorCount >= status.EligibleAssetCount {
+		return true
+	}
+	remaining := status.EligibleAssetCount - max(status.CompletedVectorCount, 0)
+	return status.FailedVectorCount >= remaining
 }
 
 func semanticIndexPublishNeededWorkCount(status SemanticModelBackfillStatus) int {
@@ -1467,13 +1485,14 @@ func (s *CatalogStore) publishSemanticBackfillIndex(ctx context.Context, job *se
 	}
 	binaryElapsed := time.Since(binaryStarted)
 	metrics := builder.metrics()
-	log.Printf("timich-agent semantic hnsw build completed source_key=%s model=%s generation=%d nodes=%d resume_ordinal=%d ef_construction=%d synchronous=NORMAL build_elapsed=%s binary_elapsed=%s vector_cache_limit_bytes=%d vector_cache_peak_bytes=%d vector_cache_hits=%d vector_cache_misses=%d vector_prefetch_queries=%d vector_prefetched=%d",
+	log.Printf("timich-agent semantic hnsw build completed source_key=%s model=%s generation=%d nodes=%d resume_ordinal=%d ef_construction=%d dot_backend=%q synchronous=NORMAL build_elapsed=%s binary_elapsed=%s vector_cache_limit_bytes=%d vector_cache_peak_bytes=%d vector_cache_hits=%d vector_cache_misses=%d vector_prefetch_queries=%d vector_prefetched=%d",
 		job.SourceKey,
 		profile.ModelID(),
 		job.AssetGeneration,
 		nodeCount,
 		resumeOrdinal,
 		semanticHNSWEfConstruction,
+		semanticDotBackend(profile.EmbeddingDim()),
 		buildElapsed.Round(time.Millisecond),
 		binaryElapsed.Round(time.Millisecond),
 		semanticIndexBuilderVectorCacheMaxBytes,
@@ -1535,19 +1554,28 @@ func (s *CatalogStore) loadSemanticBackfillAssets(ctx context.Context, sourceKey
 	retryBefore := formatCatalogTime(time.Now().UTC().Add(-semanticBackfillFailureRetryInterval))
 	queryArgs = append(queryArgs, profile.VectorSpaceID(), profile.EmbeddingDim(), retryBefore, limit)
 	db := s.queryDB()
-	rows, err := db.QueryContext(ctx, `SELECT a.source_key, a.upstream_asset_id, a.media_type, a.filename, a.captured_at, a.duration
+	rows, err := db.QueryContext(ctx, `SELECT a.source_key, a.upstream_asset_id, a.media_type, a.filename, a.captured_at, a.duration,
+			COALESCE(retry.requested_at, '')
 		FROM catalog_assets a
 		LEFT JOIN semantic_vectors v
 			ON v.source_key = a.source_key
 			AND v.upstream_asset_id = a.upstream_asset_id
 			AND v.model_id = ?
+		LEFT JOIN semantic_vector_retry_requests retry
+			ON retry.source_key = v.source_key
+			AND retry.upstream_asset_id = v.upstream_asset_id
+			AND retry.model_id = v.model_id
 		`+where+`
 			AND (
 				v.upstream_asset_id IS NULL
 				OR v.vector_space_id != ?
 				OR v.embedding_dim != ?
 				OR v.status NOT IN ('ready', 'failed')
-				OR (v.status = 'failed' AND (v.generated_at IS NULL OR v.generated_at <= ?))
+				OR (v.status = 'failed' AND (
+					v.generated_at IS NULL
+					OR v.generated_at <= ?
+					OR retry.requested_at IS NOT NULL
+				))
 			)
 		ORDER BY CASE WHEN v.status = 'failed' THEN 1 ELSE 0 END ASC,
 			a.captured_at DESC, a.source_key ASC, a.upstream_asset_id ASC
@@ -1610,6 +1638,11 @@ func (s *CatalogStore) upsertSemanticVectors(ctx context.Context, sourceKey stri
 			_ = tx.Rollback()
 			return fmt.Errorf("upsert catalog semantic vector %q: %w", asset.ID, err)
 		}
+		if err := clearSemanticEmbeddingRetryRequestInTx(ctx, tx, sourceKey, asset.ID, profile.ModelID()); err != nil {
+			_ = statement.Close()
+			_ = tx.Rollback()
+			return err
+		}
 	}
 	if err := statement.Close(); err != nil {
 		_ = tx.Rollback()
@@ -1632,7 +1665,28 @@ func (s *CatalogStore) upsertSemanticVectorFailures(ctx context.Context, sourceK
 	if err != nil {
 		return fmt.Errorf("begin catalog semantic vector failure upsert: %w", err)
 	}
-	statement, err := tx.PrepareContext(ctx, `INSERT INTO semantic_vectors (
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO semantic_generation_suppression(source_key)
+		VALUES (?) ON CONFLICT(source_key) DO NOTHING`, sourceKey); err != nil {
+		return fmt.Errorf("suppress semantic generation for failure retries: %w", err)
+	}
+	retryStatement, err := tx.PrepareContext(ctx, `UPDATE semantic_vectors
+		SET last_error = ?, generated_at = ?
+		WHERE source_key = ?
+			AND upstream_asset_id = ?
+			AND model_id = ?
+			AND vector_space_id = ?
+			AND embedding_dim = ?
+			AND payload_batch_id IS NULL
+			AND vector_offset = 0
+			AND vector_length = 0
+			AND embedding_input = ?
+			AND status = 'failed'`)
+	if err != nil {
+		return fmt.Errorf("prepare catalog semantic vector failure retry: %w", err)
+	}
+	defer retryStatement.Close()
+	failureStatement, err := tx.PrepareContext(ctx, `INSERT INTO semantic_vectors (
 			source_key, upstream_asset_id, model_id, vector_space_id, embedding_dim,
 			payload_batch_id, vector_offset, vector_length, embedding_input, status, last_error, generated_at
 		) VALUES (?, ?, ?, ?, ?, NULL, 0, 0, ?, 'failed', ?, ?)
@@ -1647,29 +1701,59 @@ func (s *CatalogStore) upsertSemanticVectorFailures(ctx context.Context, sourceK
 			last_error = excluded.last_error,
 			generated_at = excluded.generated_at`)
 	if err != nil {
-		_ = tx.Rollback()
 		return fmt.Errorf("prepare catalog semantic vector failure upsert: %w", err)
 	}
+	defer failureStatement.Close()
 	nowText := formatCatalogTime(now)
+	generationChanged := false
 	for _, failure := range failures {
 		message := strings.TrimSpace(failure.Err.Error())
 		if len(message) > 2048 {
 			message = message[:2048]
 		}
+		retryResult, retryErr := retryStatement.ExecContext(ctx,
+			message, nowText, sourceKey, failure.Asset.ID, profile.ModelID(),
+			profile.VectorSpaceID(), profile.EmbeddingDim(), profile.InputKind(),
+		)
+		if retryErr != nil {
+			return fmt.Errorf("update catalog semantic vector failure retry %q: %w", failure.Asset.ID, retryErr)
+		}
+		retried, retryErr := retryResult.RowsAffected()
+		if retryErr != nil {
+			return fmt.Errorf("count catalog semantic vector failure retry %q: %w", failure.Asset.ID, retryErr)
+		}
+		if retried > 0 {
+			if err := consumeSelectedSemanticEmbeddingRetryRequestInTx(ctx, tx, sourceKey, failure.Asset.ID, profile.ModelID(), failure.Asset.SelectedRetryRequestedAt); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := queueSemanticVectorPayloadGCInTx(ctx, tx, sourceKey, failure.Asset.ID, profile.ModelID(), ""); err != nil {
-			_ = statement.Close()
-			_ = tx.Rollback()
 			return err
 		}
-		if _, err = statement.ExecContext(ctx, sourceKey, failure.Asset.ID, profile.ModelID(), profile.VectorSpaceID(), profile.EmbeddingDim(), profile.InputKind(), message, nowText); err != nil {
-			_ = statement.Close()
-			_ = tx.Rollback()
+		if _, err = failureStatement.ExecContext(ctx, sourceKey, failure.Asset.ID, profile.ModelID(), profile.VectorSpaceID(), profile.EmbeddingDim(), profile.InputKind(), message, nowText); err != nil {
 			return fmt.Errorf("upsert catalog semantic vector failure %q: %w", failure.Asset.ID, err)
 		}
+		if err := consumeSelectedSemanticEmbeddingRetryRequestInTx(ctx, tx, sourceKey, failure.Asset.ID, profile.ModelID(), failure.Asset.SelectedRetryRequestedAt); err != nil {
+			return err
+		}
+		generationChanged = true
 	}
-	if err := statement.Close(); err != nil {
-		_ = tx.Rollback()
+	if err := retryStatement.Close(); err != nil {
+		return fmt.Errorf("close catalog semantic vector failure retry: %w", err)
+	}
+	if err := failureStatement.Close(); err != nil {
 		return fmt.Errorf("close catalog semantic vector failure upsert: %w", err)
+	}
+	if generationChanged {
+		if _, err = tx.ExecContext(ctx, `UPDATE semantic_state
+			SET asset_generation = asset_generation + 1
+			WHERE source_key = ? AND model_id = ?`, sourceKey, profile.ModelID()); err != nil {
+			return fmt.Errorf("advance semantic generation for vector failures: %w", err)
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM semantic_generation_suppression WHERE source_key = ?`, sourceKey); err != nil {
+		return fmt.Errorf("restore semantic generation after failure retries: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit catalog semantic vector failure upsert: %w", err)
@@ -1938,15 +2022,6 @@ func (h *semanticMaxHeap) Pop() any {
 	item := old[len(old)-1]
 	*h = old[:len(old)-1]
 	return item
-}
-
-func semanticDot(left []float32, right []float32) float32 {
-	limit := min(len(left), len(right))
-	var sum float32
-	for index := 0; index < limit; index++ {
-		sum += left[index] * right[index]
-	}
-	return sum
 }
 
 func encodeSemanticVector(vector []float32) []byte {

@@ -860,6 +860,33 @@ func (s *CatalogStore) openSemanticBinaryIndexFile(ctx context.Context, sourceKe
 	return reader, status, nil
 }
 
+func (s *CatalogStore) hasPublishedSemanticBinaryIndex(ctx context.Context, sourceKey string, profile semanticEmbeddingProfile) (bool, error) {
+	if s == nil || strings.TrimSpace(s.path) == "" || profile == nil {
+		return false, ErrCatalogNotConfigured
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	manifest, err := readSemanticBinaryActiveManifest(s.semanticBinaryActiveManifestPath(sourceKey, profile))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read semantic binary active manifest: %w", err)
+	}
+	if err := validateSemanticBinaryIndexHeaderIdentity(manifest.Header, sourceKey, profile); err != nil {
+		return false, err
+	}
+	if manifest.Header.IndexedVectorCount <= 0 {
+		return false, nil
+	}
+	path := s.semanticBinaryIndexPath(sourceKey, profile, manifest.Header.AssetGeneration)
+	if err := s.verifySemanticBinaryActiveFile(ctx, path, manifest, false); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *CatalogStore) openSemanticBinaryIndexFileForGeneration(ctx context.Context, sourceKey string, profile semanticEmbeddingProfile, assetGeneration int64) (*semanticBinaryIndexReader, error) {
 	if s == nil || strings.TrimSpace(s.path) == "" {
 		return nil, ErrCatalogNotConfigured
