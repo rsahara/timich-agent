@@ -581,9 +581,10 @@ func TestDashboardSeparatesDatasourceTaskFailureUnits(t *testing.T) {
 
 	failureLink := dashboardSnippet(t, "function datasourceTaskFailureLinkHTML", "function datasourceTaskStatusClass")
 	if !strings.Contains(failureLink, "task?.phase === 'metadata' || task?.phase === 'thumbnails'") ||
-		strings.Contains(failureLink, "search_index") ||
-		strings.Contains(failureLink, "embeddings") {
-		t.Fatalf("local failure CSV link is not limited to local item-only task phases:\n%s", failureLink)
+		!strings.Contains(failureLink, "task?.phase === 'embeddings'") ||
+		!strings.Contains(failureLink, "/v1/datasources/embeddings/failures.csv") ||
+		strings.Contains(failureLink, "search_index") {
+		t.Fatalf("failure CSV links are not scoped to their supported task phases:\n%s", failureLink)
 	}
 
 	taskNotes := dashboardSnippet(t, "const datasourceTaskNotes", "function datasourceTaskNote")
@@ -591,6 +592,10 @@ func TestDashboardSeparatesDatasourceTaskFailureUnits(t *testing.T) {
 		!strings.Contains(taskNotes, "An existing published index remains searchable while publishing runs.") ||
 		!strings.Contains(taskNotes, "Failed publish jobs are retried automatically on the next eligible run.") {
 		t.Fatalf("search index task note does not explain automatic publish retry:\n%s", taskNotes)
+	}
+	if !strings.Contains(taskNotes, "Failed media remains browsable but is excluded from semantic search.") ||
+		!strings.Contains(taskNotes, "Automatic retry becomes eligible after 30 minutes") {
+		t.Fatalf("embedding task note does not explain failure impact and retry timing:\n%s", taskNotes)
 	}
 }
 
@@ -725,6 +730,8 @@ func TestAdminRoutesRequireAuthentication(t *testing.T) {
 		{method: http.MethodPost, path: "/v1/datasources/local/root/accept"},
 		{method: http.MethodGet, path: "/v1/datasources/local/phase0-diagnostics.csv"},
 		{method: http.MethodGet, path: "/v1/datasources/local/failure-diagnostics.csv"},
+		{method: http.MethodGet, path: "/v1/datasources/embeddings/failures.csv"},
+		{method: http.MethodPost, path: "/v1/datasources/embeddings/retry-failed"},
 		{method: http.MethodPost, path: "/v1/datasources/local/metadata/repair"},
 		{method: http.MethodPost, path: "/v1/datasources/local/thumbnails/repair"},
 		{method: http.MethodPost, path: "/v1/datasources/local/embeddings/repair"},

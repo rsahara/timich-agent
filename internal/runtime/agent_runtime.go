@@ -212,6 +212,10 @@ type LocalDatasourceMetadataRequeueResponse = catalog.LocalMetadataRequeueResult
 // LocalDatasourceEmbeddingRepairResponse reports an explicit local embedding repair kick.
 type LocalDatasourceEmbeddingRepairResponse = catalog.SemanticBackfillResult
 
+// SemanticEmbeddingFailureRetryResponse reports failed current-profile
+// embeddings made eligible for the next background-worker assignment.
+type SemanticEmbeddingFailureRetryResponse = catalog.SemanticEmbeddingFailureRetryResult
+
 // DeviceUploadPolicy exposes one paired device upload policy.
 type DeviceUploadPolicy struct {
 	Enabled       bool       `json:"enabled"`
@@ -1244,6 +1248,35 @@ func (a *AgentRuntime) LocalFailureDiagnosticRows(ctx context.Context, sourceKey
 		return nil, catalog.ErrNoDatasourceConfigured
 	}
 	return catalogService.LocalFailureDiagnosticRows(ctx, sourceKey)
+}
+
+func (a *AgentRuntime) OpenSemanticEmbeddingFailureDiagnostics(ctx context.Context) (*catalog.SemanticEmbeddingFailureDiagnostics, error) {
+	catalogService := a.catalogService()
+	if catalogService == nil {
+		return nil, catalog.ErrNoDatasourceConfigured
+	}
+	profile := a.semanticEmbeddingCoverageProfile(ctx, catalogService)
+	if profile == nil {
+		return nil, ErrSemanticCandidateUnavailable
+	}
+	return catalogService.OpenSemanticEmbeddingFailureDiagnostics(ctx, *profile, nil)
+}
+
+func (a *AgentRuntime) RetryFailedSemanticEmbeddings(ctx context.Context) (SemanticEmbeddingFailureRetryResponse, error) {
+	catalogService := a.catalogService()
+	if catalogService == nil {
+		return SemanticEmbeddingFailureRetryResponse{}, catalog.ErrNoDatasourceConfigured
+	}
+	profile := a.semanticEmbeddingCoverageProfile(ctx, catalogService)
+	if profile == nil {
+		return SemanticEmbeddingFailureRetryResponse{}, ErrSemanticCandidateUnavailable
+	}
+	result, err := catalogService.RequestSemanticEmbeddingFailureRetry(ctx, *profile, nil, time.Now().UTC())
+	if err == nil && result.RequestedCount > 0 {
+		a.schedulerWorkStateMarkDirty()
+		a.wakeBackgroundWorkerScheduler()
+	}
+	return result, err
 }
 
 func (a *AgentRuntime) RunLocalDatasourcePhase0Scan(ctx context.Context, sourceKey string) (LocalDatasourcePhase0ScanResponse, error) {

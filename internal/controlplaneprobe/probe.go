@@ -20,7 +20,13 @@ type ProbeInput struct {
 	TLS        TLSConfig
 }
 
+type dialContextFunc func(context.Context, string, ...grpc.DialOption) (*grpc.ClientConn, error)
+
 func Probe(ctx context.Context, input ProbeInput) (string, error) {
+	return probe(ctx, input, grpc.DialContext)
+}
+
+func probe(ctx context.Context, input ProbeInput, dialContext dialContextFunc) (string, error) {
 	tokenSigner := controlplanetransport.NewTokenSigner(input.AgentID, input.KeyID, input.PrivateKey, controlplanetransport.DefaultTokenTTL)
 
 	target, dialOption, err := controlplanetransport.DialOptionForTarget(strings.TrimSpace(input.Target), input.TLS, tokenSigner != nil)
@@ -40,7 +46,7 @@ func Probe(ctx context.Context, input ProbeInput) (string, error) {
 		dialOptions = append(dialOptions, grpc.WithPerRPCCredentials(tokenSigner))
 	}
 
-	conn, err := grpc.DialContext(ctx, target, dialOptions...)
+	conn, err := dialContext(ctx, target, dialOptions...)
 	if err != nil {
 		return "", err
 	}

@@ -284,6 +284,24 @@ paths:
       responses:
         "200":
           $ref: "#/components/responses/AdminCSVResponse"
+  /v1/datasources/embeddings/failures.csv:
+    get:
+      operationId: exportSemanticEmbeddingFailureDiagnostics
+      summary: Export current-profile embedding failure details for all indexed datasources as CSV.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminCSVResponse"
+  /v1/datasources/embeddings/retry-failed:
+    post:
+      operationId: retryFailedSemanticEmbeddings
+      summary: Make current-profile failed embeddings eligible for the next background-worker assignment.
+      security:
+        - AdminBearerAuth: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminJSONResponse"
   /v1/datasources/local/metadata/repair:
     post:
       operationId: repairLocalDatasourceMetadata

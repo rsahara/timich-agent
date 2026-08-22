@@ -347,7 +347,7 @@ func TestSemanticBinaryReaderRejectsImpossibleNodeCountBeforeAllocation(t *testi
 	}
 }
 
-func TestSemanticIndexPublishNeededWaitsForGenerationVectorCoverage(t *testing.T) {
+func TestSemanticIndexPublishNeededWaitsForGenerationSettlement(t *testing.T) {
 	t.Parallel()
 
 	store := &CatalogStore{}
@@ -356,12 +356,16 @@ func TestSemanticIndexPublishNeededWaitsForGenerationVectorCoverage(t *testing.T
 		name         string
 		eligible     int
 		completed    int
+		failed       int
 		allowPartial bool
 		want         bool
 	}{
 		{name: "empty snapshot clears", want: true},
 		{name: "eligible assets without vectors wait", eligible: 1, want: false},
 		{name: "incomplete vectors wait", eligible: 2, completed: 1, want: false},
+		{name: "ready and failed assets publish", eligible: 2, completed: 1, failed: 1, want: true},
+		{name: "failed assets with pending work wait", eligible: 3, completed: 1, failed: 1, want: false},
+		{name: "all failed replacement clears stale generation", eligible: 2, failed: 2, want: true},
 		{name: "explicit partial publish", eligible: 2, completed: 1, allowPartial: true, want: true},
 		{name: "complete replacement publishes", eligible: 2, completed: 2, want: true},
 	}
@@ -370,6 +374,7 @@ func TestSemanticIndexPublishNeededWaitsForGenerationVectorCoverage(t *testing.T
 			status := SemanticModelBackfillStatus{
 				EligibleAssetCount:   test.eligible,
 				CompletedVectorCount: test.completed,
+				FailedVectorCount:    test.failed,
 				AssetGeneration:      1,
 				IndexedGeneration:    0,
 			}

@@ -23,7 +23,7 @@ const (
 	semanticIndexBuilderVectorCacheMaxBytes = 64 << 20
 	semanticIndexBuilderPrefetchSize        = 128
 	semanticIndexBuilderTransactionSize     = 128
-	semanticIndexBuilderFormatVersion       = "3"
+	semanticIndexBuilderFormatVersion       = "4"
 )
 
 type semanticIndexBuilderQueryer interface {
@@ -318,6 +318,7 @@ func (b *semanticIndexBuilder) identityMatches(ctx context.Context) (bool, error
 	return values["source_key"] == b.sourceKey &&
 		values["builder_version"] == semanticIndexBuilderFormatVersion &&
 		values["ef_construction"] == strconv.Itoa(semanticHNSWEfConstruction) &&
+		values["scoring_fingerprint"] == semanticDotScoringFingerprint(b.profile.EmbeddingDim()) &&
 		values["model_id"] == b.profile.ModelID() &&
 		values["vector_space_id"] == b.profile.VectorSpaceID() &&
 		values["embedding_dim"] == strconv.Itoa(b.profile.EmbeddingDim()) &&
@@ -404,19 +405,20 @@ func (b *semanticIndexBuilder) populate(ctx context.Context) error {
 		return err
 	}
 	meta := map[string]string{
-		"builder_version":    semanticIndexBuilderFormatVersion,
-		"ef_construction":    strconv.Itoa(semanticHNSWEfConstruction),
-		"source_key":         b.sourceKey,
-		"model_id":           b.profile.ModelID(),
-		"vector_space_id":    b.profile.VectorSpaceID(),
-		"embedding_dim":      strconv.Itoa(b.profile.EmbeddingDim()),
-		"asset_generation":   strconv.FormatInt(b.assetGeneration, 10),
-		"node_count":         strconv.Itoa(ordinal),
-		"next_ordinal":       "0",
-		"chain_next_ordinal": "0",
-		"entry_ordinal":      "-1",
-		"entry_level":        "-1",
-		"phase":              "building",
+		"builder_version":     semanticIndexBuilderFormatVersion,
+		"ef_construction":     strconv.Itoa(semanticHNSWEfConstruction),
+		"scoring_fingerprint": semanticDotScoringFingerprint(b.profile.EmbeddingDim()),
+		"source_key":          b.sourceKey,
+		"model_id":            b.profile.ModelID(),
+		"vector_space_id":     b.profile.VectorSpaceID(),
+		"embedding_dim":       strconv.Itoa(b.profile.EmbeddingDim()),
+		"asset_generation":    strconv.FormatInt(b.assetGeneration, 10),
+		"node_count":          strconv.Itoa(ordinal),
+		"next_ordinal":        "0",
+		"chain_next_ordinal":  "0",
+		"entry_ordinal":       "-1",
+		"entry_level":         "-1",
+		"phase":               "building",
 	}
 	for key, value := range meta {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO build_meta(key, value) VALUES (?, ?)

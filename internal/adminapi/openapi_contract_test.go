@@ -50,6 +50,8 @@ func TestAgentAdminOpenAPICoversJSONRoutes(t *testing.T) {
 		"/v1/datasources/local/immich-fallback":         {"put"},
 		"/v1/datasources/local/phase0-diagnostics.csv":  {"get"},
 		"/v1/datasources/local/failure-diagnostics.csv": {"get"},
+		"/v1/datasources/embeddings/failures.csv":       {"get"},
+		"/v1/datasources/embeddings/retry-failed":       {"post"},
 		"/v1/datasources/local/metadata/repair":         {"post"},
 		"/v1/datasources/local/thumbnails/repair":       {"post"},
 		"/v1/datasources/local/embeddings/repair":       {"post"},

@@ -1,10 +1,13 @@
 package catalog
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2355,6 +2358,454 @@ func newCatalogSemanticSearchBinaryFixture(
 	return service
 }
 
+func installSemanticRuntimeStatusTestModel(t *testing.T, dataDir string) (*SemanticModelPackStore, SemanticModelPackStatus) {
+	t.Helper()
+
+	helperPath := writeEmbeddingRuntimeHelperForStatusTest(t)
+	modelStore, err := LoadOrCreateSemanticModelPackStoreWithOptions(dataDir, SemanticModelPackStoreOptions{
+		RuntimeHelperPath: helperPath,
+	})
+	if err != nil {
+		t.Fatalf("LoadOrCreateSemanticModelPackStoreWithOptions() error = %v", err)
+	}
+	artifact := semanticRuntimeStatusTestZipArtifact(t)
+	pack := semanticRuntimeStatusTestPack()
+	pack.EmbeddingDim = 4
+	sum := sha256.Sum256(artifact)
+	pack.Artifact.SHA256 = hex.EncodeToString(sum[:])
+	pack.Artifact.SizeBytes = int64(len(artifact))
+	install, err := modelStore.InstallPack(context.Background(), pack, bytes.NewReader(artifact))
+	if err != nil {
+		t.Fatalf("InstallPack() error = %v", err)
+	}
+	if err := modelStore.FinalizePackInstall(pack.ID, pack.VectorSpaceID, install.InstallID); err != nil {
+		t.Fatalf("FinalizePackInstall() error = %v", err)
+	}
+	return modelStore, pack
+}
+
+func semanticRuntimeStatusTestZipArtifactForIdentity(t *testing.T, modelID string, vectorSpaceID string) []byte {
+	t.Helper()
+
+	var buffer bytes.Buffer
+	writer := zip.NewWriter(&buffer)
+	writeEntry := func(name string, payload []byte) {
+		t.Helper()
+		entry, err := writer.Create(name)
+		if err != nil {
+			t.Fatalf("Create(%q) error = %v", name, err)
+		}
+		if _, err := entry.Write(payload); err != nil {
+			t.Fatalf("Write(%q) error = %v", name, err)
+		}
+	}
+	layout, err := json.Marshal(map[string]any{
+		"schemaVersion": 1,
+		"product":       "timich-semantic-model-pack",
+		"modelId":       modelID,
+		"vectorSpaceId": vectorSpaceID,
+		"embeddingDim":  4,
+		"inputKind":     semanticInputKindImage,
+		"runtime":       semanticRuntimeLoaderONNXRuntime,
+		"imageModel":    "models/image.onnx",
+		"textModel":     "models/text.onnx",
+		"tokenizer":     "tokenizer/tokenizer.json",
+	})
+	if err != nil {
+		t.Fatalf("Marshal(runtime layout) error = %v", err)
+	}
+	writeEntry("timich-model.json", layout)
+	writeEntry("models/image.onnx", []byte("image model"))
+	writeEntry("models/text.onnx", []byte("text model"))
+	writeEntry("tokenizer/tokenizer.json", []byte(`{"model":"test"}`))
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	return buffer.Bytes()
+}
+
+func TestSemanticSearchCandidateProfileUsesPublishedManifestWithoutCoverageAggregation(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	modelStore, pack := installSemanticRuntimeStatusTestModel(t, dataDir)
+
+	const sourceKey = "1111111111111111"
+	service, err := NewServiceWithOptions([]config.DatasourceConfig{{
+		SourceKey:   sourceKey,
+		Name:        "Home Immich",
+		Kind:        config.DatasourceKindImmichIndexed,
+		URL:         "http://immich.test",
+		AccessToken: "test-key",
+	}}, ServiceOptions{DataDir: dataDir, SemanticModels: modelStore})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	defer service.Close()
+
+	profile, ok := modelStore.CandidateEmbeddingProfile(pack.ID, pack.VectorSpaceID)
+	if !ok {
+		t.Fatal("CandidateEmbeddingProfile() ok = false")
+	}
+	if selected := service.semanticSearchCandidateProfile(ctx, AssetSearchOptions{}); selected == nil {
+		t.Fatal("semanticSearchCandidateProfile() before first publish = nil, want runtime profile")
+	}
+	selection := service.semanticSearchProfileSelection(ctx, AssetSearchOptions{})
+	if selection.profile == nil || selection.published {
+		t.Fatalf("semanticSearchProfileSelection() before first publish = %#v, want identified unpublished profile", selection)
+	}
+	builtAt := time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC)
+	seedAndWriteSemanticBinaryIndexForTest(t, service.catalog, ctx, sourceKey, profile, []semanticAsset{{
+		SourceKey:  sourceKey,
+		ID:         "asset-beach",
+		MediaType:  "image",
+		Filename:   "Summer Beach.jpg",
+		CapturedAt: builtAt,
+		Vector:     []float32{0, 1, 0, 0},
+	}}, builtAt, 0)
+	if _, err := service.catalog.db.ExecContext(ctx, `DROP TABLE semantic_vectors`); err != nil {
+		t.Fatalf("drop semantic_vectors to make coverage aggregation unavailable: %v", err)
+	}
+	candidate, ok := modelStore.InstalledCandidateProfile()
+	if !ok {
+		t.Fatal("InstalledCandidateProfile() ok = false")
+	}
+	if _, err := service.SemanticModelBackfillStatus(ctx, candidate); err == nil {
+		t.Fatal("SemanticModelBackfillStatus() error = nil after dropping semantic_vectors")
+	}
+	selection = service.semanticSearchProfileSelection(ctx, AssetSearchOptions{})
+	if selection.profile == nil || !selection.published || selection.profile.ModelID() != pack.ID || selection.profile.VectorSpaceID() != pack.VectorSpaceID {
+		t.Fatalf("semanticSearchProfileSelection() = %#v, want published candidate despite unavailable coverage aggregation", selection)
+	}
+	if _, err := modelStore.ActivatePack(pack.ID, pack.VectorSpaceID); err != nil {
+		t.Fatalf("ActivatePack() error = %v", err)
+	}
+	selected := service.semanticSearchActiveProfile(ctx)
+	if selected == nil || selected.ModelID() != pack.ID || selected.VectorSpaceID() != pack.VectorSpaceID {
+		t.Fatalf("semanticSearchActiveProfile() = %#v, want published active profile despite unavailable coverage aggregation", selected)
+	}
+}
+
+func TestSearchAssetsSkipsCandidateRuntimeInspectionForPublishedActiveIndex(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	markerPath := filepath.Join(t.TempDir(), "candidate-inspected")
+	helperPath := filepath.Join(t.TempDir(), "timich-semantic-helper")
+	const activeModelID = "active-search-model"
+	const activeVectorSpaceID = "active-search-model/v1/d4"
+	const candidateModelID = "candidate-search-model"
+	const candidateVectorSpaceID = "candidate-search-model/v1/d4"
+	helperScript := `#!/bin/sh
+case "$1" in
+  inspect)
+    runtime_layout="$3"
+    if grep -q '"modelId":"` + candidateModelID + `"' "$runtime_layout/timich-model.json"; then
+      : > ` + shellQuoteForTest(markerPath) + `
+    fi
+    printf '%s\n' '{"protocolVersion":1,"runtime":"onnxruntime","modelId":"` + activeModelID + `","vectorSpaceId":"` + activeVectorSpaceID + `","embeddingDim":4,"inputKind":"image","loaded":true,"canEmbed":true}'
+    ;;
+  embed-text)
+    printf '%s\n' '{"protocolVersion":1,"runtime":"onnxruntime","modelId":"` + activeModelID + `","vectorSpaceId":"` + activeVectorSpaceID + `","embeddingDim":4,"inputKind":"image","vector":[0,1,0,0],"input":"text-helper"}'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+`
+	if err := os.WriteFile(helperPath, []byte(helperScript), 0o700); err != nil {
+		t.Fatalf("WriteFile(runtime helper) error = %v", err)
+	}
+	modelStore, err := LoadOrCreateSemanticModelPackStoreWithOptions(dataDir, SemanticModelPackStoreOptions{
+		RuntimeHelperPath: helperPath,
+	})
+	if err != nil {
+		t.Fatalf("LoadOrCreateSemanticModelPackStoreWithOptions() error = %v", err)
+	}
+	install := func(modelID string, vectorSpaceID string, role string) SemanticModelPackStatus {
+		t.Helper()
+		artifact := semanticRuntimeStatusTestZipArtifactForIdentity(t, modelID, vectorSpaceID)
+		sum := sha256.Sum256(artifact)
+		pack := semanticRuntimeStatusTestPack()
+		pack.ID = modelID
+		pack.VectorSpaceID = vectorSpaceID
+		pack.EmbeddingDim = 4
+		pack.Artifact.Filename = modelID + ".zip"
+		pack.Artifact.SHA256 = hex.EncodeToString(sum[:])
+		pack.Artifact.SizeBytes = int64(len(artifact))
+		result, err := modelStore.InstallPack(ctx, pack, bytes.NewReader(artifact))
+		if err != nil {
+			t.Fatalf("InstallPack(%s) error = %v", role, err)
+		}
+		if err := modelStore.FinalizePackInstall(pack.ID, pack.VectorSpaceID, result.InstallID); err != nil {
+			t.Fatalf("FinalizePackInstall(%s) error = %v", role, err)
+		}
+		return pack
+	}
+	activePack := install(activeModelID, activeVectorSpaceID, "active")
+	if _, err := modelStore.ActivatePack(activePack.ID, activePack.VectorSpaceID); err != nil {
+		t.Fatalf("ActivatePack() error = %v", err)
+	}
+	install(candidateModelID, candidateVectorSpaceID, "candidate")
+
+	const sourceKey = "1111111111111111"
+	service, err := NewServiceWithOptions([]config.DatasourceConfig{{
+		SourceKey:   sourceKey,
+		Name:        "Home Immich",
+		Kind:        config.DatasourceKindImmichIndexed,
+		URL:         "http://immich.test",
+		AccessToken: "test-key",
+	}}, ServiceOptions{DataDir: dataDir, SemanticModels: modelStore})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	defer service.Close()
+	activeProfile, ok := modelStore.ActiveEmbeddingProfileWithContext(ctx)
+	if !ok {
+		t.Fatal("ActiveEmbeddingProfileWithContext() ok = false")
+	}
+	builtAt := time.Date(2026, 8, 22, 6, 0, 0, 0, time.UTC)
+	seedAndWriteSemanticBinaryIndexForTest(t, service.catalog, ctx, sourceKey, activeProfile, []semanticAsset{{
+		SourceKey:  sourceKey,
+		ID:         "asset-beach",
+		MediaType:  "image",
+		Filename:   "Summer Beach.jpg",
+		CapturedAt: builtAt,
+		Vector:     []float32{0, 1, 0, 0},
+	}}, builtAt, 0)
+	builtAtText := formatCatalogTime(builtAt)
+	if _, err := service.catalog.db.ExecContext(ctx, `INSERT INTO semantic_state (
+			source_key, model_id, vector_space_id, status, embedding_dim,
+			completed_vector_count, indexed_vector_count, asset_generation, indexed_generation,
+			built_at, last_error, updated_at
+		) VALUES (?, ?, ?, 'ready', ?, 1, 1, 0, 0, ?, NULL, ?)`,
+		sourceKey,
+		activeModelID,
+		activeVectorSpaceID,
+		activeProfile.EmbeddingDim(),
+		builtAtText,
+		builtAtText,
+	); err != nil {
+		t.Fatalf("insert semantic state: %v", err)
+	}
+	if _, err := service.catalog.RebuildCatalogCanonicalAssets(ctx); err != nil {
+		t.Fatalf("RebuildCatalogCanonicalAssets() error = %v", err)
+	}
+	if err := os.Remove(markerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Remove(candidate marker) error = %v", err)
+	}
+
+	page, err := service.SearchAssetsWithContext(ctx, AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind: CollectionKindSearch,
+			Query: &AssetSearchQuery{
+				Text: "Beach",
+				Mode: QueryModeSemantic,
+			},
+		},
+		Page: AssetSearchPageRequest{Index: 0, Size: 10},
+	})
+	if err != nil {
+		t.Fatalf("SearchAssetsWithContext() error = %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != "asset-beach" || page.Resolved.Semantic == nil || page.Resolved.Semantic.ModelID != activeModelID {
+		t.Fatalf("SearchAssetsWithContext() page = %#v, want active semantic result", page)
+	}
+	if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("candidate runtime inspection occurred despite a published active index: %v", err)
+	}
+}
+
+func TestSearchAssetsPreservesActiveSemanticProfileBeforeFirstPublish(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	modelStore, pack := installSemanticRuntimeStatusTestModel(t, dataDir)
+	if _, err := modelStore.ActivatePack(pack.ID, pack.VectorSpaceID); err != nil {
+		t.Fatalf("ActivatePack() error = %v", err)
+	}
+
+	const sourceKey = "1111111111111111"
+	service, err := NewServiceWithOptions([]config.DatasourceConfig{{
+		SourceKey:   sourceKey,
+		Name:        "Home Immich",
+		Kind:        config.DatasourceKindImmichIndexed,
+		URL:         "http://immich.test",
+		AccessToken: "test-key",
+	}}, ServiceOptions{DataDir: dataDir, SemanticModels: modelStore})
+	if err != nil {
+		t.Fatalf("NewServiceWithOptions() error = %v", err)
+	}
+	defer service.Close()
+
+	startedAt := time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC)
+	if _, err := service.catalog.ReplaceFull(ctx, sourceKey, []ImmichMirrorAsset{{
+		UpstreamAssetID: "asset-beach",
+		MediaType:       "image",
+		Filename:        "Summer Beach.jpg",
+		CapturedAt:      startedAt,
+	}}, 0, startedAt); err != nil {
+		t.Fatalf("ReplaceFull() error = %v", err)
+	}
+	profile, ok := modelStore.ActiveEmbeddingProfileWithContext(ctx)
+	if !ok {
+		t.Fatal("ActiveEmbeddingProfileWithContext() ok = false")
+	}
+	backfill, err := service.catalog.BackfillSemanticVectors(ctx, sourceKey, profile, startedAt, SemanticBackfillOptions{
+		ImageLoader: staticSemanticImageLoader{},
+		MaxAssets:   1,
+	})
+	if err != nil {
+		t.Fatalf("BackfillSemanticVectors() error = %v", err)
+	}
+	if backfill.Status.CompletedVectorCount != 1 || backfill.Status.IndexedVectorCount != 0 {
+		t.Fatalf("backfill status = %#v, want one unpublished vector", backfill.Status)
+	}
+
+	page, err := service.SearchAssetsWithContext(ctx, AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind: CollectionKindSearch,
+			Query: &AssetSearchQuery{
+				Text: "Beach",
+				Mode: QueryModeAuto,
+			},
+		},
+		Page: AssetSearchPageRequest{Index: 0, Size: 10},
+	})
+	if err != nil {
+		t.Fatalf("SearchAssetsWithContext() error = %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != "asset-beach" || page.Resolved.QueryMode != QueryModeFilename {
+		t.Fatalf("SearchAssetsWithContext() page = %#v, want filename fallback", page)
+	}
+	semantic := page.Resolved.Semantic
+	if semantic == nil ||
+		semantic.Status != semanticBackfillStatusBackfilling ||
+		semantic.ModelID != pack.ID ||
+		semantic.VectorSpaceID != pack.VectorSpaceID ||
+		semantic.CompletedVectorCount != 1 ||
+		semantic.IndexedVectorCount != 0 ||
+		semantic.MessageCode != semanticMessageIndexUnavailableFallback ||
+		semantic.FallbackQueryMode != QueryModeFilename {
+		t.Fatalf("SearchAssetsWithContext() semantic = %#v", semantic)
+	}
+
+	semanticOnly, err := service.SearchAssetsWithContext(ctx, AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind: CollectionKindSearch,
+			Query: &AssetSearchQuery{
+				Text: "Beach",
+				Mode: QueryModeSemantic,
+			},
+		},
+		Page: AssetSearchPageRequest{Index: 0, Size: 10},
+	})
+	if err != nil {
+		t.Fatalf("SearchAssetsWithContext(semantic) error = %v", err)
+	}
+	semantic = semanticOnly.Resolved.Semantic
+	if len(semanticOnly.Items) != 0 ||
+		semanticOnly.Resolved.QueryMode != QueryModeSemantic ||
+		semantic == nil ||
+		semantic.Status != semanticBackfillStatusBackfilling ||
+		semantic.ModelID != pack.ID ||
+		semantic.VectorSpaceID != pack.VectorSpaceID ||
+		semantic.MessageCode != semanticMessageIndexBackfilling ||
+		semantic.FallbackQueryMode != "" {
+		t.Fatalf("SearchAssetsWithContext(semantic) page = %#v", semanticOnly)
+	}
+}
+
+func TestSemanticSearchPublishedIndexAvailabilityUsesManifestAcrossPartialSources(t *testing.T) {
+	const publishedSourceKey = "1111111111111111"
+	const missingSourceKey = "2222222222222222"
+	builtAt := time.Date(2026, 8, 22, 1, 0, 0, 0, time.UTC)
+	service := newCatalogSemanticSearchBinaryFixture(t, publishedSourceKey, []semanticAsset{{
+		SourceKey:  publishedSourceKey,
+		ID:         "asset-001",
+		MediaType:  "image",
+		Filename:   "asset-001.jpg",
+		CapturedAt: builtAt,
+		Vector:     []float32{1, 0, 0, 0},
+	}}, builtAt)
+	service.ReconfigureDatasources([]config.DatasourceConfig{
+		{
+			SourceKey:   missingSourceKey,
+			Name:        "Missing index",
+			Kind:        config.DatasourceKindImmichIndexed,
+			URL:         "http://missing.immich.test",
+			AccessToken: "missing-key",
+		},
+		{
+			SourceKey:   publishedSourceKey,
+			Name:        "Published index",
+			Kind:        config.DatasourceKindImmichIndexed,
+			URL:         "http://published.immich.test",
+			AccessToken: "published-key",
+		},
+	})
+	profile := testImageSemanticProfile{}
+	if _, err := service.catalog.db.ExecContext(context.Background(), `UPDATE semantic_state
+		SET status = 'backfilling', asset_generation = indexed_generation + 1
+		WHERE source_key = ? AND model_id = ?`, publishedSourceKey, profile.ModelID()); err != nil {
+		t.Fatalf("make live semantic state newer than published generation: %v", err)
+	}
+	if !service.semanticSearchHasPublishedIndex(context.Background(), profile) {
+		t.Fatal("semanticSearchHasPublishedIndex() = false, want last published partial-source index to remain searchable during a newer generation")
+	}
+
+	manifestPath := service.catalog.semanticBinaryActiveManifestPath(publishedSourceKey, profile)
+	manifest, err := readSemanticBinaryActiveManifest(manifestPath)
+	if err != nil {
+		t.Fatalf("readSemanticBinaryActiveManifest() error = %v", err)
+	}
+	manifest.Header.VectorSpaceID = "other/vector-space"
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("json.Marshal(manifest) error = %v", err)
+	}
+	if err := os.WriteFile(manifestPath, raw, 0o600); err != nil {
+		t.Fatalf("write mismatched manifest: %v", err)
+	}
+	if service.semanticSearchHasPublishedIndex(context.Background(), profile) {
+		t.Fatal("semanticSearchHasPublishedIndex() = true for mismatched published manifest")
+	}
+}
+
+func TestCatalogSemanticAutoSearchFallsBackWhenPublishedIndexDisappears(t *testing.T) {
+	const sourceKey = "1111111111111111"
+	builtAt := time.Date(2026, 8, 22, 2, 0, 0, 0, time.UTC)
+	service := newCatalogSemanticSearchBinaryFixture(t, sourceKey, []semanticAsset{{
+		SourceKey:  sourceKey,
+		ID:         "asset-beach",
+		MediaType:  "image",
+		Filename:   "Summer Beach.jpg",
+		CapturedAt: builtAt,
+		Vector:     []float32{0, 1, 0, 0},
+	}}, builtAt)
+	profile := testImageSemanticProfile{}
+	if err := os.Remove(service.catalog.semanticBinaryActiveManifestPath(sourceKey, profile)); err != nil {
+		t.Fatalf("remove active semantic manifest: %v", err)
+	}
+	normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind:  CollectionKindSearch,
+			Query: &AssetSearchQuery{Text: "beach", Mode: QueryModeAuto},
+		},
+		Page: AssetSearchPageRequest{Index: 0, Size: 10},
+	})
+	if err != nil {
+		t.Fatalf("normalizeAssetSearchRequest() error = %v", err)
+	}
+	page, err := service.searchCatalogSemanticAssets(context.Background(), normalized, profile, AssetSearchOptions{})
+	if err != nil {
+		t.Fatalf("searchCatalogSemanticAssets() error = %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != "asset-beach" || page.Resolved.QueryMode != QueryModeFilename {
+		t.Fatalf("fallback page = %#v, want filename result after published index disappears", page)
+	}
+	if page.Resolved.Semantic == nil || page.Resolved.Semantic.Eligible || page.Resolved.Semantic.FallbackQueryMode != QueryModeFilename {
+		t.Fatalf("fallback semantic resolution = %#v", page.Resolved.Semantic)
+	}
+}
+
 func TestCanonicalAssetsForScoredSourcesChunksLargeCandidateSets(t *testing.T) {
 	t.Parallel()
 
@@ -3379,6 +3830,108 @@ func TestCatalogSemanticBackfillFailureDoesNotStarveLaterAssets(t *testing.T) {
 	if third.ProcessedVectorCount != 0 {
 		t.Fatalf("third backfill result = %#v, want failed asset retry backoff", third)
 	}
+
+	profile := testImageSemanticProfile{}
+	enqueued, err := service.catalog.ReconcileSemanticIndexJobs(ctx, []string{sourceKey}, profile, false, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("ReconcileSemanticIndexJobs(settled failure) error = %v", err)
+	}
+	if enqueued != 1 {
+		t.Fatalf("ReconcileSemanticIndexJobs(settled failure) = %d, want one publish job", enqueued)
+	}
+	publish, err := service.catalog.PublishNextSemanticIndexJob(ctx, []string{sourceKey}, profile, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("PublishNextSemanticIndexJob(settled failure) error = %v", err)
+	}
+	if !publish.Published ||
+		publish.Status.CompletedVectorCount != 1 ||
+		publish.Status.FailedVectorCount != 1 ||
+		publish.Status.IndexedVectorCount != 1 ||
+		publish.Status.Status != semanticBackfillStatusBackfilling {
+		t.Fatalf("settled-failure publish = %#v, want the ready vector published while the failure remains retryable", publish)
+	}
+
+	makeFailedAssetRetryEligible := func() {
+		t.Helper()
+		tx, err := service.catalog.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin failed semantic asset retry eligibility update: %v", err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.ExecContext(ctx, `INSERT INTO semantic_generation_suppression(source_key)
+			VALUES (?) ON CONFLICT(source_key) DO NOTHING`, sourceKey); err != nil {
+			t.Fatalf("suppress generation for retry eligibility update: %v", err)
+		}
+		retryBefore := formatCatalogTime(time.Now().UTC().Add(-semanticBackfillFailureRetryInterval - time.Minute))
+		if _, err := tx.ExecContext(ctx, `UPDATE semantic_vectors
+			SET generated_at = ?
+			WHERE source_key = ? AND upstream_asset_id = ? AND model_id = ?`,
+			retryBefore, sourceKey, "asset-new", profile.ModelID()); err != nil {
+			t.Fatalf("make failed semantic asset retry eligible: %v", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_generation_suppression WHERE source_key = ?`, sourceKey); err != nil {
+			t.Fatalf("restore generation after retry eligibility update: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit failed semantic asset retry eligibility update: %v", err)
+		}
+	}
+
+	makeFailedAssetRetryEligible()
+	retriedFailure, err := service.catalog.BackfillSemanticVectors(ctx, sourceKey, profile, time.Now().UTC(), SemanticBackfillOptions{
+		ImageLoader: loader,
+		MaxAssets:   1,
+	})
+	if err != nil {
+		t.Fatalf("BackfillSemanticVectors(retried failure) error = %v", err)
+	}
+	if retriedFailure.ProcessedVectorCount != 1 ||
+		retriedFailure.Status.CompletedVectorCount != 1 ||
+		retriedFailure.Status.FailedVectorCount != 1 ||
+		retriedFailure.Status.IndexedVectorCount != 1 ||
+		retriedFailure.Status.AssetGeneration != publish.Status.IndexedGeneration ||
+		retriedFailure.Status.IndexedGeneration != publish.Status.IndexedGeneration {
+		t.Fatalf("retried failure = %#v, want unchanged published generation", retriedFailure)
+	}
+	enqueued, err = service.catalog.ReconcileSemanticIndexJobs(ctx, []string{sourceKey}, profile, false, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("ReconcileSemanticIndexJobs(retried failure) error = %v", err)
+	}
+	if enqueued != 0 {
+		t.Fatalf("ReconcileSemanticIndexJobs(retried failure) = %d, want no unchanged-index publish job", enqueued)
+	}
+
+	makeFailedAssetRetryEligible()
+	recovered, err := service.catalog.BackfillSemanticVectors(ctx, sourceKey, profile, time.Now().UTC(), SemanticBackfillOptions{
+		ImageLoader: staticSemanticImageLoader{},
+		MaxAssets:   1,
+	})
+	if err != nil {
+		t.Fatalf("BackfillSemanticVectors(recovered) error = %v", err)
+	}
+	if recovered.ProcessedVectorCount != 1 ||
+		recovered.Status.CompletedVectorCount != 2 ||
+		recovered.Status.FailedVectorCount != 0 ||
+		recovered.Status.IndexedVectorCount != 1 {
+		t.Fatalf("recovered backfill = %#v, want the formerly failed vector ready and unpublished", recovered)
+	}
+	enqueued, err = service.catalog.ReconcileSemanticIndexJobs(ctx, []string{sourceKey}, profile, false, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("ReconcileSemanticIndexJobs(recovered) error = %v", err)
+	}
+	if enqueued != 1 {
+		t.Fatalf("ReconcileSemanticIndexJobs(recovered) = %d, want one follow-up publish job", enqueued)
+	}
+	republish, err := service.catalog.PublishNextSemanticIndexJob(ctx, []string{sourceKey}, profile, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("PublishNextSemanticIndexJob(recovered) error = %v", err)
+	}
+	if !republish.Published ||
+		republish.Status.Status != semanticBackfillStatusReady ||
+		republish.Status.CompletedVectorCount != 2 ||
+		republish.Status.IndexedVectorCount != 2 {
+		t.Fatalf("recovered publish = %#v, want both vectors published and ready", republish)
+	}
 }
 
 func TestCatalogSemanticBackfillSharedFailureDoesNotPersistAssetFailures(t *testing.T) {
@@ -3448,7 +4001,7 @@ func TestCatalogSemanticBackfillSharedFailureDoesNotPersistAssetFailures(t *test
 	}
 }
 
-func TestCatalogSemanticSearchDoesNotFallbackWhenModelPackIsBackfilling(t *testing.T) {
+func TestCatalogSemanticAutoSearchFallsBackWhenModelPackHasNoPublishedIndex(t *testing.T) {
 	t.Parallel()
 
 	const sourceKey = "1111111111111111"
@@ -3501,16 +4054,17 @@ func TestCatalogSemanticSearchDoesNotFallbackWhenModelPackIsBackfilling(t *testi
 	if err != nil {
 		t.Fatalf("searchCatalogSemanticAssets() error = %v", err)
 	}
-	if len(page.Items) != 0 || page.Total != 0 {
-		t.Fatalf("search page fell back to catalog results: %#v", page)
+	if len(page.Items) != 1 || page.Total != 1 || page.Items[0].ID != "asset-beach" {
+		t.Fatalf("search page = %#v, want filename fallback while the first index is unpublished", page)
 	}
-	if page.Resolved.QueryMode != QueryModeSemantic ||
+	if page.Resolved.QueryMode != QueryModeFilename ||
 		page.Resolved.Semantic == nil ||
 		page.Resolved.Semantic.ModelID != "test-image-profile" ||
 		page.Resolved.Semantic.ProfileKind != semanticProfileKindModelPack ||
 		page.Resolved.Semantic.Status != semanticBackfillStatusBackfilling ||
-		page.Resolved.Semantic.MessageCode != semanticMessageIndexBackfilling ||
-		page.Resolved.Semantic.FallbackQueryMode != "" {
+		page.Resolved.Semantic.MessageCode != semanticMessageIndexUnavailableFallback ||
+		page.Resolved.Semantic.Eligible ||
+		page.Resolved.Semantic.FallbackQueryMode != QueryModeFilename {
 		t.Fatalf("semantic resolution = %#v", page.Resolved.Semantic)
 	}
 }

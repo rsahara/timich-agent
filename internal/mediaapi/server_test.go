@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -88,23 +89,6 @@ func TestMuxRootOnlyServesRouteIndex(t *testing.T) {
 	}
 }
 
-func TestWriteCatalogErrorMapsDatasourceFailureToBadGateway(t *testing.T) {
-	t.Parallel()
-
-	recorder := httptest.NewRecorder()
-	writeCatalogError(recorder, fmt.Errorf("upstream auth failed: %w", catalog.ErrDatasourceUnavailable))
-	if recorder.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadGateway)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if payload["error"] != "datasource_unavailable" {
-		t.Fatalf("error = %#v, want datasource_unavailable", payload["error"])
-	}
-}
-
 func TestParseAssetRequestSupportsMetadataAndMediaRoutes(t *testing.T) {
 	t.Parallel()
 
@@ -176,6 +160,28 @@ func TestCopyProxyResponseOmitsHeadBody(t *testing.T) {
 
 	if recorder.Body.Len() != 0 {
 		t.Fatalf("expected empty HEAD body, got %q", recorder.Body.String())
+	}
+}
+
+func TestCopyProxyResponseUsesNoStoreForErrors(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	response := &catalog.UpstreamMediaResponse{
+		StatusCode: http.StatusNotFound,
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: io.NopCloser(strings.NewReader(`{"error":"not_found"}`)),
+	}
+
+	copyProxyResponse(recorder, http.MethodGet, response)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("Cache-Control = %q, want private, no-store", got)
 	}
 }
 
@@ -336,6 +342,44 @@ func TestRequestBaseURLFallsBackToRequestURL(t *testing.T) {
 	}
 }
 
+func TestRequestBaseURLUsesRequestHostWithForwardedProto(t *testing.T) {
+	t.Parallel()
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/session/refresh", nil)
+	request.Host = "agent.local:8082"
+	request.Header.Set("X-Forwarded-Proto", " https ")
+
+	if got := requestBaseURL(request); got != "https://agent.local:8082" {
+		t.Fatalf("requestBaseURL() = %q, want %q", got, "https://agent.local:8082")
+	}
+}
+
+func TestRequestBaseURLUsesTransportSchemeForPathOnlyRequest(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		useTLS  bool
+		wantURL string
+	}{
+		{name: "HTTP", wantURL: "http://agent.local:8082"},
+		{name: "HTTPS", useTLS: true, wantURL: "https://agent.local:8082"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/session/refresh", nil)
+			request.Host = "agent.local:8082"
+			if test.useTLS {
+				request.TLS = &tls.ConnectionState{}
+			}
+
+			if got := requestBaseURL(request); got != test.wantURL {
+				t.Fatalf("requestBaseURL() = %q, want %q", got, test.wantURL)
+			}
+		})
+	}
+}
+
 func TestUploadPolicyAndSessionRoutes(t *testing.T) {
 	t.Parallel()
 
@@ -474,37 +518,397 @@ func TestUploadSessionRoutesRequireValidRequest(t *testing.T) {
 	}
 }
 
-func TestWriteUploadErrorMapsFinalPathConflict(t *testing.T) {
+func TestProtectedRoutesRejectInvalidAuthorization(t *testing.T) {
 	t.Parallel()
 
-	recorder := httptest.NewRecorder()
-	writeUploadError(recorder, runtimestate.ErrUploadFinalPathConflict)
-	if recorder.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409 body=%s", recorder.Code, recorder.Body.String())
+	runtime := newUploadTestRuntime(t)
+	handler := NewMux(runtime)
+	routes := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "search capabilities", method: http.MethodGet, path: "/v1/assets/search/capabilities"},
+		{name: "asset search", method: http.MethodPost, path: "/v1/assets/search"},
+		{name: "asset metadata", method: http.MethodGet, path: "/v1/assets/asset-1"},
+		{name: "upload policy", method: http.MethodGet, path: "/v1/uploads/me"},
+		{name: "create upload", method: http.MethodPost, path: "/v1/uploads/sessions"},
+		{name: "upload session", method: http.MethodGet, path: "/v1/uploads/sessions/upload-1"},
+		{name: "WebRTC offer", method: http.MethodPost, path: "/v1/webrtc/offer"},
 	}
-	var payload map[string]string
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
+	authorizations := []struct {
+		name  string
+		value string
+	}{
+		{name: "missing"},
+		{name: "wrong scheme", value: "Basic credentials"},
+		{name: "empty bearer", value: "Bearer   "},
+		{name: "invalid bearer", value: "Bearer invalid-token"},
 	}
-	if payload["error"] != "upload_final_path_conflict" {
-		t.Fatalf("error = %q, want upload_final_path_conflict", payload["error"])
+
+	for _, route := range routes {
+		for _, authorization := range authorizations {
+			t.Run(route.name+"/"+authorization.name, func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(route.method, route.path, nil)
+				if authorization.value != "" {
+					request.Header.Set("Authorization", authorization.value)
+				}
+
+				handler.ServeHTTP(recorder, request)
+
+				assertJSONErrorResponse(t, recorder, http.StatusUnauthorized, "unauthorized")
+			})
+		}
 	}
 }
 
-func TestWriteUploadErrorMapsStorageWriteBlocked(t *testing.T) {
+func TestAuthenticateRequestAcceptsValidBearerAndRejectsRevokedDevice(t *testing.T) {
 	t.Parallel()
 
-	recorder := httptest.NewRecorder()
-	writeUploadError(recorder, runtimestate.ErrStorageWriteBlocked)
-	if recorder.Code != http.StatusInsufficientStorage {
-		t.Fatalf("status = %d, want 507 body=%s", recorder.Code, recorder.Body.String())
+	runtime := newUploadTestRuntime(t)
+	session, err := runtime.CreateHostedSession("Authenticated iPhone", "https://timich.example")
+	if err != nil {
+		t.Fatalf("CreateHostedSession() error = %v", err)
+	}
+
+	validRecorder := httptest.NewRecorder()
+	validRequest := httptest.NewRequest(http.MethodGet, "/v1/uploads/me", nil)
+	validRequest.Header.Set("Authorization", "  bEaReR   "+session.AccessToken+"  ")
+	claims, ok := authenticateRequest(validRecorder, runtime, validRequest)
+	if !ok {
+		t.Fatalf("authenticateRequest(valid token) rejected request: status=%d body=%s", validRecorder.Code, validRecorder.Body.String())
+	}
+	if claims.AppDeviceID != session.DeviceID {
+		t.Fatalf("claims.AppDeviceID = %q, want %q", claims.AppDeviceID, session.DeviceID)
+	}
+
+	if err := runtime.RevokeDevice(session.DeviceID); err != nil {
+		t.Fatalf("RevokeDevice() error = %v", err)
+	}
+	revokedRecorder := httptest.NewRecorder()
+	revokedRequest := httptest.NewRequest(http.MethodGet, "/v1/uploads/me", nil)
+	revokedRequest.Header.Set("Authorization", "Bearer "+session.AccessToken)
+	if _, ok := authenticateRequest(revokedRecorder, runtime, revokedRequest); ok {
+		t.Fatal("authenticateRequest(revoked device) accepted request")
+	}
+	assertJSONErrorResponse(t, revokedRecorder, http.StatusUnauthorized, "unauthorized")
+}
+
+func TestMuxRejectsUnsupportedMethods(t *testing.T) {
+	t.Parallel()
+
+	runtime := newUploadTestRuntime(t)
+	session, err := runtime.CreateHostedSession("Method Test iPhone", "https://timich.example")
+	if err != nil {
+		t.Fatalf("CreateHostedSession() error = %v", err)
+	}
+	handler := NewMux(runtime)
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "create nearby link", method: http.MethodGet, path: "/v1/nearby-links"},
+		{name: "poll nearby link", method: http.MethodGet, path: "/v1/nearby-links/link-1/poll"},
+		{name: "cancel nearby link", method: http.MethodGet, path: "/v1/nearby-links/link-1/cancel"},
+		{name: "redeem pairing", method: http.MethodGet, path: "/v1/pairing/redeem"},
+		{name: "refresh session", method: http.MethodGet, path: "/v1/session/refresh"},
+		{name: "search capabilities", method: http.MethodPost, path: "/v1/assets/search/capabilities"},
+		{name: "search assets", method: http.MethodGet, path: "/v1/assets/search"},
+		{name: "upload policy", method: http.MethodPost, path: "/v1/uploads/me"},
+		{name: "create upload", method: http.MethodGet, path: "/v1/uploads/sessions"},
+		{name: "read upload", method: http.MethodPost, path: "/v1/uploads/sessions/upload-1"},
+		{name: "append upload chunk", method: http.MethodPost, path: "/v1/uploads/sessions/upload-1/chunk"},
+		{name: "complete upload", method: http.MethodGet, path: "/v1/uploads/sessions/upload-1/complete"},
+		{name: "abort upload", method: http.MethodGet, path: "/v1/uploads/sessions/upload-1/abort"},
+		{name: "answer WebRTC offer", method: http.MethodGet, path: "/v1/webrtc/offer"},
+		{name: "asset metadata", method: http.MethodPost, path: "/v1/assets/asset-1"},
+		{name: "asset media", method: http.MethodPost, path: "/v1/assets/asset-1/preview"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(test.method, test.path, nil)
+			request.Header.Set("Authorization", "Bearer "+session.AccessToken)
+
+			handler.ServeHTTP(recorder, request)
+
+			assertJSONErrorResponse(t, recorder, http.StatusMethodNotAllowed, "method_not_allowed")
+		})
+	}
+}
+
+func TestMuxRejectsMalformedNestedRoutes(t *testing.T) {
+	t.Parallel()
+
+	runtime := newUploadTestRuntime(t)
+	session, err := runtime.CreateHostedSession("Route Test iPhone", "https://timich.example")
+	if err != nil {
+		t.Fatalf("CreateHostedSession() error = %v", err)
+	}
+	handler := NewMux(runtime)
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "empty upload ID", method: http.MethodGet, path: "/v1/uploads/sessions/"},
+		{name: "unknown upload action", method: http.MethodGet, path: "/v1/uploads/sessions/upload-1/unknown"},
+		{name: "deep upload path", method: http.MethodGet, path: "/v1/uploads/sessions/upload-1/chunk/extra"},
+		{name: "missing nearby action", method: http.MethodPost, path: "/v1/nearby-links/link-1"},
+		{name: "unknown nearby action", method: http.MethodPost, path: "/v1/nearby-links/link-1/unknown"},
+		{name: "empty asset ID", method: http.MethodGet, path: "/v1/assets/"},
+		{name: "deep asset path", method: http.MethodGet, path: "/v1/assets/asset-1/preview/extra"},
+		{name: "unknown media variant", method: http.MethodGet, path: "/v1/assets/asset-1/unknown"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(test.method, test.path, nil)
+			request.Header.Set("Authorization", "Bearer "+session.AccessToken)
+
+			handler.ServeHTTP(recorder, request)
+
+			assertJSONErrorResponse(t, recorder, http.StatusNotFound, "route_not_found")
+		})
+	}
+}
+
+func TestMuxRejectsMalformedJSONRequests(t *testing.T) {
+	t.Parallel()
+
+	runtime := newUploadTestRuntime(t)
+	session, err := runtime.CreateHostedSession("JSON Test iPhone", "https://timich.example")
+	if err != nil {
+		t.Fatalf("CreateHostedSession() error = %v", err)
+	}
+	handler := NewMux(runtime)
+	tests := []struct {
+		name string
+		path string
+	}{
+		{name: "create nearby link", path: "/v1/nearby-links"},
+		{name: "poll nearby link", path: "/v1/nearby-links/link-1/poll"},
+		{name: "cancel nearby link", path: "/v1/nearby-links/link-1/cancel"},
+		{name: "redeem pairing", path: "/v1/pairing/redeem"},
+		{name: "refresh session", path: "/v1/session/refresh"},
+		{name: "search assets", path: "/v1/assets/search"},
+		{name: "create upload", path: "/v1/uploads/sessions"},
+		{name: "complete upload", path: "/v1/uploads/sessions/upload-1/complete"},
+		{name: "answer WebRTC offer", path: "/v1/webrtc/offer"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader("{"))
+			request.Header.Set("Authorization", "Bearer "+session.AccessToken)
+
+			handler.ServeHTTP(recorder, request)
+
+			assertJSONErrorResponse(t, recorder, http.StatusBadRequest, "invalid_request")
+		})
+	}
+}
+
+func TestRouteParserContracts(t *testing.T) {
+	t.Parallel()
+
+	t.Run("upload sessions", func(t *testing.T) {
+		tests := []struct {
+			path       string
+			wantID     string
+			wantAction string
+			wantOK     bool
+		}{
+			{path: "/v1/uploads/sessions/upload-1", wantID: "upload-1", wantOK: true},
+			{path: "/v1/uploads/sessions/upload-1/chunk", wantID: "upload-1", wantAction: "chunk", wantOK: true},
+			{path: "/v1/uploads/sessions/upload-1/complete/", wantID: "upload-1", wantAction: "complete", wantOK: true},
+			{path: "/v1/uploads/sessions/"},
+			{path: "/v1/uploads/sessions/upload-1/chunk/extra"},
+		}
+		for _, test := range tests {
+			gotID, gotAction, gotOK := parseUploadSessionRequest(test.path)
+			if gotID != test.wantID || gotAction != test.wantAction || gotOK != test.wantOK {
+				t.Errorf("parseUploadSessionRequest(%q) = %q/%q/%t, want %q/%q/%t", test.path, gotID, gotAction, gotOK, test.wantID, test.wantAction, test.wantOK)
+			}
+		}
+	})
+
+	t.Run("nearby links", func(t *testing.T) {
+		tests := []struct {
+			path       string
+			wantID     string
+			wantAction string
+			wantOK     bool
+		}{
+			{path: "/v1/nearby-links/link-1/poll", wantID: "link-1", wantAction: "poll", wantOK: true},
+			{path: "/v1/nearby-links/link-1/cancel/", wantID: "link-1", wantAction: "cancel", wantOK: true},
+			{path: "/v1/nearby-links/"},
+			{path: "/v1/nearby-links/link-1"},
+			{path: "/v1/nearby-links/link-1/poll/extra"},
+		}
+		for _, test := range tests {
+			gotID, gotAction, gotOK := parseNearbyLinkRequest(test.path)
+			if gotID != test.wantID || gotAction != test.wantAction || gotOK != test.wantOK {
+				t.Errorf("parseNearbyLinkRequest(%q) = %q/%q/%t, want %q/%q/%t", test.path, gotID, gotAction, gotOK, test.wantID, test.wantAction, test.wantOK)
+			}
+		}
+	})
+}
+
+func TestParseRequiredInt64HeaderContract(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		setHeader   bool
+		raw         string
+		want        int64
+		wantError   bool
+		wantInvalid bool
+	}{
+		{name: "missing", wantError: true, wantInvalid: true},
+		{name: "blank", setHeader: true, raw: "   ", wantError: true, wantInvalid: true},
+		{name: "not a number", setHeader: true, raw: "offset", wantError: true},
+		{name: "negative", setHeader: true, raw: "-1", wantError: true, wantInvalid: true},
+		{name: "zero", setHeader: true, raw: "0"},
+		{name: "trimmed positive", setHeader: true, raw: " 42 ", want: 42},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPut, "/v1/uploads/sessions/upload-1/chunk", nil)
+			if test.setHeader {
+				request.Header.Set("X-Timich-Offset", test.raw)
+			}
+			got, err := parseRequiredInt64Header(request, "X-Timich-Offset")
+			if (err != nil) != test.wantError {
+				t.Fatalf("parseRequiredInt64Header() error = %v, wantError %t", err, test.wantError)
+			}
+			if test.wantInvalid && !errors.Is(err, runtimestate.ErrUploadRequestInvalid) {
+				t.Fatalf("parseRequiredInt64Header() error = %v, want %v", err, runtimestate.ErrUploadRequestInvalid)
+			}
+			if err == nil && got != test.want {
+				t.Fatalf("parseRequiredInt64Header() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDecodeJSONRequestEnforcesBodyContract(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid body", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"value":"ok"}`))
+		var payload struct {
+			Value string `json:"value"`
+		}
+		if err := decodeJSONRequest(recorder, request, &payload); err != nil {
+			t.Fatalf("decodeJSONRequest(valid) error = %v", err)
+		}
+		if payload.Value != "ok" {
+			t.Fatalf("decoded value = %q, want ok", payload.Value)
+		}
+	})
+
+	t.Run("malformed body", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("{"))
+		var payload map[string]any
+		if err := decodeJSONRequest(recorder, request, &payload); err == nil {
+			t.Fatal("decodeJSONRequest(malformed) error = nil")
+		}
+	})
+
+	t.Run("oversized body", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		body := `{"value":"` + strings.Repeat("x", maxJSONBodyBytes) + `"}`
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		var payload map[string]any
+		err := decodeJSONRequest(recorder, request, &payload)
+		if err == nil || !strings.Contains(err.Error(), "request body too large") {
+			t.Fatalf("decodeJSONRequest(oversized) error = %v, want body-too-large error", err)
+		}
+	})
+}
+
+func TestPublicErrorResponseMappings(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		write      func(http.ResponseWriter, error)
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "pairing not found", write: writePairingError, err: store.ErrPairingSessionNotFound, wantStatus: http.StatusNotFound, wantCode: "pairing_not_found"},
+		{name: "pairing expired", write: writePairingError, err: store.ErrPairingSessionExpired, wantStatus: http.StatusGone, wantCode: "pairing_expired"},
+		{name: "pairing used", write: writePairingError, err: store.ErrPairingSessionUsed, wantStatus: http.StatusGone, wantCode: "pairing_used"},
+		{name: "pairing device limit", write: writePairingError, err: store.ErrDeviceLimitReached, wantStatus: http.StatusConflict, wantCode: "device_limit_reached"},
+		{name: "pairing fallback", write: writePairingError, err: errors.New("pairing failure"), wantStatus: http.StatusInternalServerError, wantCode: "pairing_redeem_failed"},
+		{name: "nearby not found", write: writeNearbyLinkError, err: store.ErrNearbyLinkNotFound, wantStatus: http.StatusNotFound, wantCode: "nearby_link_not_found"},
+		{name: "nearby denied", write: writeNearbyLinkError, err: store.ErrNearbyLinkDenied, wantStatus: http.StatusGone, wantCode: "nearby_link_denied"},
+		{name: "nearby pending", write: writeNearbyLinkError, err: store.ErrNearbyLinkNotApproved, wantStatus: http.StatusConflict, wantCode: "nearby_link_pending"},
+		{name: "nearby consumed", write: writeNearbyLinkError, err: store.ErrNearbyLinkConsumed, wantStatus: http.StatusGone, wantCode: "nearby_link_used"},
+		{name: "nearby poll token", write: writeNearbyLinkError, err: store.ErrNearbyLinkPollTokenInvalid, wantStatus: http.StatusUnauthorized, wantCode: "nearby_link_poll_token_invalid"},
+		{name: "nearby limit", write: writeNearbyLinkError, err: store.ErrNearbyLinkLimitReached, wantStatus: http.StatusTooManyRequests, wantCode: "nearby_link_limit_reached"},
+		{name: "nearby device limit", write: writeNearbyLinkError, err: store.ErrDeviceLimitReached, wantStatus: http.StatusConflict, wantCode: "device_limit_reached"},
+		{name: "nearby fallback", write: writeNearbyLinkError, err: errors.New("nearby failure"), wantStatus: http.StatusInternalServerError, wantCode: "nearby_link_failed"},
+		{name: "refresh token not found", write: writeRefreshError, err: store.ErrRefreshTokenNotFound, wantStatus: http.StatusUnauthorized, wantCode: "refresh_token_invalid"},
+		{name: "refresh token expired", write: writeRefreshError, err: store.ErrRefreshTokenExpired, wantStatus: http.StatusUnauthorized, wantCode: "refresh_token_invalid"},
+		{name: "refresh fallback", write: writeRefreshError, err: errors.New("refresh failure"), wantStatus: http.StatusInternalServerError, wantCode: "session_refresh_failed"},
+		{name: "catalog missing datasource", write: writeCatalogError, err: catalog.ErrNoDatasourceConfigured, wantStatus: http.StatusServiceUnavailable, wantCode: "datasource_not_configured"},
+		{name: "catalog invalid search", write: writeCatalogError, err: catalog.ErrInvalidSearchRequest, wantStatus: http.StatusBadRequest, wantCode: "invalid_search_request"},
+		{name: "catalog unsupported search", write: writeCatalogError, err: catalog.ErrUnsupportedSearch, wantStatus: http.StatusBadRequest, wantCode: "unsupported_search"},
+		{name: "catalog unavailable", write: writeCatalogError, err: catalog.ErrDatasourceUnavailable, wantStatus: http.StatusBadGateway, wantCode: "datasource_unavailable"},
+		{name: "catalog asset not found", write: writeCatalogError, err: catalog.ErrAssetNotFound, wantStatus: http.StatusNotFound, wantCode: "asset_not_found"},
+		{name: "catalog media too large", write: writeCatalogError, err: catalog.ErrMediaTooLarge, wantStatus: http.StatusRequestEntityTooLarge, wantCode: "media_too_large"},
+		{name: "catalog fallback", write: writeCatalogError, err: errors.New("catalog failure"), wantStatus: http.StatusBadGateway, wantCode: "catalog_proxy_failed"},
+		{name: "upload invalid request", write: writeUploadError, err: runtimestate.ErrUploadRequestInvalid, wantStatus: http.StatusBadRequest, wantCode: "upload_request_invalid"},
+		{name: "upload checksum mismatch", write: writeUploadError, err: runtimestate.ErrUploadChecksumMismatch, wantStatus: http.StatusBadRequest, wantCode: "upload_checksum_mismatch"},
+		{name: "upload offset conflict", write: writeUploadError, err: store.ErrUploadSessionOffsetConflict, wantStatus: http.StatusConflict, wantCode: "upload_offset_conflict"},
+		{name: "upload asset exists", write: writeUploadError, err: store.ErrUploadedAssetExists, wantStatus: http.StatusConflict, wantCode: "uploaded_asset_exists"},
+		{name: "upload final path conflict", write: writeUploadError, err: runtimestate.ErrUploadFinalPathConflict, wantStatus: http.StatusConflict, wantCode: "upload_final_path_conflict"},
+		{name: "upload policy blocked", write: writeUploadError, err: runtimestate.ErrUploadPolicyInvalid, wantStatus: http.StatusConflict, wantCode: "upload_policy_blocked"},
+		{name: "upload storage blocked", write: writeUploadError, err: runtimestate.ErrStorageWriteBlocked, wantStatus: http.StatusInsufficientStorage, wantCode: "storage_write_blocked"},
+		{name: "upload session not found", write: writeUploadError, err: store.ErrUploadSessionNotFound, wantStatus: http.StatusNotFound, wantCode: "upload_session_not_found"},
+		{name: "upload device not found", write: writeUploadError, err: store.ErrDeviceNotFound, wantStatus: http.StatusNotFound, wantCode: "device_not_found"},
+		{name: "upload fallback", write: writeUploadError, err: errors.New("upload failure"), wantStatus: http.StatusInternalServerError, wantCode: "upload_request_failed"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			test.write(recorder, fmt.Errorf("wrapped response error: %w", test.err))
+			assertJSONErrorResponse(t, recorder, test.wantStatus, test.wantCode)
+		})
+	}
+}
+
+func assertJSONErrorResponse(t *testing.T, recorder *httptest.ResponseRecorder, wantStatus int, wantCode string) {
+	t.Helper()
+
+	if recorder.Code != wantStatus {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, wantStatus, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
 	}
 	var payload map[string]string
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("response is not JSON: %v body=%s", err, recorder.Body.String())
 	}
-	if payload["error"] != "storage_write_blocked" {
-		t.Fatalf("error = %q, want storage_write_blocked", payload["error"])
+	if payload["error"] != wantCode {
+		t.Fatalf("error = %q, want %q payload=%v", payload["error"], wantCode, payload)
+	}
+	if strings.TrimSpace(payload["message"]) == "" {
+		t.Fatalf("message is empty payload=%v", payload)
 	}
 }
 

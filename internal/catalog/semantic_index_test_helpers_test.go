@@ -373,6 +373,48 @@ func TestSemanticIndexBuilderPrefetchUsesByteBoundedCache(t *testing.T) {
 	}
 }
 
+func TestSemanticIndexBuilderIdentityIncludesScoringFingerprint(t *testing.T) {
+	t.Parallel()
+
+	store, err := LoadOrCreateCatalogStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateCatalogStore() error = %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	profile := testImageSemanticProfile{}
+	path := filepath.Join(store.root, semanticBinaryIndexDirName, "scoring-identity.build.db")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	builder, err := openSemanticIndexBuilder(store, path, "1111111111111111", profile, 1, nil)
+	if err != nil {
+		t.Fatalf("openSemanticIndexBuilder() error = %v", err)
+	}
+	defer builder.Remove()
+	if err := builder.populate(ctx); err != nil {
+		t.Fatalf("populate() error = %v", err)
+	}
+	if valid, err := builder.identityMatches(ctx); err != nil || !valid {
+		t.Fatalf("identityMatches() = %v, %v, want true, nil", valid, err)
+	}
+
+	want := semanticDotScoringFingerprint(profile.EmbeddingDim())
+	var stored string
+	if err := builder.db.QueryRowContext(ctx, `SELECT value FROM build_meta WHERE key = 'scoring_fingerprint'`).Scan(&stored); err != nil {
+		t.Fatalf("read scoring fingerprint: %v", err)
+	}
+	if stored != want {
+		t.Fatalf("stored scoring fingerprint = %q, want %q", stored, want)
+	}
+	if _, err := builder.db.ExecContext(ctx, `UPDATE build_meta SET value = 'different-backend' WHERE key = 'scoring_fingerprint'`); err != nil {
+		t.Fatalf("replace scoring fingerprint: %v", err)
+	}
+	if valid, err := builder.identityMatches(ctx); err != nil || valid {
+		t.Fatalf("identityMatches(after backend change) = %v, %v, want false, nil", valid, err)
+	}
+}
+
 func TestSemanticIndexBuilderAbruptTerminationResumesCommittedChunk(t *testing.T) {
 	const (
 		helperEnv = "TIMICH_TEST_SEMANTIC_BUILDER_ABRUPT_EXIT"
