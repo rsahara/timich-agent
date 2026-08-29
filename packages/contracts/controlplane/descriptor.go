@@ -116,6 +116,7 @@ func buildFileDescriptor() (protoreflect.FileDescriptor, error) {
 					fieldRepeatedMessage("headers", 4, "Header"),
 					fieldBytes("body", 5),
 					fieldString("content_type", 6),
+					fieldInt64("deadline_unix_millis", 7),
 				},
 			},
 			{
@@ -192,6 +193,15 @@ func fieldInt32(name string, number int32) *descriptorpb.FieldDescriptorProto {
 		Number: proto.Int32(number),
 		Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
 		Type:   descriptorpb.FieldDescriptorProto_TYPE_INT32.Enum(),
+	}
+}
+
+func fieldInt64(name string, number int32) *descriptorpb.FieldDescriptorProto {
+	return &descriptorpb.FieldDescriptorProto{
+		Name:   proto.String(name),
+		Number: proto.Int32(number),
+		Label:  descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+		Type:   descriptorpb.FieldDescriptorProto_TYPE_INT64.Enum(),
 	}
 }
 

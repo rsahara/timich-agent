@@ -15,9 +15,96 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
+
+type relayIsolationAPI interface {
+	OpenControlStream(grpc.ServerStream) error
+	UploadFetchResult(context.Context, *dynamicpb.Message) (*dynamicpb.Message, error)
+}
+
+type relayIsolationServer struct {
+	commands []*dynamicpb.Message
+}
+
+func (s *relayIsolationServer) OpenControlStream(stream grpc.ServerStream) error {
+	hello, err := newMessage("AgentEvent")
+	if err != nil {
+		return err
+	}
+	if err := stream.RecvMsg(hello); err != nil {
+		return err
+	}
+	for _, command := range s.commands {
+		if err := stream.SendMsg(command); err != nil {
+			return err
+		}
+	}
+	<-stream.Context().Done()
+	return nil
+}
+
+func (s *relayIsolationServer) UploadFetchResult(context.Context, *dynamicpb.Message) (*dynamicpb.Message, error) {
+	response, err := newMessage("FetchResultUploadResponse")
+	if err != nil {
+		return nil, err
+	}
+	response.Set(fieldByName(response, "accepted"), protoreflect.ValueOfBool(true))
+	return response, nil
+}
+
+func registerRelayIsolationServer(server *grpc.Server, service *relayIsolationServer) {
+	server.RegisterService(&grpc.ServiceDesc{
+		ServiceName: ServiceFullName(),
+		HandlerType: (*relayIsolationAPI)(nil),
+		Methods: []grpc.MethodDesc{{
+			MethodName: "UploadFetchResult",
+			Handler: func(srv any, ctx context.Context, decoder func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
+				request, err := newMessage("FetchResultUploadRequest")
+				if err != nil {
+					return nil, err
+				}
+				if err := decoder(request); err != nil {
+					return nil, err
+				}
+				return srv.(relayIsolationAPI).UploadFetchResult(ctx, request)
+			},
+		}},
+		Streams: []grpc.StreamDesc{{
+			StreamName: "OpenControlStream",
+			Handler: func(srv any, stream grpc.ServerStream) error {
+				return srv.(relayIsolationAPI).OpenControlStream(stream)
+			},
+			ServerStreams: true,
+			ClientStreams: true,
+		}},
+	}, service)
+}
+
+func relayCommandForClientTest(t *testing.T, fetchID string, path string) *dynamicpb.Message {
+	t.Helper()
+	command, err := newMessage("ServerCommand")
+	if err != nil {
+		t.Fatalf("new ServerCommand: %v", err)
+	}
+	command.Set(fieldByName(command, "command_id"), protoreflect.ValueOfString("command-"+fetchID))
+	relay, err := newMessage("RelayFetchRequest")
+	if err != nil {
+		t.Fatalf("new RelayFetchRequest: %v", err)
+	}
+	relay.Set(fieldByName(relay, "fetch_id"), protoreflect.ValueOfString(fetchID))
+	relay.Set(fieldByName(relay, "method"), protoreflect.ValueOfString(http.MethodPost))
+	relay.Set(fieldByName(relay, "path"), protoreflect.ValueOfString(path))
+	relay.Set(fieldByName(relay, "deadline_unix_millis"), protoreflect.ValueOfInt64(time.Now().Add(5*time.Second).UnixMilli()))
+	command.Set(fieldByName(command, "relay_fetch"), protoreflect.ValueOfMessage(relay.ProtoReflect()))
+	return command
+}
 
 func TestRegisterRelayCredentialSendsSignedProof(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
@@ -92,6 +179,70 @@ func TestRunOnceTimesOutStalledDial(t *testing.T) {
 			conn.Close()
 		}
 	default:
+	}
+}
+
+func TestRunOnceDoesNotSerializeSessionRefreshBehindSlowMedia(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	server := grpc.NewServer()
+	registerRelayIsolationServer(server, &relayIsolationServer{commands: []*dynamicpb.Message{
+		relayCommandForClientTest(t, "slow", "/v1/assets/search"),
+		relayCommandForClientTest(t, "refresh", "/v1/session/refresh"),
+	}})
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+	})
+
+	slowStarted := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	refreshHandled := make(chan struct{})
+	var slowOnce sync.Once
+	var refreshOnce sync.Once
+	client := &Client{
+		target:        listener.Addr().String(),
+		agentID:       "agent-home",
+		version:       "test",
+		hostedBaseURL: "https://relay.example",
+		mediaHandler: http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			switch request.URL.Path {
+			case "/v1/assets/search":
+				slowOnce.Do(func() { close(slowStarted) })
+				select {
+				case <-releaseSlow:
+				case <-request.Context().Done():
+				}
+			case "/v1/session/refresh":
+				refreshOnce.Do(func() { close(refreshHandled) })
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.runOnce(ctx) }()
+	select {
+	case <-slowStarted:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("slow media request did not start")
+	}
+	select {
+	case <-refreshHandled:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("session refresh remained blocked behind slow media")
+	}
+	close(releaseSlow)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runOnce did not stop after cancellation")
 	}
 }
 
@@ -325,6 +476,95 @@ func TestHandleRelayRequestRejectsInvalidInput(t *testing.T) {
 				t.Fatalf("error code = %q, want %q", got, test.wantCode)
 			}
 		})
+	}
+}
+
+func TestHandleRelayRequestRejectsExpiredWorkBeforeSideEffects(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	client := &Client{
+		hostedBaseURL: "https://relay.example",
+		mediaHandler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			called = true
+		}),
+	}
+	response := client.handleRelayRequest(&RelayRequest{
+		FetchID:            "fetch-expired",
+		Method:             http.MethodPost,
+		Path:               "/v1/session/refresh",
+		DeadlineUnixMillis: time.Now().Add(-time.Second).UnixMilli(),
+	})
+	if called {
+		t.Fatal("expired relay request reached the media handler")
+	}
+	if response.StatusCode != http.StatusGatewayTimeout || relayErrorCode(t, response) != "relay_request_expired" {
+		t.Fatalf("expired relay response = status %d body %s, want 504 relay_request_expired", response.StatusCode, response.Body)
+	}
+}
+
+func TestHandleRelayRequestRejectsCancelledWorkerBeforeSideEffects(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	client := &Client{
+		hostedBaseURL: "https://relay.example",
+		mediaHandler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			called = true
+		}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	response := client.handleRelayRequestContext(ctx, &RelayRequest{
+		FetchID: "fetch-cancelled",
+		Method:  http.MethodPost,
+		Path:    "/v1/session/refresh",
+	})
+	if called {
+		t.Fatal("cancelled relay request reached the media handler")
+	}
+	if response.StatusCode != http.StatusGatewayTimeout || relayErrorCode(t, response) != "relay_request_expired" {
+		t.Fatalf("cancelled relay response = status %d body %s, want 504 relay_request_expired", response.StatusCode, response.Body)
+	}
+}
+
+func TestHandleRelayRequestPropagatesDeadlineToMediaHandler(t *testing.T) {
+	t.Parallel()
+
+	deadline := time.Now().Add(100 * time.Millisecond).UTC()
+	client := &Client{
+		hostedBaseURL: "https://relay.example",
+		mediaHandler: http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			got, ok := request.Context().Deadline()
+			if !ok || got.UnixMilli() != deadline.UnixMilli() {
+				t.Errorf("media request deadline = %s/%t, want %s", got, ok, deadline)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	response := client.handleRelayRequestContext(context.Background(), &RelayRequest{
+		FetchID:            "fetch-deadline",
+		Method:             http.MethodGet,
+		Path:               "/v1/assets/search",
+		DeadlineUnixMillis: deadline.UnixMilli(),
+	})
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("deadline relay response status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+}
+
+func TestRelayRequestUsesReservedSessionWorker(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{"/v1/session/refresh", "/v1/pairing/redeem"} {
+		if !relayRequestUsesSessionWorker(&RelayRequest{Path: path}) {
+			t.Fatalf("relayRequestUsesSessionWorker(%q) = false, want true", path)
+		}
+	}
+	for _, path := range []string{"/v1/assets/search", "/v1/webrtc/offer", "%"} {
+		if relayRequestUsesSessionWorker(&RelayRequest{Path: path}) {
+			t.Fatalf("relayRequestUsesSessionWorker(%q) = true, want false", path)
+		}
 	}
 }
 

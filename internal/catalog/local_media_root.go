@@ -67,12 +67,14 @@ type localMediaRootInspection struct {
 }
 
 type trustedLocalMediaRoot struct {
-	transition            *localMediaRootTransitionLease
-	datasource            config.DatasourceConfig
-	root                  config.LocalMediaRootConfig
-	handle                *os.Root
-	rootGeneration        int64
-	reconciliationPending bool
+	transition                      *localMediaRootTransitionLease
+	datasource                      config.DatasourceConfig
+	root                            config.LocalMediaRootConfig
+	handle                          *os.Root
+	rootGeneration                  int64
+	reconciliationPending           bool
+	externalContentIdentityMappings []immichExternalLibraryMapping
+	externalContentIdentityScopeKey string
 }
 
 type localMediaRootWorkState struct {
@@ -191,7 +193,8 @@ func (s *Service) acquireTrustedLocalMediaRootWithMode(ctx context.Context, sour
 	if s == nil || s.catalog == nil {
 		return nil, false, ErrNoDatasourceConfigured
 	}
-	datasource, rootConfig, err := s.localDatasourceAndRoot(sourceKey)
+	datasourceState := s.datasourceStateSnapshot()
+	datasource, rootConfig, err := localDatasourceAndRootFromState(datasourceState, sourceKey)
 	if err != nil {
 		return nil, false, err
 	}
@@ -205,6 +208,9 @@ func (s *Service) acquireTrustedLocalMediaRootWithMode(ctx context.Context, sour
 			transition.release()
 		}
 	}()
+	if s.datasourceStateSnapshot() != datasourceState {
+		return nil, false, ErrNoDatasourceConfigured
+	}
 	workState, err := s.localMediaRootWorkState(ctx, datasource.SourceKey, rootConfig.Key)
 	if err != nil {
 		return nil, false, err
@@ -222,12 +228,14 @@ func (s *Service) acquireTrustedLocalMediaRootWithMode(ctx context.Context, sour
 	}
 	release = false
 	return &trustedLocalMediaRoot{
-		transition:            transition,
-		datasource:            *datasource,
-		root:                  *rootConfig,
-		handle:                handle,
-		rootGeneration:        normalizeLocalMediaRootGeneration(workState.generation),
-		reconciliationPending: workState.reconciliationPending,
+		transition:                      transition,
+		datasource:                      *datasource,
+		root:                            *rootConfig,
+		handle:                          handle,
+		rootGeneration:                  normalizeLocalMediaRootGeneration(workState.generation),
+		reconciliationPending:           workState.reconciliationPending,
+		externalContentIdentityMappings: datasourceState.externalContentIdentityMappings,
+		externalContentIdentityScopeKey: datasourceState.externalContentIdentityScopeKey,
 	}, true, nil
 }
 

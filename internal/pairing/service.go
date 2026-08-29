@@ -1,6 +1,9 @@
 package pairing
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"time"
@@ -69,10 +72,11 @@ type NearbyLinkPollResponse struct {
 
 // Service owns local pairing, refresh, and access-token verification.
 type Service struct {
-	agentID   string
-	agentName string
-	registry  *store.DeviceRegistryStore
-	tokens    *security.TokenManager
+	agentID            string
+	agentName          string
+	registry           *store.DeviceRegistryStore
+	tokens             *security.TokenManager
+	refreshRotationKey [sha256.Size]byte
 }
 
 // NewService builds the local pairing/session service.
@@ -87,10 +91,11 @@ func NewService(
 		return nil, err
 	}
 	return &Service{
-		agentID:   agentID,
-		agentName: agentName,
-		registry:  registry,
-		tokens:    tokenManager,
+		agentID:            agentID,
+		agentName:          agentName,
+		registry:           registry,
+		tokens:             tokenManager,
+		refreshRotationKey: sha256.Sum256([]byte("timich-refresh-rotation-v1\x00" + encodedSigningKey)),
 	}, nil
 }
 
@@ -246,8 +251,11 @@ func (s *Service) CreateHostedSession(deviceName string, baseURL string) (Sessio
 // RefreshSession rotates the refresh-token family and mints a fresh access token.
 func (s *Service) RefreshSession(refreshToken string, baseURL string) (SessionBundle, error) {
 	now := time.Now().UTC()
+	normalizedRefreshToken := strings.TrimSpace(refreshToken)
+	replacementRefreshToken := s.nextRefreshToken(normalizedRefreshToken)
 	device, err := s.registry.RotateRefreshToken(
-		strings.TrimSpace(refreshToken),
+		normalizedRefreshToken,
+		replacementRefreshToken,
 		now,
 		now.Add(defaultRefreshTokenTTL),
 	)
@@ -255,6 +263,12 @@ func (s *Service) RefreshSession(refreshToken string, baseURL string) (SessionBu
 		return SessionBundle{}, err
 	}
 	return s.buildSessionBundle(device, baseURL, now)
+}
+
+func (s *Service) nextRefreshToken(refreshToken string) string {
+	digest := hmac.New(sha256.New, s.refreshRotationKey[:])
+	_, _ = digest.Write([]byte(strings.TrimSpace(refreshToken)))
+	return base64.RawURLEncoding.EncodeToString(digest.Sum(nil))
 }
 
 // AuthenticateAccessToken verifies the bearer token and confirms the device still exists.

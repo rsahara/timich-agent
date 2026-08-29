@@ -87,9 +87,15 @@ func (a *AgentRuntime) schedulerWorkStateSnapshot(ctx context.Context, schedule 
 	startSeq := a.schedulerWorkStateSeq
 	a.schedulerWorkStateMu.Unlock()
 
-	recomputed, err := a.recomputeSchedulerWorkState(ctx, schedule, semanticScheduled, configHash, now)
+	recomputeCtx, release, err := a.foregroundCatalog.beginCancelableBackground(ctx)
 	if err != nil {
-		if ctx.Err() == nil {
+		return schedulerWorkState{}, false
+	}
+	recomputed, err := a.recomputeSchedulerWorkState(recomputeCtx, schedule, semanticScheduled, configHash, now)
+	recomputeCanceled := recomputeCtx.Err() != nil
+	release()
+	if err != nil {
+		if ctx.Err() == nil && !recomputeCanceled {
 			log.Printf("timich-agent scheduler work-state recompute failed error=%v", err)
 		}
 		return schedulerWorkState{}, false
@@ -191,29 +197,37 @@ func (a *AgentRuntime) populateSemanticSchedulerWorkState(ctx context.Context, c
 	if a == nil || a.semanticModels == nil || catalogService == nil || state == nil {
 		return
 	}
-	status := a.SemanticModelRegistryStatusWithContext(ctx)
+	// The scheduler derives coverage and publication decisions from the single
+	// snapshot below. Starting from the installed-only registry avoids running
+	// the same large-catalog counts while selecting a candidate first.
+	status := a.SemanticModelRegistryInstalledStatusWithContext(ctx)
+	profiles := semanticBackfillCandidateProfiles(ctx, status, a.semanticModels)
+	snapshot := loadSemanticSchedulerSnapshot(ctx, profiles, catalogService.SemanticModelBackfillSnapshot)
+	statusLookup := snapshot.backfillStatus
 	state.SemanticRuntimeRetry = semanticSchedulerRuntimeRetryNeeded(ctx, status, a.semanticModels, a.semanticONNXRuntime.Status())
-	state.SemanticNextEligibleAt = semanticSchedulerNextEligibleAt(ctx, catalogService, status, a.semanticModels)
+	state.SemanticNextEligibleAt = semanticSchedulerNextEligibleAtWithLookup(profiles, statusLookup)
 	state.SemanticMixedEmbeddingBatch = semanticMixedEmbeddingBatchForReadyRuntime(ctx, status, a.semanticModels, schedule)
-	state.SemanticPriorityPublishReady = semanticCandidateNeedingPriorityIndexPublish(ctx, catalogService, status, a.semanticModels) != nil
-	state.SemanticPublishReady = semanticCandidateNeedingIndexPublish(ctx, catalogService, status, a.semanticModels) != nil
-	if candidate, backfill := semanticCandidateNeedingMixedBackfill(ctx, catalogService, status, a.semanticModels, schedule); candidate != nil && backfill != nil {
+	state.SemanticPriorityPublishReady = semanticCandidateNeedingPriorityIndexPublishWithLookup(profiles, statusLookup) != nil
+	state.SemanticPublishReady = semanticCandidateNeedingIndexPublishWithLookup(profiles, func(profile catalog.SemanticModelProfileStatus) (bool, int, error) {
+		return snapshot.indexPublishNeed(ctx, catalogService, a.semanticModels, profile)
+	}) != nil
+	if candidate, backfill := semanticCandidateNeedingMixedBackfillWithLookup(profiles, schedule, statusLookup); candidate != nil && backfill != nil {
 		if batchSize, ok := semanticMixedIndexingBatchSizeForStatus(schedule, *backfill); ok {
 			state.SemanticMixedEmbeddingQueued = semanticIndexEmbeddingQueued(*backfill)
 			state.SemanticMixedEmbeddingBatch = batchSize
 			state.applySemanticBackfillStatus(*candidate, *backfill)
 		}
 	}
-	if candidate := semanticCandidateNeedingBackfill(ctx, catalogService, status, a.semanticModels); candidate != nil {
+	if candidate := semanticCandidateNeedingBackfillWithLookup(profiles, statusLookup); candidate != nil {
 		if schedule.TargetCompletedVectors <= 0 {
 			state.SemanticEmbeddingReady = schedule.BatchSize > 0
 			state.SemanticEmbeddingBatchSize = schedule.BatchSize
-			if backfill, err := catalogService.SemanticModelBackfillStatus(ctx, *candidate); err == nil && backfill != nil {
+			if backfill, err := statusLookup(*candidate); err == nil && backfill != nil {
 				state.applySemanticBackfillStatus(*candidate, *backfill)
 			}
 			return
 		}
-		if backfill, err := catalogService.SemanticModelBackfillStatus(ctx, *candidate); err == nil && backfill != nil {
+		if backfill, err := statusLookup(*candidate); err == nil && backfill != nil {
 			if batchSize, ok := semanticIndexingBatchSizeForStatus(schedule, backfill.CompletedVectorCount); ok {
 				state.SemanticEmbeddingReady = true
 				state.SemanticEmbeddingBatchSize = batchSize
@@ -227,15 +241,23 @@ func semanticSchedulerNextEligibleAt(ctx context.Context, catalogService *catalo
 	if catalogService == nil {
 		return nil
 	}
+	profiles := semanticBackfillCandidateProfiles(ctx, status, modelStore)
+	return semanticSchedulerNextEligibleAtWithLookup(profiles, func(profile catalog.SemanticModelProfileStatus) (*catalog.SemanticModelBackfillStatus, error) {
+		return catalogService.SemanticModelBackfillStatus(ctx, profile)
+	})
+}
+
+func semanticSchedulerNextEligibleAtWithLookup(profiles []catalog.SemanticModelProfileStatus, lookup semanticBackfillStatusLookup) *time.Time {
 	var nextEligibleAt *time.Time
-	for _, profile := range semanticBackfillCandidateProfiles(ctx, status, modelStore) {
+	for _, profile := range profiles {
 		if semanticBackfillRolePriority(profile) == 0 ||
 			profile.Runtime == nil ||
 			!profile.Runtime.Loaded ||
-			!profile.Runtime.CanEmbed {
+			!profile.Runtime.CanEmbed ||
+			lookup == nil {
 			continue
 		}
-		backfill, err := catalogService.SemanticModelBackfillStatus(ctx, profile)
+		backfill, err := lookup(profile)
 		if err != nil || backfill == nil || backfill.NextEligibleAt == nil {
 			continue
 		}

@@ -820,7 +820,9 @@ func (a *AgentRuntime) runScheduledLocalMetadataBatchWithWorkers(ctx context.Con
 	activeWorkers := localActiveWorkersForBatch(workers, batchSize, localMetadataJobsPerWorker)
 	log.Printf("timich-agent local metadata batch starting reason=%s planned=%d batch_size=%d workers=%d", reason, planned, batchSize, activeWorkers)
 	a.rememberDatasourceTaskActivitySnapshot(catalogService, "metadata", activeWorkers)
-	result, err := catalogService.RunLocalMetadataBatchWithWorkers(ctx, batchSize, activeWorkers)
+	result, err := catalogService.RunLocalMetadataBatchWithOptions(ctx, batchSize, activeWorkers, catalog.LocalBackgroundBatchOptions{
+		BeforeJob: a.foregroundCatalog.waitUntilIdle,
+	})
 	a.rememberDatasourceTaskActivitySnapshot(catalogService, "metadata", 0)
 	if err != nil {
 		if result.ProcessedJobs > 0 {
@@ -882,7 +884,9 @@ func (a *AgentRuntime) runScheduledLocalThumbnailBatchWithWorkers(ctx context.Co
 	activeWorkers := localActiveWorkersForBatch(workers, batchSize, localThumbnailJobsPerWorker)
 	log.Printf("timich-agent local thumbnail batch starting reason=%s planned=%d batch_size=%d workers=%d", reason, planned, batchSize, activeWorkers)
 	a.rememberDatasourceTaskActivitySnapshot(catalogService, "thumbnails", activeWorkers)
-	result, err := catalogService.RunLocalThumbnailBatchWithWorkers(ctx, batchSize, activeWorkers)
+	result, err := catalogService.RunLocalThumbnailBatchWithOptions(ctx, batchSize, activeWorkers, catalog.LocalBackgroundBatchOptions{
+		BeforeJob: a.foregroundCatalog.waitUntilIdle,
+	})
 	a.rememberDatasourceTaskActivitySnapshot(catalogService, "thumbnails", 0)
 	if err != nil {
 		if result.ProcessedJobs > 0 {

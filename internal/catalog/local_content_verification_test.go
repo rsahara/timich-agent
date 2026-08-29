@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -163,6 +164,156 @@ func TestLocalContentVerificationSelectsOldestLocationFirst(t *testing.T) {
 	}
 	if newerAfter != newerAt {
 		t.Fatalf("newer content_verified_at = %q, want unchanged %q", newerAfter, newerAt)
+	}
+}
+
+func TestLocalContentVerificationCancellationRestoresAttemptForQuietRetry(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	mediaPath := filepath.Join(rootPath, "family.jpg")
+	if err := os.WriteFile(mediaPath, []byte("original-photo"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	service := newLocalPhase0TestService(t, rootPath)
+	if _, err := service.RunLocalReconciliationScan(context.Background(), "1111111111111111"); err != nil {
+		t.Fatalf("RunLocalReconciliationScan() error = %v", err)
+	}
+	if result, err := service.RunLocalMetadataBatch(context.Background(), 10); err != nil || result.RegisteredAssets != 1 {
+		t.Fatalf("RunLocalMetadataBatch() result=%+v error=%v, want one registered asset", result, err)
+	}
+	previousAttempt := formatCatalogTime(time.Now().UTC().Add(-7 * 24 * time.Hour))
+	if _, err := service.catalog.db.Exec(`UPDATE local_asset_locations
+		SET content_verified_at = ?,
+			content_verification_attempted_at = ?,
+			content_verification_error = NULL
+		WHERE relative_path = 'family.jpg'`, previousAttempt, previousAttempt); err != nil {
+		t.Fatalf("age content verification state: %v", err)
+	}
+	startLocalContentVerificationTestWindow(t, service, time.Minute)
+
+	hashStarted := make(chan struct{})
+	service.localContentVerificationHash = func(ctx context.Context, file *os.File) (string, int64, os.FileInfo, error) {
+		info, statErr := file.Stat()
+		if statErr != nil {
+			return "", 0, nil, statErr
+		}
+		close(hashStarted)
+		<-ctx.Done()
+		return "", 0, info, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	type verificationRun struct {
+		result LocalContentVerificationResult
+		err    error
+	}
+	finished := make(chan verificationRun, 1)
+	go func() {
+		result, err := service.RunLocalContentVerification(ctx, "1111111111111111")
+		finished <- verificationRun{result: result, err: err}
+	}()
+	select {
+	case <-hashStarted:
+	case <-time.After(time.Second):
+		t.Fatal("content verification hash did not start")
+	}
+	cancel()
+	var canceledRun verificationRun
+	select {
+	case canceledRun = <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("canceled content verification did not return")
+	}
+	if !errors.Is(canceledRun.err, context.Canceled) {
+		t.Fatalf("RunLocalContentVerification(canceled) error = %v, want context canceled", canceledRun.err)
+	}
+	if canceledRun.result.WindowComplete || canceledRun.result.FailedFiles != 0 {
+		t.Fatalf("canceled content verification result = %+v, want open window without failure", canceledRun.result)
+	}
+	var attemptedAt string
+	var verificationError sql.NullString
+	if err := service.catalog.db.QueryRow(`SELECT content_verification_attempted_at, content_verification_error
+		FROM local_asset_locations WHERE relative_path = 'family.jpg'`).Scan(&attemptedAt, &verificationError); err != nil {
+		t.Fatalf("read restored content verification state: %v", err)
+	}
+	if attemptedAt != previousAttempt || verificationError.Valid {
+		t.Fatalf("restored verification state = attempted %q error %+v, want attempted %q and no error", attemptedAt, verificationError, previousAttempt)
+	}
+	runnable, err := service.LocalContentVerificationRunnableSourceKeys(context.Background(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("LocalContentVerificationRunnableSourceKeys() error = %v", err)
+	}
+	if len(runnable) != 1 || runnable[0] != "1111111111111111" {
+		t.Fatalf("runnable source keys after cancellation = %#v, want same open window", runnable)
+	}
+
+	service.localContentVerificationHash = nil
+	retry, err := service.RunLocalContentVerification(context.Background(), "1111111111111111")
+	if err != nil {
+		t.Fatalf("RunLocalContentVerification(retry) error = %v", err)
+	}
+	if retry.ProcessedFiles != 1 || retry.VerifiedFiles != 1 || retry.FailedFiles != 0 || !retry.WindowComplete {
+		t.Fatalf("content verification retry = %+v, want successful quiet retry", retry)
+	}
+}
+
+func TestLocalContentVerificationCancellationAfterHashSettlesResultAndKeepsWindowOpen(t *testing.T) {
+	t.Parallel()
+
+	rootPath := t.TempDir()
+	mediaPath := filepath.Join(rootPath, "family.jpg")
+	if err := os.WriteFile(mediaPath, []byte("original-photo"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	service := newLocalPhase0TestService(t, rootPath)
+	if _, err := service.RunLocalReconciliationScan(context.Background(), "1111111111111111"); err != nil {
+		t.Fatalf("RunLocalReconciliationScan() error = %v", err)
+	}
+	if result, err := service.RunLocalMetadataBatch(context.Background(), 10); err != nil || result.RegisteredAssets != 1 {
+		t.Fatalf("RunLocalMetadataBatch() result=%+v error=%v, want one registered asset", result, err)
+	}
+	previousVerified := formatCatalogTime(time.Now().UTC().Add(-7 * 24 * time.Hour))
+	if _, err := service.catalog.db.Exec(`UPDATE local_asset_locations
+		SET content_verified_at = ?, content_verification_attempted_at = ?
+		WHERE relative_path = 'family.jpg'`, previousVerified, previousVerified); err != nil {
+		t.Fatalf("age content verification state: %v", err)
+	}
+	startLocalContentVerificationTestWindow(t, service, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	service.localContentVerificationHash = func(_ context.Context, file *os.File) (string, int64, os.FileInfo, error) {
+		sha1Hex, readBytes, info, err := sha1OpenFile(context.Background(), file)
+		cancel()
+		return sha1Hex, readBytes, info, err
+	}
+	result, err := service.RunLocalContentVerification(ctx, "1111111111111111")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunLocalContentVerification() error = %v, want context canceled after hash", err)
+	}
+	if result.ProcessedFiles != 1 || result.VerifiedFiles != 1 || result.FailedFiles != 0 || result.WindowComplete {
+		t.Fatalf("canceled post-hash result = %+v, want settled file and open window", result)
+	}
+	var verifiedAt string
+	var verificationError sql.NullString
+	if err := service.catalog.db.QueryRow(`SELECT content_verified_at, content_verification_error
+		FROM local_asset_locations WHERE relative_path = 'family.jpg'`).Scan(&verifiedAt, &verificationError); err != nil {
+		t.Fatalf("read settled content verification state: %v", err)
+	}
+	if verifiedAt == previousVerified || verificationError.Valid {
+		t.Fatalf("settled verification state = verified %q error %+v, want refreshed success", verifiedAt, verificationError)
+	}
+	window := readLocalContentVerificationWindowStateForTest(t, service)
+	if window.Status != LocalContentVerificationStatusRunning || window.Processed != 1 || window.Verified != 1 || window.Failed != 0 {
+		t.Fatalf("window after post-hash cancellation = %+v, want one persisted success and open window", window)
+	}
+
+	service.localContentVerificationHash = nil
+	retry, err := service.RunLocalContentVerification(context.Background(), "1111111111111111")
+	if err != nil {
+		t.Fatalf("RunLocalContentVerification(quiet retry) error = %v", err)
+	}
+	if retry.ProcessedFiles != 0 || !retry.WindowComplete {
+		t.Fatalf("quiet retry result = %+v, want completed window without rehash", retry)
 	}
 }
 

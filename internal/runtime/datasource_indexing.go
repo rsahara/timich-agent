@@ -27,7 +27,8 @@ const (
 	datasourceIndexingSnapshotTimeout     = 2 * time.Minute
 	datasourceIndexingSnapshotSaveTimeout = 500 * time.Millisecond
 	datasourceIndexingSnapshotStaleAfter  = datasourceIndexingSnapshotTimeout + 5*time.Second
-	datasourceIndexingAdminActiveWindow   = 30 * time.Minute
+	datasourceIndexingReconcileFirstDelay = time.Minute
+	datasourceIndexingReconcileInterval   = 30 * time.Minute
 	assetProcessingStatsRefreshMinAge     = 15 * time.Second
 	assetProcessingStatsRefreshTimeout    = 90 * time.Second
 	datasourceTaskNoteMediaDiscovery      = "Quick discovery finds ordinary additions, removals, and moves. Reconciliation inspects every supported file daily at 04:00 in the Agent timezone; Run reconciliation now starts it manually."
@@ -210,14 +211,11 @@ type DatasourceIndexingRunResult struct {
 }
 
 // DatasourceIndexingStatus returns the Admin UI read model for datasource work.
-// It never waits for expensive live catalog aggregation. If no snapshot exists
-// yet, it returns a lightweight config/active-worker view and starts a best
-// effort refresh in the background.
+// It never waits for or starts expensive live catalog aggregation. If no
+// snapshot exists yet, it returns a lightweight config/active-worker view.
 func (a *AgentRuntime) DatasourceIndexingStatus(ctx context.Context) (DatasourceIndexingResponse, error) {
-	a.markDatasourceIndexingAdminAccess(time.Now().UTC())
 	catalogService := a.catalogService()
 	if snapshot, ok := a.datasourceIndexingSnapshot(ctx, catalogService); ok {
-		a.scheduleDatasourceIndexingSnapshotRefresh(catalogService)
 		return snapshot, nil
 	}
 	response := a.emptyDatasourceIndexingResponse()
@@ -227,12 +225,12 @@ func (a *AgentRuntime) DatasourceIndexingStatus(ctx context.Context) (Datasource
 		response.StatusSnapshotAt = timePtr(stats.RefreshedAt)
 		response.StatusSnapshotUsed = true
 	}
-	a.scheduleDatasourceIndexingSnapshotRefresh(catalogService)
 	return response, nil
 }
 
-// StartDatasourceIndexingStatusRefresh warms the Admin datasource task read model
-// while an Admin client has recently requested datasource status.
+// StartDatasourceIndexingStatusRefresh starts a low-priority repair loop for
+// the Admin read model. Admin requests never activate this work; reconciliation
+// runs only after background queues drain and yields to foreground catalog use.
 func (a *AgentRuntime) StartDatasourceIndexingStatusRefresh() {
 	if a == nil {
 		return
@@ -261,17 +259,13 @@ func (a *AgentRuntime) stopDatasourceIndexingStatusRefresh() {
 
 func (a *AgentRuntime) runDatasourceIndexingStatusRefreshLoop(ctx context.Context) {
 	defer a.datasourceStatusWG.Done()
+	interval := datasourceIndexingReconcileFirstDelay
 	for {
-		if !a.datasourceIndexingAdminActive(time.Now().UTC()) {
-			if !sleepDatasourceIndexingRefreshLoop(ctx, assetProcessingStatsRefreshMinAge) {
-				return
-			}
-			continue
-		}
-		a.runDatasourceIndexingSnapshotRefresh(a.catalogService(), assetProcessingStatsRefreshMinAge)
-		if !sleepDatasourceIndexingRefreshLoop(ctx, assetProcessingStatsRefreshMinAge) {
+		if !sleepDatasourceIndexingRefreshLoop(ctx, interval) {
 			return
 		}
+		a.runDatasourceIndexingSnapshotRefresh(a.catalogService(), datasourceIndexingReconcileInterval)
+		interval = datasourceIndexingReconcileInterval
 	}
 }
 
@@ -289,36 +283,11 @@ func sleepDatasourceIndexingRefreshLoop(ctx context.Context, interval time.Durat
 	}
 }
 
-func (a *AgentRuntime) markDatasourceIndexingAdminAccess(now time.Time) {
-	if a == nil {
-		return
-	}
-	if now.IsZero() {
-		now = time.Now().UTC()
-	}
-	a.datasourceTaskMu.Lock()
-	a.datasourceStatusLastAdminAccess = now.UTC()
-	a.datasourceTaskMu.Unlock()
-}
-
-func (a *AgentRuntime) datasourceIndexingAdminActive(now time.Time) bool {
-	if a == nil {
-		return false
-	}
-	if now.IsZero() {
-		now = time.Now().UTC()
-	}
-	a.datasourceTaskMu.Lock()
-	lastAccess := a.datasourceStatusLastAdminAccess
-	a.datasourceTaskMu.Unlock()
-	return !lastAccess.IsZero() && now.Sub(lastAccess) <= datasourceIndexingAdminActiveWindow
-}
-
-// RefreshDatasourceIndexingStatus runs a live datasource status refresh and
-// stores the result for subsequent UI reads.
+// RefreshDatasourceIndexingStatus returns the latest read model without making
+// an Admin action responsible for a large catalog scan. The refresh query flag
+// now means "read the latest snapshot" rather than "recount the catalog".
 func (a *AgentRuntime) RefreshDatasourceIndexingStatus(ctx context.Context) (DatasourceIndexingResponse, error) {
-	a.markDatasourceIndexingAdminAccess(time.Now().UTC())
-	return a.refreshDatasourceIndexingSnapshot(ctx, a.catalogService())
+	return a.DatasourceIndexingStatus(ctx)
 }
 
 // CachedDatasourceIndexingStatus returns the last successful Admin datasource
@@ -488,20 +457,28 @@ func (a *AgentRuntime) refreshDatasourceIndexingSnapshot(ctx context.Context, ca
 	return response, nil
 }
 
-func (a *AgentRuntime) scheduleDatasourceIndexingSnapshotRefresh(catalogService *catalog.Service) {
-	if a == nil || catalogService == nil {
-		return
-	}
-	if !a.datasourceIndexingAdminActive(time.Now().UTC()) {
-		return
-	}
-	go a.runDatasourceIndexingSnapshotRefresh(catalogService, assetProcessingStatsRefreshMinAge)
-}
-
 func (a *AgentRuntime) runDatasourceIndexingSnapshotRefresh(catalogService *catalog.Service, minInterval time.Duration) {
 	if a == nil || catalogService == nil {
 		return
 	}
+	if !a.datasourceIndexingReconciliationReady() {
+		return
+	}
+	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), datasourceIndexingSnapshotTimeout)
+	defer timeoutCancel()
+	ctx, release, err := a.foregroundCatalog.beginCancelableBackground(timeoutCtx)
+	if err != nil {
+		return
+	}
+	defer release()
+	if !a.mirrorSyncMu.TryLock() {
+		return
+	}
+	defer a.mirrorSyncMu.Unlock()
+	if !a.datasourceIndexingReconciliationReady() {
+		return
+	}
+
 	a.datasourceTaskMu.Lock()
 	if a.datasourceSnapshotBusy {
 		if a.datasourceSnapshotStarted.IsZero() || time.Since(a.datasourceSnapshotStarted) < datasourceIndexingSnapshotStaleAfter {
@@ -526,16 +503,75 @@ func (a *AgentRuntime) runDatasourceIndexingSnapshotRefresh(catalogService *cata
 		a.datasourceSnapshotFinished = time.Now().UTC()
 		a.datasourceTaskMu.Unlock()
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), datasourceIndexingSnapshotTimeout)
-	defer cancel()
-	if stats, err := a.refreshAssetProcessingStatsReadModel(ctx, catalogService); err != nil {
-		log.Printf("timich-agent datasource task stats refresh failed error=%v", err)
+	if stats, refreshErr := a.refreshAssetProcessingStatsReadModel(ctx, catalogService); refreshErr != nil {
+		if ctx.Err() == nil {
+			log.Printf("timich-agent datasource task stats refresh failed error=%v", refreshErr)
+		}
 	} else {
 		a.rememberDatasourceTaskStatsSnapshot(context.Background(), catalogService, stats)
 	}
-	if _, err := a.refreshDatasourceIndexingSnapshot(ctx, catalogService); err != nil && !datasourceIndexingSnapshotFallbackAllowed(err) {
-		log.Printf("timich-agent datasource indexing snapshot refresh failed error=%v", err)
+	if _, refreshErr := a.refreshDatasourceIndexingSnapshot(ctx, catalogService); refreshErr != nil && !datasourceIndexingSnapshotFallbackAllowed(refreshErr) {
+		log.Printf("timich-agent datasource indexing snapshot refresh failed error=%v", refreshErr)
 	}
+}
+
+// datasourceIndexingReconciliationReady keeps exact Admin-only recounts out of
+// the same window as ingestion/indexing. A configured background scheduler
+// must provide a fresh cache; remote-only configurations without schedulable
+// local or semantic work do not need one.
+func (a *AgentRuntime) datasourceIndexingReconciliationReady() bool {
+	if a == nil || a.datasourceDiscoveryActiveCount() > 0 || a.datasourceMirrorSyncActive.Load() > 0 {
+		return false
+	}
+	if active, _ := a.backgroundWorkerActiveState(); active > 0 {
+		return false
+	}
+	if len(a.datasourceTaskActiveSnapshot()) > 0 {
+		return false
+	}
+	a.mu.RLock()
+	summaries := a.datasourceSummariesLocked()
+	a.mu.RUnlock()
+	if len(summaries) == 0 || datasourceSummariesArePassthroughOnly(summaries) {
+		return false
+	}
+	schedule, semanticScheduled := a.semanticIndexingSchedule()
+	state, ok := a.cachedSchedulerWorkStateForDisplay(semanticSingleWorkerSchedule(schedule), semanticScheduled)
+	if !ok {
+		return !a.datasourceIndexingReconciliationRequiresSchedulerState()
+	}
+	return state.MetadataQueued == 0 &&
+		state.MetadataSettling == 0 &&
+		state.ThumbnailQueued == 0 &&
+		!state.ContentVerificationReady &&
+		!state.SemanticRuntimeRetry &&
+		!state.SemanticPriorityPublishReady &&
+		!state.SemanticPublishReady &&
+		!state.SemanticEmbeddingReady &&
+		state.SemanticMixedEmbeddingQueued == 0 &&
+		state.SemanticMixedEmbeddingHint == 0 &&
+		state.SemanticPendingIndexJobs == 0 &&
+		state.SemanticEligibleIndexJobs == 0
+}
+
+func (a *AgentRuntime) datasourceIndexingReconciliationRequiresSchedulerState() bool {
+	if a == nil {
+		return true
+	}
+	if _, ok := a.localDatasourceScanSchedule(); ok {
+		return true
+	}
+	if _, ok := a.semanticIndexingSchedule(); ok {
+		return true
+	}
+	catalogService := a.catalogService()
+	if catalogService == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), localWorkerCountTimeout)
+	defer cancel()
+	pending, err := catalogService.PendingSemanticIndexJobs(ctx)
+	return err != nil || pending
 }
 
 func (a *AgentRuntime) datasourceIndexingSnapshot(ctx context.Context, catalogService *catalog.Service) (DatasourceIndexingResponse, bool) {
@@ -608,6 +644,16 @@ func (a *AgentRuntime) datasourceIndexingSnapshot(ctx context.Context, catalogSe
 }
 
 func (a *AgentRuntime) normalizeDatasourceIndexingSnapshot(response DatasourceIndexingResponse) DatasourceIndexingResponse {
+	response.Tasks = append([]DatasourceTaskStatus(nil), response.Tasks...)
+	response.Datasources = append([]DatasourceIndexingStatus(nil), response.Datasources...)
+	semanticScheduled := false
+	schedule, scheduleOK := a.semanticIndexingSchedule()
+	if scheduleOK && schedule.Workers > 0 {
+		semanticScheduled = true
+	}
+	if state, ok := a.cachedSchedulerWorkStateForDisplay(semanticSingleWorkerSchedule(schedule), semanticScheduled); ok {
+		applySchedulerWorkStateToDatasourceTasks(response.Tasks, state)
+	}
 	response.Tasks = preferSearchIndexQueuedTargetWait(response.Tasks)
 	response.Tasks = normalizeDatasourceTaskWorkerState(response.Tasks, a.effectiveHeavyTaskWorkers())
 	a.applyDatasourceTaskActiveSnapshot(response.Tasks)
@@ -1243,6 +1289,18 @@ func (a *AgentRuntime) rememberDatasourceDiscoveryTaskSnapshot(catalogService *c
 	if len(response.Tasks) == 0 {
 		response.Tasks = a.datasourceTaskStatuses(context.Background(), response.Datasources)
 	}
+	for _, result := range scanResults {
+		for index := range response.Datasources {
+			if response.Datasources[index].SourceKey != strings.TrimSpace(result.SourceKey) {
+				continue
+			}
+			response.Datasources[index].applyLocalPhase0ScanResult(result)
+			break
+		}
+	}
+	if len(scanResults) > 0 {
+		response.Tasks = a.datasourceTaskStatuses(context.Background(), response.Datasources)
+	}
 	lastQuickScanAt := localPhase0ScanModeCompletedAt(scanResults, datasourceLocalScanModeQuick)
 	lastReconciliationAt := localPhase0ScanModeCompletedAt(scanResults, datasourceLocalScanModeReconciliation)
 	found := false
@@ -1289,6 +1347,33 @@ func (a *AgentRuntime) rememberDatasourceDiscoveryTaskSnapshot(catalogService *c
 		response.Tasks = append(response.Tasks, task)
 	}
 	a.rememberDatasourceTaskReadModel(catalogService, response)
+}
+
+func (s *DatasourceIndexingStatus) applyLocalPhase0ScanResult(result catalog.LocalPhase0ScanResult) {
+	if s == nil {
+		return
+	}
+	s.Status = strings.TrimSpace(result.Status)
+	if s.Status == "completed" || s.Status == "" {
+		s.Status = "ready"
+	}
+	if rootKey := strings.TrimSpace(result.RootKey); rootKey != "" {
+		s.RootKey = rootKey
+	}
+	s.DiscoveredLocations = max(s.DiscoveredLocations, result.DiscoveredPaths)
+	s.MissingLocations = max(s.MissingLocations, result.MissingPaths)
+	s.SettlingMetadataJobs += max(result.QueuedMetadata, 0)
+	s.LastRunStatus = result.Status
+	if !result.CompletedAt.IsZero() {
+		s.LastRunAt = timePtr(result.CompletedAt.UTC())
+		switch result.ScanMode {
+		case datasourceLocalScanModeQuick:
+			s.LastQuickScanAt = timePtr(result.CompletedAt.UTC())
+		case datasourceLocalScanModeReconciliation:
+			s.LastReconciliationAt = timePtr(result.CompletedAt.UTC())
+		}
+	}
+	s.LastError = strings.TrimSpace(result.LastError)
 }
 
 func (a *AgentRuntime) rememberDatasourceTaskActivitySnapshot(catalogService *catalog.Service, phase string, active int) {
@@ -2328,8 +2413,41 @@ func (a *AgentRuntime) syncDatasourceIndexing(ctx context.Context, sourceKey str
 	if err != nil {
 		return catalog.MirrorSyncResult{}, err
 	}
+	a.rememberRemoteDatasourceSyncSnapshot(catalogService, sourceKey, result)
 	a.notifyDatasourceMirrorSyncCompleted()
 	return result, nil
+}
+
+func (a *AgentRuntime) rememberRemoteDatasourceSyncSnapshot(catalogService *catalog.Service, sourceKey string, result catalog.MirrorSyncResult) {
+	if a == nil {
+		return
+	}
+	response, ok := a.datasourceIndexingSnapshot(context.Background(), catalogService)
+	if !ok {
+		response = a.emptyDatasourceIndexingResponse()
+	}
+	for index := range response.Datasources {
+		if response.Datasources[index].SourceKey != strings.TrimSpace(sourceKey) {
+			continue
+		}
+		response.Datasources[index].applyRemoteStatus(result.Mirror)
+		response.Datasources[index].LastRunStatus = result.Status
+		if !result.CompletedAt.IsZero() {
+			response.Datasources[index].LastRunAt = timePtr(result.CompletedAt.UTC())
+			switch strings.TrimSpace(result.Mode) {
+			case catalog.MirrorSyncModeFull:
+				response.Datasources[index].LastFullSyncAt = timePtr(result.CompletedAt.UTC())
+			default:
+				response.Datasources[index].LastIncrementalSyncAt = timePtr(result.CompletedAt.UTC())
+			}
+		}
+		response.Datasources[index].LastError = strings.TrimSpace(result.Error)
+		break
+	}
+	response.StatusSnapshotUsed = false
+	response.StatusSnapshotAt = nil
+	response.Tasks = a.datasourceTaskStatuses(context.Background(), response.Datasources)
+	a.rememberDatasourceTaskReadModel(catalogService, response)
 }
 
 func datasourceIndexingRunResultFromRemote(sourceKey string, result catalog.MirrorSyncResult) DatasourceIndexingRunResult {

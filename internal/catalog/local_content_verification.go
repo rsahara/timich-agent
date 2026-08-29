@@ -37,17 +37,19 @@ type LocalContentVerificationResult struct {
 }
 
 type localContentVerificationCandidate struct {
-	ID             int64
-	SourceKey      string
-	RootKey        string
-	RootGeneration int64
-	RelativePath   string
-	Status         string
-	SizeBytes      int64
-	MTime          string
-	FastSignature  string
-	FileIdentity   string
-	SHA1Hex        string
+	ID                int64
+	SourceKey         string
+	RootKey           string
+	RootGeneration    int64
+	RelativePath      string
+	Status            string
+	SizeBytes         int64
+	MTime             string
+	FastSignature     string
+	FileIdentity      string
+	SHA1Hex           string
+	AttemptedAt       sql.NullString
+	VerificationError sql.NullString
 }
 
 type localContentVerificationOutcome struct {
@@ -348,10 +350,18 @@ func (s *Service) RunLocalContentVerification(ctx context.Context, sourceKey str
 			result.FailedFiles++
 		}
 	}
-	if ctx.Err() != nil {
-		return result, ctx.Err()
-	}
 	result.CompletedAt = time.Now().UTC()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if outcome.found {
+			finishCtx, finishCancel := context.WithTimeout(context.Background(), localPhase0FinishTimeout)
+			progressErr := s.recordLocalContentVerificationProgress(finishCtx, sourceKey, window, result)
+			finishCancel()
+			if progressErr != nil {
+				return result, errors.Join(ctxErr, progressErr)
+			}
+		}
+		return result, ctxErr
+	}
 	if err := s.recordLocalContentVerificationProgress(ctx, sourceKey, window, result); err != nil {
 		return result, err
 	}
@@ -526,7 +536,14 @@ func (s *Service) verifyNextLocalContent(ctx context.Context, sourceKey string, 
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			nowText := formatCatalogTime(time.Now().UTC())
-			if markErr := s.markLocalLocationMissing(ctx, candidate.ID, nowText, "content_verification_absent"); markErr != nil {
+			if markErr := s.markLocalLocationMissing(
+				ctx,
+				trustedRoot.externalContentIdentityMappings,
+				trustedRoot.externalContentIdentityScopeKey,
+				candidate.ID,
+				nowText,
+				"content_verification_absent",
+			); markErr != nil {
 				return outcome, markErr
 			}
 			outcome.changed = true
@@ -551,7 +568,7 @@ func (s *Service) verifyNextLocalContent(ctx context.Context, sourceKey string, 
 		FileIdentity:  candidate.FileIdentity,
 	}
 	if !localLocationMatchesFileInfo(location, info) {
-		if err := s.resettleLocalLocationAfterContentVerification(ctx, candidate, info, "content_verification_stat_changed"); err != nil {
+		if err := s.resettleLocalLocationAfterContentVerification(ctx, trustedRoot, candidate, info, "content_verification_stat_changed"); err != nil {
 			return outcome, err
 		}
 		outcome.changed = true
@@ -559,7 +576,7 @@ func (s *Service) verifyNextLocalContent(ctx context.Context, sourceKey string, 
 	}
 
 	attemptCtx, attemptCancel := context.WithTimeout(context.Background(), localPhase0FinishTimeout)
-	err = s.recordLocalContentVerificationAttempt(attemptCtx, candidate)
+	attemptedAt, err := s.recordLocalContentVerificationAttempt(attemptCtx, candidate)
 	attemptCancel()
 	if err != nil {
 		return outcome, err
@@ -573,11 +590,10 @@ func (s *Service) verifyNextLocalContent(ctx context.Context, sourceKey string, 
 	if err != nil {
 		if ctx.Err() != nil {
 			finishCtx, finishCancel := context.WithTimeout(context.Background(), localPhase0FinishTimeout)
-			recordErr := s.recordLocalContentVerificationFailure(finishCtx, candidate, ctx.Err())
+			restoreErr := s.restoreLocalContentVerificationAttempt(finishCtx, candidate, attemptedAt)
 			finishCancel()
-			outcome.failed = true
-			if recordErr != nil {
-				return outcome, errors.Join(ctx.Err(), recordErr)
+			if restoreErr != nil {
+				return outcome, errors.Join(ctx.Err(), restoreErr)
 			}
 			return outcome, ctx.Err()
 		}
@@ -587,8 +603,10 @@ func (s *Service) verifyNextLocalContent(ctx context.Context, sourceKey string, 
 		outcome.failed = true
 		return outcome, nil
 	}
+	finishCtx, finishCancel := context.WithTimeout(context.Background(), localPhase0FinishTimeout)
+	defer finishCancel()
 	if readBytes != info.Size() || !localFileInfoUnchanged(info, infoAfter) {
-		if err := s.resettleLocalLocationAfterContentVerification(ctx, candidate, infoAfter, "content_verification_source_changed"); err != nil {
+		if err := s.resettleLocalLocationAfterContentVerification(finishCtx, trustedRoot, candidate, infoAfter, "content_verification_source_changed"); err != nil {
 			return outcome, err
 		}
 		outcome.changed = true
@@ -596,7 +614,7 @@ func (s *Service) verifyNextLocalContent(ctx context.Context, sourceKey string, 
 	}
 	pathFile, pathInfo, pathnameMatches, err := reopenPinnedLocalRootFileAndMatch(trustedRoot.handle, candidate.RelativePath, infoAfter)
 	if err != nil {
-		if recordErr := s.recordLocalContentVerificationFailure(ctx, candidate, err); recordErr != nil {
+		if recordErr := s.recordLocalContentVerificationFailure(finishCtx, candidate, err); recordErr != nil {
 			return outcome, errors.Join(err, recordErr)
 		}
 		outcome.failed = true
@@ -604,20 +622,20 @@ func (s *Service) verifyNextLocalContent(ctx context.Context, sourceKey string, 
 	}
 	_ = pathFile.Close()
 	if !pathnameMatches {
-		if err := s.resettleLocalLocationAfterContentVerification(ctx, candidate, pathInfo, "content_verification_path_replaced"); err != nil {
+		if err := s.resettleLocalLocationAfterContentVerification(finishCtx, trustedRoot, candidate, pathInfo, "content_verification_path_replaced"); err != nil {
 			return outcome, err
 		}
 		outcome.changed = true
 		return outcome, nil
 	}
 	if !strings.EqualFold(actualSHA1, candidate.SHA1Hex) {
-		if err := s.resettleLocalLocationAfterContentVerification(ctx, candidate, infoAfter, "content_hash_changed"); err != nil {
+		if err := s.resettleLocalLocationAfterContentVerification(finishCtx, trustedRoot, candidate, infoAfter, "content_hash_changed"); err != nil {
 			return outcome, err
 		}
 		outcome.changed = true
 		return outcome, nil
 	}
-	updated, err := s.recordLocalContentVerificationSuccess(ctx, candidate)
+	updated, err := s.recordLocalContentVerificationSuccess(finishCtx, candidate)
 	if err != nil {
 		return outcome, err
 	}
@@ -630,7 +648,8 @@ func (s *Service) nextLocalContentVerificationCandidate(ctx context.Context, sou
 	var candidate localContentVerificationCandidate
 	err := s.catalog.queryDB().QueryRowContext(ctx, `SELECT l.id, l.source_key, l.root_key,
 			rs.root_generation, l.relative_path, l.status, l.size_bytes, l.mtime,
-			l.fast_signature, l.file_identity, l.sha1_hex
+			l.fast_signature, l.file_identity, l.sha1_hex,
+			l.content_verification_attempted_at, l.content_verification_error
 		FROM local_asset_locations l INDEXED BY idx_local_asset_locations_content_verification
 		JOIN local_scan_root_state rs
 			ON rs.source_key = l.source_key
@@ -665,6 +684,8 @@ func (s *Service) nextLocalContentVerificationCandidate(ctx context.Context, sou
 		&candidate.FastSignature,
 		&candidate.FileIdentity,
 		&candidate.SHA1Hex,
+		&candidate.AttemptedAt,
+		&candidate.VerificationError,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return localContentVerificationCandidate{}, false, nil
@@ -675,7 +696,7 @@ func (s *Service) nextLocalContentVerificationCandidate(ctx context.Context, sou
 	return candidate, true, nil
 }
 
-func (s *Service) recordLocalContentVerificationAttempt(ctx context.Context, candidate localContentVerificationCandidate) error {
+func (s *Service) recordLocalContentVerificationAttempt(ctx context.Context, candidate localContentVerificationCandidate) (string, error) {
 	nowText := formatCatalogTime(time.Now().UTC())
 	result, err := s.catalog.db.ExecContext(ctx, `UPDATE local_asset_locations
 		SET content_verification_attempted_at = ?,
@@ -709,14 +730,46 @@ func (s *Service) recordLocalContentVerificationAttempt(ctx context.Context, can
 		candidate.RootGeneration,
 	)
 	if err != nil {
-		return fmt.Errorf("record local content verification attempt: %w", err)
+		return "", fmt.Errorf("record local content verification attempt: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("read local content verification attempt rows: %w", err)
+		return "", fmt.Errorf("read local content verification attempt rows: %w", err)
 	}
 	if affected == 0 {
-		return ErrLocalMediaRootNotTrusted
+		return "", ErrLocalMediaRootNotTrusted
+	}
+	return nowText, nil
+}
+
+func (s *Service) restoreLocalContentVerificationAttempt(ctx context.Context, candidate localContentVerificationCandidate, attemptedAt string) error {
+	var previousAttemptedAt any
+	if candidate.AttemptedAt.Valid {
+		previousAttemptedAt = candidate.AttemptedAt.String
+	}
+	var previousError any
+	if candidate.VerificationError.Valid {
+		previousError = candidate.VerificationError.String
+	}
+	_, err := s.catalog.db.ExecContext(ctx, `UPDATE local_asset_locations
+		SET content_verification_attempted_at = ?,
+			content_verification_error = ?
+		WHERE id = ?
+			AND source_key = ?
+			AND root_key = ?
+			AND status = 'active'
+			AND sha1_hex = ?
+			AND content_verification_attempted_at = ?`,
+		previousAttemptedAt,
+		previousError,
+		candidate.ID,
+		candidate.SourceKey,
+		candidate.RootKey,
+		candidate.SHA1Hex,
+		attemptedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("restore canceled local content verification attempt: %w", err)
 	}
 	return nil
 }
@@ -793,20 +846,19 @@ func (s *Service) recordLocalContentVerificationFailure(ctx context.Context, can
 	return nil
 }
 
-func (s *Service) resettleLocalLocationAfterContentVerification(ctx context.Context, candidate localContentVerificationCandidate, info os.FileInfo, reason string) error {
+func (s *Service) resettleLocalLocationAfterContentVerification(ctx context.Context, trustedRoot *trustedLocalMediaRoot, candidate localContentVerificationCandidate, info os.FileInfo, reason string) error {
 	if info == nil || !info.Mode().IsRegular() {
 		return fmt.Errorf("resettle content verification source: path is not a regular file")
 	}
-	datasource, root, err := s.localDatasourceAndRoot(candidate.SourceKey)
-	if err != nil {
-		return err
+	if trustedRoot == nil || trustedRoot.datasource.SourceKey != candidate.SourceKey || trustedRoot.root.Key != candidate.RootKey {
+		return ErrLocalMediaRootNotTrusted
 	}
 	now := time.Now().UTC()
 	nowText := formatCatalogTime(now)
 	mtimeText := formatCatalogTime(info.ModTime().UTC())
 	fastSignature := fmt.Sprintf("%d:%s", info.Size(), mtimeText)
 	fileIdentity := localFileIdentity(info)
-	notBeforeText := formatCatalogTime(now.Add(localDatasourceSettlingDuration(*datasource)))
+	notBeforeText := formatCatalogTime(now.Add(localDatasourceSettlingDuration(trustedRoot.datasource)))
 	tx, err := s.catalog.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin local content verification resettle: %w", err)
@@ -871,12 +923,26 @@ func (s *Service) resettleLocalLocationAfterContentVerification(ctx context.Cont
 	}
 	scanner := localPhase0Scanner{
 		service:        s,
-		datasource:     *datasource,
-		root:           *root,
+		datasource:     trustedRoot.datasource,
+		root:           trustedRoot.root,
 		nowText:        nowText,
 		rootGeneration: candidate.RootGeneration,
 	}
 	if _, err := scanner.queueMetadataJobInTx(ctx, tx, candidate.ID, mtimeText); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	externalIdentityChanges, err := s.catalog.reconcileImmichExternalIdentitiesForLocalIdentityLossInTx(
+		ctx,
+		tx,
+		trustedRoot.externalContentIdentityMappings,
+		trustedRoot.externalContentIdentityScopeKey,
+		candidate.SourceKey,
+		candidate.RootKey,
+		[]string{candidate.RelativePath},
+		nowText,
+	)
+	if err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -889,7 +955,7 @@ func (s *Service) resettleLocalLocationAfterContentVerification(ctx context.Cont
 		_ = tx.Rollback()
 		return err
 	}
-	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0); err != nil {
+	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0 || externalIdentityChanges > 0); err != nil {
 		return fmt.Errorf("commit local content verification resettle: %w", err)
 	}
 	s.notifyLocalWorkQueued()

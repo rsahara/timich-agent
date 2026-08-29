@@ -82,6 +82,47 @@ func TestSemanticIndexJobFailureBacksOffAndReconcilePreservesDeadline(t *testing
 	}
 }
 
+func TestCanceledSemanticIndexJobRequeuesWithoutFailureOrAttempt(t *testing.T) {
+	store, err := LoadOrCreateCatalogStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadOrCreateCatalogStore() error = %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	profile := testImageSemanticProfile{}
+	const sourceKey = "1111111111111111"
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	if err := store.enqueueSemanticIndexJob(ctx, sourceKey, profile, now); err != nil {
+		t.Fatalf("enqueueSemanticIndexJob() error = %v", err)
+	}
+	job, err := store.claimSemanticIndexJob(ctx, []string{sourceKey}, profile, now)
+	if err != nil || job == nil || job.Attempts != 1 {
+		t.Fatalf("claimSemanticIndexJob() = %#v, %v, want first attempt", job, err)
+	}
+	if err := store.requeueCanceledSemanticIndexJob(ctx, job.ID, job.Attempts, now.Add(time.Second)); err != nil {
+		t.Fatalf("requeueCanceledSemanticIndexJob() error = %v", err)
+	}
+
+	pending, failed, eligible, nextEligibleAt, err := store.semanticIndexJobState(
+		ctx,
+		sourceKey,
+		profile.ModelID(),
+		profile.VectorSpaceID(),
+		now.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatalf("semanticIndexJobState() error = %v", err)
+	}
+	if pending != 1 || failed != 0 || eligible != 1 || nextEligibleAt != nil {
+		t.Fatalf("canceled job state = pending:%d failed:%d eligible:%d next:%v, want queued and immediately eligible", pending, failed, eligible, nextEligibleAt)
+	}
+	retried, err := store.claimSemanticIndexJob(ctx, []string{sourceKey}, profile, now.Add(time.Second))
+	if err != nil || retried == nil || retried.Attempts != 1 {
+		t.Fatalf("claimSemanticIndexJob(after cancellation) = %#v, %v, want first attempt again", retried, err)
+	}
+}
+
 func TestSemanticIndexActivationFailureBacksOffCompletedJob(t *testing.T) {
 	store, err := LoadOrCreateCatalogStore(t.TempDir())
 	if err != nil {

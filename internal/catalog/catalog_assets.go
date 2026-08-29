@@ -9,6 +9,7 @@ import (
 )
 
 type catalogGalleryReadiness struct {
+	localSourceKeys               []string
 	localImmichFallbackSourceKeys []string
 	immichSourceKeys              []string
 	immichOnly                    bool
@@ -24,6 +25,9 @@ func (s *CatalogStore) SearchCatalogAssets(ctx context.Context, normalized norma
 	db := s.queryDB()
 	readiness := s.galleryReadinessSnapshot()
 	if page, handled, err := s.searchGalleryTimeline(ctx, normalized, readiness); handled {
+		return page, err
+	}
+	if page, handled, err := s.searchGalleryProjection(ctx, normalized, readiness); handled {
 		return page, err
 	}
 	where, args := catalogSearchWhere(normalized, "c", readiness)

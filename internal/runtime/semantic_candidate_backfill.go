@@ -249,6 +249,9 @@ func (a *AgentRuntime) runNextBackgroundWorkerTask(ctx context.Context) bool {
 		return false
 	}
 	a.schedulerWorkStateAssign(assignment.phase, assignment.planned)
+	if assignment.phase == "embeddings" || assignment.phase == "search_index" || assignment.phase == "content_verification" {
+		return a.runForegroundCancelableBackgroundAssignment(ctx, assignment.run)
+	}
 	return assignment.run(ctx)
 }
 
@@ -536,7 +539,11 @@ func (a *AgentRuntime) launchBackgroundWorkerAssignment(ctx context.Context, ass
 	go func(task backgroundWorkerAssignment) {
 		defer a.semanticBackfillWG.Done()
 		defer a.finishBackgroundWorkerAssignment(task.phase, task.workers)
-		_ = task.run(ctx)
+		if task.phase == "embeddings" || task.phase == "search_index" || task.phase == "content_verification" {
+			_ = a.runForegroundCancelableBackgroundAssignment(ctx, task.run)
+		} else {
+			_ = task.run(ctx)
+		}
 		if ctx.Err() != nil {
 			a.recoverCanceledLocalBackgroundWorkerAssignment(task.phase)
 		}

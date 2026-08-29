@@ -332,7 +332,7 @@ func (b *semanticIndexBuilder) populate(ctx context.Context) error {
 	}
 	where, args := semanticCatalogEligibilityWhere(b.sourceKey, b.profile.InputKind(), "a")
 	queryArgs := append(append([]any{}, args...), b.profile.ModelID(), b.profile.VectorSpaceID())
-	rows, err := b.store.queryDB().QueryContext(ctx, `SELECT
+	rows, err := b.store.backgroundQueryDB().QueryContext(ctx, `SELECT
 			a.upstream_asset_id, a.media_type, a.filename, a.captured_at, a.duration,
 			v.embedding_input, v.payload_batch_id, v.vector_offset, v.vector_length
 		FROM semantic_vectors v

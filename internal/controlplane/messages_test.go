@@ -131,6 +131,7 @@ func TestParseServerCommandRelayFetch(t *testing.T) {
 	setControlPlaneString(relay, "method", "  POST  ")
 	setControlPlaneString(relay, "path", "  /v1/assets/search?page=2  ")
 	setControlPlaneString(relay, "content_type", "  application/json  ")
+	relay.Set(fieldByName(relay, "deadline_unix_millis"), protoreflect.ValueOfInt64(1_787_460_000_123))
 	relay.Set(fieldByName(relay, "body"), protoreflect.ValueOfBytes([]byte(`{"page":2}`)))
 	setHeaders(relay, []Header{
 		{Name: "  X-Test  ", Value: " first "},
@@ -150,8 +151,9 @@ func TestParseServerCommandRelayFetch(t *testing.T) {
 			{Name: "X-Test", Value: " first "},
 			{Name: "X-Test", Value: "second"},
 		},
-		Body:        []byte(`{"page":2}`),
-		ContentType: "application/json",
+		Body:               []byte(`{"page":2}`),
+		ContentType:        "application/json",
+		DeadlineUnixMillis: 1_787_460_000_123,
 	}
 	if commandID != "command-3" || ackMessage != "" || !reflect.DeepEqual(request, want) {
 		t.Fatalf("parseServerCommand() = %q/%q/%+v, want %q/%q/%+v", commandID, ackMessage, request, "command-3", "", want)

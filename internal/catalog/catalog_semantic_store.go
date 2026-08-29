@@ -62,6 +62,7 @@ type SemanticBackfillOptions struct {
 	ImageLoader SemanticImageLoader
 	MaxAssets   int
 	Workers     int
+	BeforeEmbed func(context.Context) error
 }
 
 type SemanticBackfillResult struct {
@@ -92,6 +93,14 @@ type SemanticIndexPublishResult struct {
 type SemanticBackfillSource struct {
 	SourceKey string                      `json:"sourceKey"`
 	Status    SemanticModelBackfillStatus `json:"status"`
+}
+
+// SemanticModelBackfillSnapshot is one internally consistent semantic
+// scheduler view. Source-level rows are retained so publish eligibility can be
+// evaluated without repeating the expensive catalog-wide progress counts.
+type SemanticModelBackfillSnapshot struct {
+	Status         SemanticModelBackfillStatus `json:"status"`
+	SourceStatuses []SemanticBackfillSource    `json:"sourceStatuses,omitempty"`
 }
 
 type SemanticImageLoader interface {
@@ -536,7 +545,7 @@ func (s *CatalogStore) semanticEligibleAssetCount(ctx context.Context, sourceKey
 	if sourceKey == "" {
 		return 0, ErrCatalogNotConfigured
 	}
-	db := s.queryDB()
+	db := s.backgroundQueryDB()
 	if strings.TrimSpace(inputKind) == semanticInputKindImage {
 		var datasourceKind string
 		err := db.QueryRowContext(ctx, `SELECT datasource_kind
@@ -597,7 +606,7 @@ func (s *CatalogStore) semanticBackfillEligibilityState(ctx context.Context, sou
 	)
 	var eligibleNow int
 	var firstDeferredFailure sql.NullString
-	err := s.queryDB().QueryRowContext(ctx, `WITH candidates AS (
+	err := s.backgroundQueryDB().QueryRowContext(ctx, `WITH candidates AS (
 			SELECT v.upstream_asset_id AS vector_asset_id,
 				v.vector_space_id,
 				v.embedding_dim,
@@ -645,7 +654,7 @@ func (s *CatalogStore) semanticBackfillEligibilityState(ctx context.Context, sou
 }
 
 func (s *CatalogStore) semanticVectorProgressCounts(ctx context.Context, sourceKey string, modelID string, vectorSpaceID string, inputKind string) (int, int, int, error) {
-	db := s.queryDB()
+	db := s.backgroundQueryDB()
 	var completed int
 	var failed int
 	var indexed int
@@ -676,7 +685,7 @@ func (s *CatalogStore) semanticVectorProgressCounts(ctx context.Context, sourceK
 }
 
 func (s *CatalogStore) semanticBackfillLastPublishedAt(ctx context.Context, sourceKey string, modelID string, vectorSpaceID string) (*time.Time, error) {
-	db := s.queryDB()
+	db := s.backgroundQueryDB()
 	var indexedAt sql.NullString
 	err := db.QueryRowContext(ctx, `SELECT built_at
 		FROM semantic_state
@@ -705,7 +714,7 @@ func (s *CatalogStore) semanticBackfillLastPublishedAt(ctx context.Context, sour
 func (s *CatalogStore) semanticIndexGenerations(ctx context.Context, sourceKey string, modelID string) (int64, int64, error) {
 	var assetGeneration int64
 	indexedGeneration := int64(-1)
-	err := s.queryDB().QueryRowContext(ctx, `SELECT asset_generation, indexed_generation
+	err := s.backgroundQueryDB().QueryRowContext(ctx, `SELECT asset_generation, indexed_generation
 		FROM semantic_state
 		WHERE source_key = ? AND model_id = ?`, strings.TrimSpace(sourceKey), strings.TrimSpace(modelID)).
 		Scan(&assetGeneration, &indexedGeneration)
@@ -795,6 +804,11 @@ func (s *CatalogStore) embedSemanticBackfillAssets(ctx context.Context, profile 
 			if err := ctx.Err(); err != nil {
 				return nil, nil, err
 			}
+			if options.BeforeEmbed != nil {
+				if err := options.BeforeEmbed(ctx); err != nil {
+					return nil, nil, err
+				}
+			}
 			err := embedSemanticBackfillAsset(ctx, profile, options.ImageLoader, &assets[index])
 			if err != nil && !errors.Is(err, ErrSemanticAssetInput) {
 				return nil, nil, err
@@ -813,6 +827,17 @@ func (s *CatalogStore) embedSemanticBackfillAssets(ctx context.Context, profile 
 			go func() {
 				defer wg.Done()
 				for index := range jobs {
+					if options.BeforeEmbed != nil {
+						if err := options.BeforeEmbed(workCtx); err != nil {
+							fatalMu.Lock()
+							if fatalErr == nil {
+								fatalErr = err
+								cancel()
+							}
+							fatalMu.Unlock()
+							continue
+						}
+					}
 					err := embedSemanticBackfillAsset(workCtx, profile, options.ImageLoader, &assets[index])
 					if err != nil && !errors.Is(err, ErrSemanticAssetInput) {
 						fatalMu.Lock()
@@ -1109,7 +1134,7 @@ func (s *CatalogStore) semanticIndexJobState(ctx context.Context, sourceKey stri
 	if s == nil || s.db == nil {
 		return 0, 0, 0, nil, ErrCatalogNotConfigured
 	}
-	db := s.queryDB()
+	db := s.backgroundQueryDB()
 	var pending int
 	var failed int
 	var eligible int
@@ -1178,6 +1203,12 @@ func (s *CatalogStore) PublishNextSemanticIndexJob(ctx context.Context, sourceKe
 	failJob := func(cause error) (SemanticIndexPublishResult, error) {
 		transitionCtx, cancel := context.WithTimeout(context.Background(), semanticIndexJobTransitionTimeout)
 		defer cancel()
+		if errors.Is(cause, context.Canceled) {
+			if requeueErr := s.requeueCanceledSemanticIndexJob(transitionCtx, job.ID, job.Attempts, time.Now().UTC()); requeueErr != nil {
+				return SemanticIndexPublishResult{}, errors.Join(cause, requeueErr)
+			}
+			return SemanticIndexPublishResult{}, cause
+		}
 		if markErr := s.failSemanticIndexJob(transitionCtx, job.ID, job.Attempts, cause, time.Now().UTC()); markErr != nil {
 			return SemanticIndexPublishResult{}, errors.Join(cause, markErr)
 		}
@@ -1411,6 +1442,38 @@ func (s *CatalogStore) failSemanticIndexJob(ctx context.Context, jobID int64, at
 	return nil
 }
 
+// requeueCanceledSemanticIndexJob returns cooperative foreground/shutdown
+// cancellation to the runnable queue without reporting a publish failure or
+// consuming a retry attempt. The builder staging directory remains resumable.
+func (s *CatalogStore) requeueCanceledSemanticIndexJob(ctx context.Context, jobID int64, attempts int, now time.Time) error {
+	nowText := formatCatalogTime(now.UTC())
+	result, err := s.db.ExecContext(ctx, `UPDATE semantic_index_jobs
+		SET status = ?,
+			attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+			last_error = NULL,
+			scheduled_at = ?,
+			started_at = NULL,
+			lease_expires_at = NULL,
+			completed_at = NULL,
+			updated_at = ?
+		WHERE id = ? AND status IN (?, ?) AND attempts = ?`,
+		semanticIndexJobStatusQueued,
+		nowText,
+		nowText,
+		jobID,
+		semanticIndexJobStatusRunning,
+		semanticIndexJobStatusCompleted,
+		attempts,
+	)
+	if err != nil {
+		return fmt.Errorf("requeue canceled semantic hnsw publish job: %w", err)
+	}
+	if count, _ := result.RowsAffected(); count > 1 {
+		return fmt.Errorf("requeue canceled semantic hnsw publish job: unexpected update count %d", count)
+	}
+	return nil
+}
+
 func (s *CatalogStore) renewSemanticIndexJobLease(ctx context.Context, job *semanticIndexJob, now time.Time) error {
 	if job == nil {
 		return ErrCatalogNotConfigured
@@ -1553,7 +1616,7 @@ func (s *CatalogStore) loadSemanticBackfillAssets(ctx context.Context, sourceKey
 	queryArgs := append([]any{profile.ModelID()}, args...)
 	retryBefore := formatCatalogTime(time.Now().UTC().Add(-semanticBackfillFailureRetryInterval))
 	queryArgs = append(queryArgs, profile.VectorSpaceID(), profile.EmbeddingDim(), retryBefore, limit)
-	db := s.queryDB()
+	db := s.backgroundQueryDB()
 	rows, err := db.QueryContext(ctx, `SELECT a.source_key, a.upstream_asset_id, a.media_type, a.filename, a.captured_at, a.duration,
 			COALESCE(retry.requested_at, '')
 		FROM catalog_assets a

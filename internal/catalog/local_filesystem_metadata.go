@@ -63,15 +63,19 @@ type localLocationForMetadata struct {
 }
 
 func (s *Service) RunLocalMetadataBatch(ctx context.Context, maxJobs int) (LocalMetadataBatchResult, error) {
-	return s.runLocalMetadataBatch(ctx, "", maxJobs, 1)
+	return s.runLocalMetadataBatch(ctx, "", maxJobs, 1, LocalBackgroundBatchOptions{})
 }
 
 func (s *Service) RunLocalMetadataBatchForSource(ctx context.Context, sourceKey string, maxJobs int) (LocalMetadataBatchResult, error) {
-	return s.runLocalMetadataBatch(ctx, sourceKey, maxJobs, 1)
+	return s.runLocalMetadataBatch(ctx, sourceKey, maxJobs, 1, LocalBackgroundBatchOptions{})
 }
 
 func (s *Service) RunLocalMetadataBatchWithWorkers(ctx context.Context, maxJobs int, workers int) (LocalMetadataBatchResult, error) {
-	return s.runLocalMetadataBatch(ctx, "", maxJobs, workers)
+	return s.runLocalMetadataBatch(ctx, "", maxJobs, workers, LocalBackgroundBatchOptions{})
+}
+
+func (s *Service) RunLocalMetadataBatchWithOptions(ctx context.Context, maxJobs int, workers int, options LocalBackgroundBatchOptions) (LocalMetadataBatchResult, error) {
+	return s.runLocalMetadataBatch(ctx, "", maxJobs, workers, options)
 }
 
 func (s *Service) RequeueFailedLocalMetadata(ctx context.Context) (LocalMetadataRequeueResult, error) {
@@ -88,7 +92,7 @@ func (s *Service) RequeueFailedLocalMetadata(ctx context.Context) (LocalMetadata
 	return LocalMetadataRequeueResult{Queued: queued}, nil
 }
 
-func (s *Service) runLocalMetadataBatch(ctx context.Context, sourceKey string, maxJobs int, workers int) (LocalMetadataBatchResult, error) {
+func (s *Service) runLocalMetadataBatch(ctx context.Context, sourceKey string, maxJobs int, workers int, options LocalBackgroundBatchOptions) (LocalMetadataBatchResult, error) {
 	if s == nil || s.catalog == nil {
 		return LocalMetadataBatchResult{}, ErrNoDatasourceConfigured
 	}
@@ -118,6 +122,8 @@ func (s *Service) runLocalMetadataBatch(ctx context.Context, sourceKey string, m
 	if elapsed := time.Since(selectStarted); elapsed > localMetadataSlowStepThreshold {
 		log.Printf("timich-agent local metadata job select slow count=%d elapsed=%s", len(jobs), elapsed.Round(time.Millisecond))
 	}
+	workCtx, cancelWork := context.WithCancel(ctx)
+	defer cancelWork()
 	jobsChannel := make(chan localMetadataJob)
 	var resultMu sync.Mutex
 	var batchErr error
@@ -128,15 +134,24 @@ func (s *Service) runLocalMetadataBatch(ctx context.Context, sourceKey string, m
 		go func() {
 			defer wait.Done()
 			for job := range jobsChannel {
-				if ctx.Err() != nil {
+				if workCtx.Err() != nil {
 					return
 				}
+				if options.BeforeJob != nil {
+					if admissionErr := options.BeforeJob(workCtx); admissionErr != nil {
+						resultMu.Lock()
+						batchErr = errors.Join(batchErr, admissionErr)
+						resultMu.Unlock()
+						cancelWork()
+						return
+					}
+				}
 				jobStarted := time.Now()
-				processed, jobErr := s.processLocalMetadataJob(ctx, job)
+				processed, jobErr := s.processLocalMetadataJob(workCtx, job)
 				if elapsed := time.Since(jobStarted); elapsed > localMetadataSlowStepThreshold {
 					log.Printf("timich-agent local metadata job slow job_id=%d location_id=%d processed=%t elapsed=%s", job.ID, job.LocationID, processed, elapsed.Round(time.Millisecond))
 				}
-				if ctx.Err() != nil {
+				if workCtx.Err() != nil {
 					if _, recoveryErr := s.deferClaimedLocalMetadataJob(job); recoveryErr != nil {
 						log.Printf("timich-agent local metadata canceled job recovery failed job_id=%d error=%v", job.ID, recoveryErr)
 						s.rememberLocalMetadataClaimRecovery(job)
@@ -153,7 +168,7 @@ func (s *Service) runLocalMetadataBatch(ctx context.Context, sourceKey string, m
 						resultMu.Unlock()
 					}
 				} else if jobErr != nil && !errors.Is(jobErr, errLocalMetadataSourceChanged) {
-					failureDeferred, failureErr := s.failLocalMetadataJob(ctx, job, jobErr)
+					failureDeferred, failureErr := s.failLocalMetadataJob(workCtx, job, jobErr)
 					if failureErr != nil {
 						recovered, recoveryErr := s.deferClaimedLocalMetadataJob(job)
 						if recoveryErr != nil {
@@ -198,7 +213,7 @@ sendJobs:
 	for _, job := range jobs {
 		select {
 		case jobsChannel <- job:
-		case <-ctx.Done():
+		case <-workCtx.Done():
 			break sendJobs
 		}
 	}
@@ -460,7 +475,14 @@ func (s *Service) processLocalMetadataJob(ctx context.Context, job localMetadata
 	file, info, err := openLocalRootFileFromPinnedRoot(trustedRoot.handle, location.RelativePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			if markErr := s.markLocalLocationMissing(ctx, location.ID, nowText, "metadata_absent"); markErr != nil {
+			if markErr := s.markLocalLocationMissing(
+				ctx,
+				trustedRoot.externalContentIdentityMappings,
+				trustedRoot.externalContentIdentityScopeKey,
+				location.ID,
+				nowText,
+				"metadata_absent",
+			); markErr != nil {
 				return false, markErr
 			}
 		}
@@ -468,7 +490,7 @@ func (s *Service) processLocalMetadataJob(ctx context.Context, job localMetadata
 	}
 	defer file.Close()
 	if !localLocationMatchesFileInfo(location, info) {
-		if err := s.resettleLocalMetadataJob(ctx, job.ID, location, info, "source_changed_before_metadata"); err != nil {
+		if err := s.resettleLocalMetadataJob(ctx, trustedRoot, job.ID, location, info, "source_changed_before_metadata"); err != nil {
 			return false, err
 		}
 		return false, errLocalMetadataSourceChanged
@@ -485,7 +507,7 @@ func (s *Service) processLocalMetadataJob(ctx context.Context, job localMetadata
 		log.Printf("timich-agent local metadata sha1 slow job_id=%d location_id=%d size_bytes=%d elapsed=%s", job.ID, job.LocationID, info.Size(), elapsed.Round(time.Millisecond))
 	}
 	if hashedBytes != info.Size() || !localFileInfoUnchanged(info, infoAfter) {
-		if err := s.resettleLocalMetadataJob(ctx, job.ID, location, infoAfter, "source_changed_during_metadata"); err != nil {
+		if err := s.resettleLocalMetadataJob(ctx, trustedRoot, job.ID, location, infoAfter, "source_changed_during_metadata"); err != nil {
 			return false, err
 		}
 		return false, errLocalMetadataSourceChanged
@@ -496,7 +518,7 @@ func (s *Service) processLocalMetadataJob(ctx context.Context, job localMetadata
 	}
 	defer pathFile.Close()
 	if !pathnameMatches {
-		if err := s.resettleLocalMetadataJob(ctx, job.ID, location, pathInfo, "source_path_replaced_during_metadata"); err != nil {
+		if err := s.resettleLocalMetadataJob(ctx, trustedRoot, job.ID, location, pathInfo, "source_path_replaced_during_metadata"); err != nil {
 			return false, err
 		}
 		return false, errLocalMetadataSourceChanged
@@ -509,7 +531,7 @@ func (s *Service) processLocalMetadataJob(ctx context.Context, job localMetadata
 	capturedAt := info.ModTime().UTC()
 	registerStarted := time.Now()
 	registrationNowText := formatCatalogTime(time.Now().UTC())
-	err = s.registerLocalMetadata(ctx, trustedRoot.datasource, location, sha1Hex, mediaType, filename, capturedAt, infoAfter, registrationNowText, job.ID)
+	err = s.registerLocalMetadata(ctx, trustedRoot.datasource, trustedRoot.externalContentIdentityScopeKey, location, sha1Hex, mediaType, filename, capturedAt, infoAfter, registrationNowText, job.ID)
 	if elapsed := time.Since(registerStarted); elapsed > localMetadataSlowStepThreshold {
 		log.Printf("timich-agent local metadata register slow job_id=%d location_id=%d size_bytes=%d elapsed=%s", job.ID, job.LocationID, info.Size(), elapsed.Round(time.Millisecond))
 	}
@@ -575,7 +597,7 @@ func (s *Service) localLocationForMetadata(ctx context.Context, locationID int64
 	return location, nil
 }
 
-func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.DatasourceConfig, location localLocationForMetadata, sha1Hex string, mediaType string, filename string, capturedAt time.Time, info os.FileInfo, nowText string, jobID int64) error {
+func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.DatasourceConfig, externalContentIdentityScopeKey string, location localLocationForMetadata, sha1Hex string, mediaType string, filename string, capturedAt time.Time, info os.FileInfo, nowText string, jobID int64) error {
 	assetID := localAssetID(sha1Hex, info.Size())
 	capturedAtText := formatCatalogTime(capturedAt)
 	mtimeText := formatCatalogTime(info.ModTime().UTC())
@@ -597,6 +619,21 @@ func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.D
 		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit local metadata registration reschedule: %w", err)
+		}
+		return errLocalMetadataSourceChanged
+	}
+	externalIdentityScopeCurrent, err := catalogExternalIdentityScopeMatchesInTx(ctx, tx, externalContentIdentityScopeKey)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if !externalIdentityScopeCurrent {
+		if err := rescheduleLocalMetadataJobForLatestLocationInTx(ctx, tx, jobID, nowText); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit local metadata registration after datasource change: %w", err)
 		}
 		return errLocalMetadataSourceChanged
 	}
@@ -661,9 +698,10 @@ func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.D
 	if _, err = tx.ExecContext(ctx, `INSERT INTO catalog_assets (
 			source_key, datasource_kind, upstream_asset_id, media_type, filename,
 			captured_at, duration, visibility_status, source_updated_at, is_favorite,
-			content_sha1_hex, content_size_bytes, place_label, description, first_seen_at,
-			updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, NULL, 'active', ?, 0, ?, ?, NULL, NULL, ?, ?)
+			upstream_checksum_algorithm, content_sha1_hex, content_size_bytes,
+			canonical_content_sha1_hex, canonical_content_size_bytes,
+			place_label, description, first_seen_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, NULL, 'active', ?, 0, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
 		ON CONFLICT(source_key, upstream_asset_id) DO UPDATE SET
 			datasource_kind = excluded.datasource_kind,
 			media_type = excluded.media_type,
@@ -671,8 +709,11 @@ func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.D
 			captured_at = excluded.captured_at,
 			visibility_status = 'active',
 			source_updated_at = excluded.source_updated_at,
+			upstream_checksum_algorithm = excluded.upstream_checksum_algorithm,
 			content_sha1_hex = excluded.content_sha1_hex,
 			content_size_bytes = excluded.content_size_bytes,
+			canonical_content_sha1_hex = excluded.canonical_content_sha1_hex,
+			canonical_content_size_bytes = excluded.canonical_content_size_bytes,
 			updated_at = excluded.updated_at`,
 		datasource.SourceKey,
 		config.DatasourceKindLocalFiles,
@@ -681,6 +722,9 @@ func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.D
 		filename,
 		capturedAtText,
 		mtimeText,
+		upstreamChecksumAlgorithmSHA1,
+		sha1Hex,
+		info.Size(),
 		sha1Hex,
 		info.Size(),
 		nowText,
@@ -690,6 +734,20 @@ func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.D
 		return fmt.Errorf("upsert local catalog asset: %w", err)
 	}
 	if err = s.catalog.refreshCatalogCanonicalAssetInTx(ctx, tx, datasource.SourceKey, assetID, nowText); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err = s.catalog.reconcileImmichExternalIdentityForLocalInTx(
+		ctx,
+		tx,
+		datasource,
+		externalContentIdentityScopeKey,
+		location.RelativePath,
+		sha1Hex,
+		info.Size(),
+		mediaType,
+		nowText,
+	); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -852,20 +910,19 @@ func (s *Service) failLocalMetadataJob(ctx context.Context, job localMetadataJob
 	return false, nil
 }
 
-func (s *Service) resettleLocalMetadataJob(ctx context.Context, jobID int64, location localLocationForMetadata, info os.FileInfo, reason string) error {
+func (s *Service) resettleLocalMetadataJob(ctx context.Context, trustedRoot *trustedLocalMediaRoot, jobID int64, location localLocationForMetadata, info os.FileInfo, reason string) error {
 	if info == nil || !info.Mode().IsRegular() {
 		return fmt.Errorf("resettle local metadata source: path is not a regular file")
 	}
-	datasource, _, err := s.localDatasourceAndRoot(location.SourceKey)
-	if err != nil {
-		return err
+	if trustedRoot == nil || trustedRoot.datasource.SourceKey != location.SourceKey || trustedRoot.root.Key != location.RootKey {
+		return ErrLocalMediaRootNotTrusted
 	}
 	now := time.Now().UTC()
 	nowText := formatCatalogTime(now)
 	mtimeText := formatCatalogTime(info.ModTime().UTC())
 	fastSignature := fmt.Sprintf("%d:%s", info.Size(), mtimeText)
 	fileIdentity := localFileIdentity(info)
-	notBeforeText := formatCatalogTime(now.Add(localDatasourceSettlingDuration(*datasource)))
+	notBeforeText := formatCatalogTime(now.Add(localDatasourceSettlingDuration(trustedRoot.datasource)))
 	tx, err := s.catalog.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin local metadata resettle: %w", err)
@@ -901,6 +958,20 @@ func (s *Service) resettleLocalMetadataJob(ctx context.Context, jobID int64, loc
 		_ = tx.Rollback()
 		return fmt.Errorf("reschedule local metadata job: %w", err)
 	}
+	externalIdentityChanges, err := s.catalog.reconcileImmichExternalIdentitiesForLocalIdentityLossInTx(
+		ctx,
+		tx,
+		trustedRoot.externalContentIdentityMappings,
+		trustedRoot.externalContentIdentityScopeKey,
+		location.SourceKey,
+		location.RootKey,
+		[]string{location.RelativePath},
+		nowText,
+	)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	changedCanonicalIDs, err := refreshLocalAssetVisibilityInTx(ctx, tx, location.SourceKey, location.RootKey, nowText)
 	if err != nil {
 		_ = tx.Rollback()
@@ -910,22 +981,30 @@ func (s *Service) resettleLocalMetadataJob(ctx context.Context, jobID int64, loc
 		_ = tx.Rollback()
 		return err
 	}
-	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0); err != nil {
+	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0 || externalIdentityChanges > 0); err != nil {
 		return fmt.Errorf("commit local metadata resettle: %w", err)
 	}
 	return nil
 }
 
-func (s *Service) markLocalLocationMissing(ctx context.Context, locationID int64, nowText string, reason string) error {
+func (s *Service) markLocalLocationMissing(
+	ctx context.Context,
+	externalContentIdentityMappings []immichExternalLibraryMapping,
+	externalContentIdentityScopeKey string,
+	locationID int64,
+	nowText string,
+	reason string,
+) error {
 	tx, err := s.catalog.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin local metadata missing update: %w", err)
 	}
 	var sourceKey string
 	var rootKey string
-	if err := tx.QueryRowContext(ctx, `SELECT source_key, root_key
+	var relativePath string
+	if err := tx.QueryRowContext(ctx, `SELECT source_key, root_key, relative_path
 		FROM local_asset_locations
-		WHERE id = ?`, locationID).Scan(&sourceKey, &rootKey); err != nil {
+		WHERE id = ?`, locationID).Scan(&sourceKey, &rootKey, &relativePath); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("read local metadata missing source key: %w", err)
 	}
@@ -946,7 +1025,21 @@ func (s *Service) markLocalLocationMissing(ctx context.Context, locationID int64
 		_ = tx.Rollback()
 		return err
 	}
-	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0); err != nil {
+	externalIdentityChanges, err := s.catalog.reconcileImmichExternalIdentitiesForLocalIdentityLossInTx(
+		ctx,
+		tx,
+		externalContentIdentityMappings,
+		externalContentIdentityScopeKey,
+		sourceKey,
+		rootKey,
+		[]string{relativePath},
+		nowText,
+	)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0 || externalIdentityChanges > 0); err != nil {
 		return fmt.Errorf("commit local metadata missing update: %w", err)
 	}
 	return nil

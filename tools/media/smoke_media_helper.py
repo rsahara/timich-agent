@@ -76,6 +76,40 @@ def main() -> int:
         require(render_image.get("operation") == "render-image", "render-image operation mismatch")
         require_jpeg(rendition_path, "render-image output")
 
+        # Generate privacy-safe corrupt inputs from the synthetic rendition. These
+        # exercise the same failure boundary as incomplete/corrupt JPEG originals
+        # without checking personal media into the repository.
+        corrupt_jpegs = write_corrupt_jpeg_fixtures(temp_dir, rendition_path)
+        for corrupt_jpeg in corrupt_jpegs:
+            run_failure(
+                [
+                    str(helper),
+                    "render-image",
+                    "--input",
+                    str(corrupt_jpeg),
+                    "--output",
+                    str(temp_dir / f"{corrupt_jpeg.stem}-output.jpg"),
+                    "--max-edge",
+                    "64",
+                    "--quality",
+                    "82",
+                ]
+            )
+
+        if capabilities.get("renderVideoPoster") is True:
+            empty_video = temp_dir / "zero-byte-video.mp4"
+            empty_video.write_bytes(b"")
+            run_failure(
+                [
+                    str(helper),
+                    "render-video-poster",
+                    "--input",
+                    str(empty_video),
+                    "--output",
+                    str(temp_dir / "zero-byte-video-poster.jpg"),
+                ]
+            )
+
         video_fixture = Path(args.video_fixture) if args.video_fixture else None
         if video_fixture:
             require(video_fixture.is_file(), f"video fixture is missing: {video_fixture}")
@@ -118,6 +152,28 @@ def run_json(argv: list[str]) -> dict:
             f"stdout:\n{process.stdout}\n"
             f"stderr:\n{process.stderr}"
         ) from err
+
+
+def run_failure(argv: list[str]) -> None:
+    process = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if process.returncode == 0:
+        raise SystemExit(
+            f"corrupt-media command unexpectedly succeeded: {shlex_join(argv)}\n"
+            f"stdout:\n{process.stdout}\n"
+            f"stderr:\n{process.stderr}"
+        )
+
+
+def write_corrupt_jpeg_fixtures(temp_dir: Path, valid_jpeg_path: Path) -> list[Path]:
+    valid_jpeg = valid_jpeg_path.read_bytes()
+    require(len(valid_jpeg) >= 64, "render-image output is too small to derive corrupt fixtures")
+
+    restart_marker = temp_dir / "corrupt-restart-marker.jpg"
+    restart_marker.write_bytes(b"\xff\xd8\xff\xd0" + b"synthetic-corrupt-scan")
+
+    truncated_scan = temp_dir / "truncated-scan.jpg"
+    truncated_scan.write_bytes(valid_jpeg[:64])
+    return [restart_marker, truncated_scan]
 
 
 def write_png_fixture(path: Path, width: int = 96, height: int = 64) -> None:

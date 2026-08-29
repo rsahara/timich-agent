@@ -8,12 +8,13 @@ type Header struct {
 }
 
 type RelayRequest struct {
-	FetchID     string
-	Method      string
-	Path        string
-	Headers     []Header
-	Body        []byte
-	ContentType string
+	FetchID            string
+	Method             string
+	Path               string
+	Headers            []Header
+	Body               []byte
+	ContentType        string
+	DeadlineUnixMillis int64
 }
 
 type RelayResponse struct {
@@ -56,4 +57,12 @@ func BytesFieldFromReflect(message protoreflect.Message, fieldName protoreflect.
 		return nil
 	}
 	return append([]byte(nil), message.Get(field).Bytes()...)
+}
+
+func Int64FieldFromReflect(message protoreflect.Message, fieldName protoreflect.Name) int64 {
+	field := message.Descriptor().Fields().ByName(fieldName)
+	if field == nil || !message.Has(field) {
+		return 0
+	}
+	return message.Get(field).Int()
 }

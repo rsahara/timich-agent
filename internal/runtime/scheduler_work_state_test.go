@@ -1,11 +1,18 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/rsahara/timich-agent/internal/catalog"
+	"github.com/rsahara/timich-agent/internal/config"
 )
 
 func TestSchedulerWorkStateFreshness(t *testing.T) {
@@ -40,6 +47,53 @@ func TestSchedulerWorkStateFreshness(t *testing.T) {
 	state.SemanticNextEligibleAt = &deadline
 	if state.fresh(now, "config-a", schedule, true) {
 		t.Fatal("fresh() = true at semantic eligibility deadline, want recount")
+	}
+}
+
+func TestSchedulerWorkStateRecomputeWaitsForForegroundQuiet(t *testing.T) {
+	runtime := newTestAgentRuntime(t, BuildInfo{}, []config.DatasourceConfig{{
+		Name: "Static demo",
+		Kind: config.DatasourceKindStaticDemo,
+		URL:  writeStaticDemoManifest(t),
+	}})
+	runtime.foregroundCatalog.quietPeriod = time.Nanosecond
+	finishForeground := runtime.foregroundCatalog.begin()
+	defer finishForeground()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if state, ok := runtime.schedulerWorkStateSnapshot(ctx, semanticIndexingSchedule{}, false); ok {
+		t.Fatalf("schedulerWorkStateSnapshot() state=%+v ok=true during foreground work, want deferred recount", state)
+	}
+}
+
+func TestSchedulerWorkStateRecomputeLogsRealErrorBeforeReleaseCancellation(t *testing.T) {
+	localRoot := t.TempDir()
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "NAS Photos",
+		Kind:      config.DatasourceKindLocalFiles,
+		RootKey:   "nas-photos",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{Key: "nas-photos", Path: localRoot}}
+	})
+	if err := runtime.catalogService().Close(); err != nil {
+		t.Fatalf("Close(catalog service) error = %v", err)
+	}
+
+	var logs bytes.Buffer
+	previousOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() {
+		log.SetOutput(previousOutput)
+	})
+
+	if state, ok := runtime.schedulerWorkStateSnapshot(context.Background(), semanticIndexingSchedule{}, false); ok {
+		t.Fatalf("schedulerWorkStateSnapshot() state=%+v ok=true with closed catalog, want failure", state)
+	}
+	if !strings.Contains(logs.String(), "scheduler work-state recompute failed") ||
+		!strings.Contains(logs.String(), "count local metadata jobs") {
+		t.Fatalf("scheduler recompute logs = %q, want real database error", logs.String())
 	}
 }
 
@@ -95,6 +149,125 @@ func TestSemanticSchedulerRuntimeRetryNeededOnlyDuringManagedWarmup(t *testing.T
 	if semanticSchedulerRuntimeRetryNeeded(context.Background(), status, nil, onnx) {
 		t.Fatal("semanticSchedulerRuntimeRetryNeeded() = true for failed managed runtime")
 	}
+}
+
+func TestSemanticSchedulerSnapshotLoadsReadyProfileOncePerDecision(t *testing.T) {
+	nextEligibleAt := time.Now().UTC().Add(time.Minute)
+	profile := catalog.SemanticModelProfileStatus{
+		ModelID:       "model-a",
+		VectorSpaceID: "model-a/d4",
+		EmbeddingDim:  4,
+		Role:          catalog.SemanticModelRoleCandidate,
+		ProfileKind:   catalog.SemanticProfileKindModelPack,
+		Runtime: &catalog.SemanticModelRuntimeStatus{
+			Loaded:   true,
+			CanEmbed: true,
+		},
+	}
+	loads := 0
+	snapshot := loadSemanticSchedulerSnapshot(context.Background(), []catalog.SemanticModelProfileStatus{profile}, func(context.Context, catalog.SemanticModelProfileStatus) (*catalog.SemanticModelBackfillSnapshot, error) {
+		loads++
+		return &catalog.SemanticModelBackfillSnapshot{Status: catalog.SemanticModelBackfillStatus{
+			ModelID:                profile.ModelID,
+			VectorSpaceID:          profile.VectorSpaceID,
+			EmbeddingDim:           profile.EmbeddingDim,
+			EligibleAssetCount:     200,
+			EligibleNowVectorCount: 100,
+			CompletedVectorCount:   100,
+			IndexedVectorCount:     50,
+			NextEligibleAt:         &nextEligibleAt,
+		}}, nil
+	})
+
+	lookup := snapshot.backfillStatus
+	if got := semanticSchedulerNextEligibleAtWithLookup(snapshot.profiles, lookup); got == nil || !got.Equal(nextEligibleAt) {
+		t.Fatalf("semanticSchedulerNextEligibleAtWithLookup() = %v, want %s", got, nextEligibleAt)
+	}
+	if got := semanticCandidateNeedingPriorityIndexPublishWithLookup(snapshot.profiles, lookup); got == nil || got.ModelID != profile.ModelID {
+		t.Fatalf("semanticCandidateNeedingPriorityIndexPublishWithLookup() = %#v, want model-a", got)
+	}
+	if got, status := semanticCandidateNeedingMixedBackfillWithLookup(snapshot.profiles, semanticIndexingSchedule{BatchSize: 100}, lookup); got == nil || status == nil {
+		t.Fatalf("semanticCandidateNeedingMixedBackfillWithLookup() = %#v, %#v, want candidate and status", got, status)
+	}
+	if got := semanticCandidateNeedingBackfillWithLookup(snapshot.profiles, lookup); got == nil || got.ModelID != profile.ModelID {
+		t.Fatalf("semanticCandidateNeedingBackfillWithLookup() = %#v, want model-a", got)
+	}
+	if loads != 1 {
+		t.Fatalf("semantic snapshot loads = %d, want exactly 1 for all scheduler decisions", loads)
+	}
+}
+
+func TestPopulateSemanticSchedulerWorkStateLoadsEachProfileOncePerDecision(t *testing.T) {
+	modelID := "scheduler-single-snapshot"
+	localRoot := t.TempDir()
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "NAS Photos",
+		Kind:      config.DatasourceKindLocalFiles,
+		RootKey:   "nas-photos",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{Key: "nas-photos", Path: localRoot}}
+		cfg.SemanticRuntime.HelperPath = writeSchedulerSnapshotSemanticHelper(t, modelID)
+	})
+	installRuntimeSemanticPackForTest(t, runtime, runtimeSemanticPackForTest(modelID))
+	deadline := time.Now().Add(5 * time.Second)
+	var profiles []catalog.SemanticModelProfileStatus
+	for time.Now().Before(deadline) {
+		installed := runtime.SemanticModelRegistryInstalledStatusWithContext(context.Background())
+		profiles = semanticBackfillCandidateProfiles(context.Background(), installed, runtime.semanticModels)
+		if len(profiles) == 1 && profiles[0].Runtime != nil && profiles[0].Runtime.Loaded && profiles[0].Runtime.CanEmbed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(profiles) != 1 || profiles[0].Runtime == nil || !profiles[0].Runtime.Loaded || !profiles[0].Runtime.CanEmbed {
+		var runtimeStatus *catalog.SemanticModelRuntimeStatus
+		if len(profiles) == 1 {
+			runtimeStatus = profiles[0].Runtime
+		}
+		t.Fatalf("installed scheduler profiles = %#v runtime=%+v, want one ready runtime profile", profiles, runtimeStatus)
+	}
+
+	var logs bytes.Buffer
+	previousOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() {
+		log.SetOutput(previousOutput)
+	})
+
+	state := schedulerWorkState{}
+	runtime.populateSemanticSchedulerWorkState(
+		context.Background(),
+		runtime.catalogService(),
+		semanticIndexingSchedule{Workers: 1, BatchSize: 100},
+		&state,
+	)
+
+	started := "timich-agent semantic model backfill status started model=" + modelID + " "
+	if loads := strings.Count(logs.String(), started); loads != 1 {
+		t.Fatalf("semantic snapshot loads through populateSemanticSchedulerWorkState = %d, want exactly 1; logs:\n%s", loads, logs.String())
+	}
+}
+
+func writeSchedulerSnapshotSemanticHelper(t *testing.T, modelID string) string {
+	t.Helper()
+
+	helperPath := filepath.Join(t.TempDir(), "timich-semantic-helper")
+	script := fmt.Sprintf(`#!/bin/sh
+command="$1"
+case "$command" in
+  inspect)
+    printf '%%s\n' '{"protocolVersion":1,"runtime":"onnxruntime","modelId":"%s","vectorSpaceId":"%s/d4","embeddingDim":4,"inputKind":"image","loaded":true,"canEmbed":true}'
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+`, modelID, modelID)
+	if err := os.WriteFile(helperPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	return helperPath
 }
 
 func TestSchedulerWorkStateLocalMetadataDeltaAfterAssignment(t *testing.T) {

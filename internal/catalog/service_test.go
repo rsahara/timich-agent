@@ -994,6 +994,7 @@ func TestCatalogCanonicalAssetsCollapseExactDuplicatesAcrossDatasources(t *testi
 		t.Fatalf("RebuildCatalogCanonicalAssets() error = %v", err)
 	}
 	store.setStandaloneGalleryReadiness(catalogGalleryReadiness{
+		localSourceKeys:               []string{localSource},
 		localImmichFallbackSourceKeys: []string{localSource},
 		immichSourceKeys:              []string{immichSource},
 	})

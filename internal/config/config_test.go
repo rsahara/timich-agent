@@ -964,6 +964,76 @@ func TestLocalDatasourceImmichFallbackDefaultsEnabledAndPersistsDisabled(t *test
 	}
 }
 
+func TestImmichExternalLibraryMappingRoundTripsAndRejectsAmbiguity(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	rootPath := t.TempDir()
+	cfg := Default()
+	cfg.LocalMediaRoots = []LocalMediaRootConfig{{Key: "nas-photos", Path: rootPath}}
+	cfg.Datasources = []DatasourceConfig{
+		{
+			SourceKey:   "1111111111111111",
+			Name:        "Immich",
+			Kind:        DatasourceKindImmichIndexed,
+			URL:         "http://immich.test",
+			AccessToken: "test-key",
+		},
+		{
+			SourceKey: "2222222222222222",
+			Name:      "NAS Photos",
+			Kind:      DatasourceKindLocalFiles,
+			RootKey:   "nas-photos",
+			Scan: &LocalDatasourceScanConfig{
+				ImmichExternalLibraryMappings: []LocalDatasourceImmichExternalLibraryMapping{{
+					SourceKey:          "1111111111111111",
+					OriginalPathPrefix: " /mnt/photos/ ",
+				}},
+			},
+		},
+	}
+	if err := WriteFile(configPath, cfg); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	mappings := loaded.Datasources[1].Scan.ImmichExternalLibraryMappings
+	if len(mappings) != 1 || mappings[0].SourceKey != "1111111111111111" || mappings[0].OriginalPathPrefix != "/mnt/photos" {
+		t.Fatalf("loaded mappings = %#v, want normalized exact mapping", mappings)
+	}
+
+	invalid := cfg
+	invalid.Datasources = append([]DatasourceConfig(nil), cfg.Datasources...)
+	local := invalid.Datasources[1]
+	scan := *local.Scan
+	scan.ImmichExternalLibraryMappings = append([]LocalDatasourceImmichExternalLibraryMapping(nil), scan.ImmichExternalLibraryMappings...)
+	scan.ImmichExternalLibraryMappings = append(scan.ImmichExternalLibraryMappings, LocalDatasourceImmichExternalLibraryMapping{
+		SourceKey:          "1111111111111111",
+		OriginalPathPrefix: "/mnt/photos/2026",
+	})
+	local.Scan = &scan
+	invalid.Datasources[1] = local
+	if err := Validate(invalid); err == nil || !strings.Contains(err.Error(), "overlaps mapping") {
+		t.Fatalf("Validate(overlap) error = %v, want overlap rejection", err)
+	}
+
+	invalid = cfg
+	invalid.Datasources = append([]DatasourceConfig(nil), cfg.Datasources...)
+	local = invalid.Datasources[1]
+	scan = *local.Scan
+	scan.ImmichExternalLibraryMappings = []LocalDatasourceImmichExternalLibraryMapping{{
+		SourceKey:          "3333333333333333",
+		OriginalPathPrefix: "/mnt/photos",
+	}}
+	local.Scan = &scan
+	invalid.Datasources[1] = local
+	if err := Validate(invalid); err == nil || !strings.Contains(err.Error(), "is not an immich_indexed datasource") {
+		t.Fatalf("Validate(unknown source) error = %v, want source-kind rejection", err)
+	}
+}
+
 func TestAddDatasourceFileAppendsDatasource(t *testing.T) {
 	t.Parallel()
 

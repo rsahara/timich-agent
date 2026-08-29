@@ -480,12 +480,18 @@ Search, Devices, and System tabs. It currently covers:
 - datasource catalog status for Immich and local filesystem datasources
 - datasource task progress by phase, including media discovery, metadata,
   thumbnail, embedding, and search-index work; normal UI polling reads the last
-  task snapshot immediately, while `?refresh=1` requests a live recompute. Task
-  snapshots are display-oriented: expensive or partially busy status reads keep
-  the most recent usable values, and process-local running state is not restored
+  task snapshot immediately. `?refresh=1` also reads the latest snapshot; Admin
+  requests never start a catalog-wide recount. Task snapshots are
+  display-oriented: process-local activity and the scheduler's cached progress
+  are overlaid on the last durable values, and running state is not restored
   from persisted snapshots after an agent restart. Until completion totals are
   available, the Tasks view omits `done` instead of presenting an unknown count
-  as zero.
+  as zero. An infrequent repair recount runs only after background queues drain
+  and is canceled when Gallery or search activity arrives. Indexed-only Agents
+  without local or semantic background work can repair the snapshot without a
+  scheduler cache. Successful scheduled Immich syncs update the same snapshot
+  immediately instead of waiting for that recount, and block repair admission
+  while their ingestion work is active.
 - manual reconciliation, plus failed metadata and thumbnail requeue for
   local filesystem datasources. Media discovery is single-flight; the UI disables
   the action while a run is active. Requeue actions move failed work back to the
@@ -720,6 +726,11 @@ curl -s http://127.0.0.1:8081/status \
   local `timich-agent` media API.
 - Refresh tokens are stored at rest as salted hashes in the paired-device
   registry instead of being persisted verbatim.
+- Refresh tokens rotate on use. To recover an immediately lost rotation
+  response, only the previous token may retrieve the same deterministic
+  replacement, and only for two minutes. The next successful rotation removes
+  that predecessor. Treat both retained generations as bearer secrets during
+  this short overlap; revoking the paired device invalidates them immediately.
 - Immich datasource API keys are stored in the local agent config file with
   owner-only file permissions. This is an accepted risk for the current
   Docker/package milestone because the agent does not yet have a separate local
@@ -815,6 +826,7 @@ Use indexed kinds when combining Immich with a NAS or another library:
   ],
   "datasources": [
     {
+      "sourceKey": "89abcdef01234567",
       "name": "Home Immich",
       "kind": "immich_indexed",
       "url": "http://immich_server:2283",
@@ -825,10 +837,17 @@ Use indexed kinds when combining Immich with a NAS or another library:
       }
     },
     {
+      "sourceKey": "0123456789abcdef",
       "name": "NAS Photos",
       "kind": "local_filesystem",
       "rootKey": "nas-photos",
       "scan": {
+        "immichExternalLibraryMappings": [
+          {
+            "sourceKey": "89abcdef01234567",
+            "originalPathPrefix": "/mnt/photos"
+          }
+        ],
         "quickScanInterval": "5m",
         "reconciliationTime": "04:00",
         "contentVerificationTime": "04:00",
@@ -839,6 +858,21 @@ Use indexed kinds when combining Immich with a NAS or another library:
   ]
 }
 ```
+
+When the Immich Indexed datasource is an Immich external library backed by the
+same files as the Local datasource, declare their relationship with
+`immichExternalLibraryMappings`. `originalPathPrefix` is the external-library
+prefix returned by Immich, while the Local root represents that prefix; for
+example, Immich `/mnt/photos/2026/family.jpg` corresponds to Local relative path
+`2026/family.jpg`. The referenced `sourceKey` must name an `immich_indexed`
+datasource, and prefixes for the same Immich datasource must not overlap.
+
+This explicit mapping is required because Immich external-library checksums can
+identify the source path instead of the file contents. Timich computes the
+Local file's content SHA-1 and size and uses that exact identity for both source
+rows. It does not guess from filenames, dates, or visual similarity. Without a
+mapping, the two datasource rows remain separate even when their paths appear
+related.
 
 The optional `indexing` object is valid only for `immich_indexed`. If an
 `immich` passthrough datasource appears with any other datasource, config load

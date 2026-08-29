@@ -188,20 +188,22 @@ func (s *Service) QueueCommittedLocalUpload(ctx context.Context, sourceKey strin
 	}
 	now := time.Now().UTC()
 	scanner := &localPhase0Scanner{
-		service:               s,
-		datasource:            trustedRoot.datasource,
-		root:                  trustedRoot.root,
-		startedAt:             now,
-		nowText:               formatCatalogTime(now),
-		settlingDuration:      0,
-		rootGeneration:        trustedRoot.rootGeneration,
-		reconciliationPending: trustedRoot.reconciliationPending,
+		service:                         s,
+		datasource:                      trustedRoot.datasource,
+		root:                            trustedRoot.root,
+		startedAt:                       now,
+		nowText:                         formatCatalogTime(now),
+		settlingDuration:                0,
+		rootGeneration:                  trustedRoot.rootGeneration,
+		reconciliationPending:           trustedRoot.reconciliationPending,
+		externalContentIdentityMappings: trustedRoot.externalContentIdentityMappings,
+		externalContentIdentityScopeKey: trustedRoot.externalContentIdentityScopeKey,
 	}
 	tx, err := s.catalog.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin committed local upload queue: %w", err)
 	}
-	locationID, _, needsMetadata, visibilityDirty, err := scanner.upsertLocationInTx(ctx, tx, relativePath, info)
+	locationID, _, needsMetadata, visibilityDirty, changedAssetID, err := scanner.upsertLocationInTx(ctx, tx, relativePath, info)
 	if err != nil {
 		_ = tx.Rollback()
 		return false, err
@@ -222,7 +224,7 @@ func (s *Service) QueueCommittedLocalUpload(ctx context.Context, sourceKey strin
 	}
 	canonicalChanged := false
 	if visibilityDirty {
-		changedCanonicalIDs, err := refreshLocalAssetVisibilityInTx(ctx, tx, trustedRoot.datasource.SourceKey, trustedRoot.root.Key, scanner.nowText)
+		changedCanonicalIDs, err := refreshLocalAssetVisibilityForAssetIDsInTx(ctx, tx, trustedRoot.datasource.SourceKey, trustedRoot.root.Key, []string{changedAssetID}, scanner.nowText)
 		if err != nil {
 			_ = tx.Rollback()
 			return false, err
@@ -231,7 +233,21 @@ func (s *Service) QueueCommittedLocalUpload(ctx context.Context, sourceKey strin
 			_ = tx.Rollback()
 			return false, err
 		}
-		canonicalChanged = len(changedCanonicalIDs) > 0
+		externalIdentityChanges, err := s.catalog.reconcileImmichExternalIdentitiesForLocalIdentityLossInTx(
+			ctx,
+			tx,
+			trustedRoot.externalContentIdentityMappings,
+			trustedRoot.externalContentIdentityScopeKey,
+			trustedRoot.datasource.SourceKey,
+			trustedRoot.root.Key,
+			[]string{relativePath},
+			scanner.nowText,
+		)
+		if err != nil {
+			_ = tx.Rollback()
+			return false, err
+		}
+		canonicalChanged = len(changedCanonicalIDs) > 0 || externalIdentityChanges > 0
 	}
 	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, canonicalChanged); err != nil {
 		return false, fmt.Errorf("commit local upload metadata queue: %w", err)
@@ -263,6 +279,9 @@ type localPhase0Scanner struct {
 	previousRootIdentity  string
 	rootGeneration        int64
 	reconciliationPending bool
+
+	externalContentIdentityMappings []immichExternalLibraryMapping
+	externalContentIdentityScopeKey string
 }
 
 type localPhase0PendingPath struct {
@@ -881,7 +900,8 @@ func (s *Service) runLocalPhase0Scan(ctx context.Context, sourceKey string, scan
 	if err := s.ensureStateWritesAvailable(); err != nil {
 		return LocalPhase0ScanResult{}, err
 	}
-	datasource, root, err := s.localDatasourceAndRoot(sourceKey)
+	datasourceState := s.datasourceStateSnapshot()
+	datasource, root, err := localDatasourceAndRootFromState(datasourceState, sourceKey)
 	if err != nil {
 		return LocalPhase0ScanResult{}, err
 	}
@@ -890,18 +910,20 @@ func (s *Service) runLocalPhase0Scan(ctx context.Context, sourceKey string, scan
 		scanMode = localPhase0ScanModeReconciliation
 	}
 	scanner := &localPhase0Scanner{
-		service:          s,
-		datasource:       *datasource,
-		root:             *root,
-		startedAt:        startedAt,
-		nowText:          formatCatalogTime(startedAt),
-		seen:             map[string]struct{}{},
-		scanMode:         scanMode,
-		directoryStates:  map[string]string{},
-		seenDirectories:  map[string]string{},
-		checkedDirs:      map[string]struct{}{},
-		retryDirs:        map[string]struct{}{},
-		settlingDuration: localDatasourceSettlingDuration(*datasource),
+		service:                         s,
+		datasource:                      *datasource,
+		root:                            *root,
+		startedAt:                       startedAt,
+		nowText:                         formatCatalogTime(startedAt),
+		seen:                            map[string]struct{}{},
+		scanMode:                        scanMode,
+		directoryStates:                 map[string]string{},
+		seenDirectories:                 map[string]string{},
+		checkedDirs:                     map[string]struct{}{},
+		retryDirs:                       map[string]struct{}{},
+		settlingDuration:                localDatasourceSettlingDuration(*datasource),
+		externalContentIdentityMappings: datasourceState.externalContentIdentityMappings,
+		externalContentIdentityScopeKey: datasourceState.externalContentIdentityScopeKey,
 		result: LocalPhase0ScanResult{
 			SourceKey:  datasource.SourceKey,
 			RootKey:    root.Key,
@@ -919,10 +941,16 @@ func (s *Service) localDatasourceAndRoot(sourceKey string) (*config.DatasourceCo
 	if s == nil || s.catalog == nil {
 		return nil, nil, ErrNoDatasourceConfigured
 	}
-	state := s.datasourceStateSnapshot()
+	return localDatasourceAndRootFromState(s.datasourceStateSnapshot(), sourceKey)
+}
+
+func localDatasourceAndRootFromState(state *serviceDatasourceState, sourceKey string) (*config.DatasourceConfig, *config.LocalMediaRootConfig, error) {
+	if state == nil {
+		return nil, nil, ErrNoDatasourceConfigured
+	}
 	sourceKey = strings.TrimSpace(sourceKey)
 	if sourceKey == "" {
-		if state == nil || state.primary == nil || state.primary.Kind != config.DatasourceKindLocalFiles {
+		if state.primary == nil || state.primary.Kind != config.DatasourceKindLocalFiles {
 			return nil, nil, ErrNoDatasourceConfigured
 		}
 		sourceKey = state.primary.SourceKey
@@ -1370,8 +1398,10 @@ func (s *localPhase0Scanner) flushPendingPaths(ctx context.Context) error {
 	}
 	changedCount := 0
 	queuedMetadataCount := 0
+	identityLossPaths := make([]string, 0)
+	identityChangedAssetIDs := make([]string, 0)
 	for _, item := range s.pending {
-		locationID, changed, needsMetadata, visibilityDirty, err := s.upsertLocationInTx(ctx, tx, item.relativePath, item.info)
+		locationID, changed, needsMetadata, visibilityDirty, changedAssetID, err := s.upsertLocationInTx(ctx, tx, item.relativePath, item.info)
 		if err != nil {
 			_ = tx.Rollback()
 			return err
@@ -1381,6 +1411,8 @@ func (s *localPhase0Scanner) flushPendingPaths(ctx context.Context) error {
 		}
 		if visibilityDirty {
 			s.visibilityDirty = true
+			identityLossPaths = append(identityLossPaths, item.relativePath)
+			identityChangedAssetIDs = append(identityChangedAssetIDs, changedAssetID)
 		}
 		if needsMetadata {
 			sortAt := formatCatalogTime(item.info.ModTime().UTC())
@@ -1403,7 +1435,38 @@ func (s *localPhase0Scanner) flushPendingPaths(ctx context.Context) error {
 			}
 		}
 	}
-	if err := tx.Commit(); err != nil {
+	canonicalChanged := false
+	if len(identityLossPaths) > 0 {
+		changedCanonicalIDs, err := refreshLocalAssetVisibilityForAssetIDsInTx(ctx, tx, s.datasource.SourceKey, s.root.Key, identityChangedAssetIDs, s.nowText)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := s.service.catalog.rebuildCatalogCanonicalIDsInTx(ctx, tx, changedCanonicalIDs, s.nowText); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		externalIdentityChanges, err := s.service.catalog.reconcileImmichExternalIdentitiesForLocalIdentityLossInTx(
+			ctx,
+			tx,
+			s.externalContentIdentityMappings,
+			s.externalContentIdentityScopeKey,
+			s.datasource.SourceKey,
+			s.root.Key,
+			identityLossPaths,
+			s.nowText,
+		)
+		if err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		canonicalChanged = externalIdentityChanges > 0 || len(changedCanonicalIDs) > 0
+	}
+	if canonicalChanged {
+		if err := s.service.catalog.commitCatalogAssetChanges(ctx, tx, canonicalChanged); err != nil {
+			return fmt.Errorf("commit local phase0 identity-loss batch: %w", err)
+		}
+	} else if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit local phase0 path batch: %w", err)
 	}
 	s.result.ChangedPaths += changedCount
@@ -1493,7 +1556,7 @@ type localLocationPathRow struct {
 	status        string
 }
 
-func (s *localPhase0Scanner) upsertLocationInTx(ctx context.Context, tx *sql.Tx, relativePath string, info fs.FileInfo) (int64, bool, bool, bool, error) {
+func (s *localPhase0Scanner) upsertLocationInTx(ctx context.Context, tx *sql.Tx, relativePath string, info fs.FileInfo) (int64, bool, bool, bool, string, error) {
 	mtime := info.ModTime().UTC()
 	mtimeText := formatCatalogTime(mtime)
 	fastSignature := fmt.Sprintf("%d:%s", info.Size(), mtimeText)
@@ -1501,12 +1564,12 @@ func (s *localPhase0Scanner) upsertLocationInTx(ctx context.Context, tx *sql.Tx,
 
 	existing, found, err := s.locationByPathInTx(ctx, tx, relativePath, false)
 	if err != nil {
-		return 0, false, false, false, fmt.Errorf("read local asset location: %w", err)
+		return 0, false, false, false, "", fmt.Errorf("read local asset location: %w", err)
 	}
 	if !found {
 		existing, found, err = s.locationByPathInTx(ctx, tx, relativePath, true)
 		if err != nil {
-			return 0, false, false, false, fmt.Errorf("read missing local asset location: %w", err)
+			return 0, false, false, false, "", fmt.Errorf("read missing local asset location: %w", err)
 		}
 	}
 	if found {
@@ -1518,44 +1581,44 @@ func (s *localPhase0Scanner) upsertLocationInTx(ctx context.Context, tx *sql.Tx,
 			switch {
 			case existing.status == "active":
 				if err := s.touchLocationInTx(ctx, tx, existing.id); err != nil {
-					return 0, false, false, false, err
+					return 0, false, false, false, "", err
 				}
-				return existing.id, false, false, false, nil
+				return existing.id, false, false, false, "", nil
 			case (existing.status == "missing" || existing.status == "permission_blocked") && existing.assetID.Valid && existing.assetID.String != "":
 				if err := s.restoreLocationInTx(ctx, tx, existing.id); err != nil {
-					return 0, false, false, false, err
+					return 0, false, false, false, "", err
 				}
-				return existing.id, true, false, true, nil
+				return existing.id, true, false, true, existing.assetID.String, nil
 			case existing.status == "discovered":
 				if err := s.touchLocationInTx(ctx, tx, existing.id); err != nil {
-					return 0, false, false, false, err
+					return 0, false, false, false, "", err
 				}
-				return existing.id, false, true, false, nil
+				return existing.id, false, true, false, "", nil
 			}
 			visibilityDirty := existing.assetID.Valid && existing.assetID.String != ""
 			if err := s.resetLocationForMetadataInTx(ctx, tx, existing.id, info.Size(), mtimeText, fastSignature, fileIdentity); err != nil {
-				return 0, false, false, false, err
+				return 0, false, false, false, "", err
 			}
-			return existing.id, true, true, visibilityDirty, nil
+			return existing.id, true, true, visibilityDirty, existing.assetID.String, nil
 		}
 		if existing.status == "missing" {
 			id, err := s.insertLocationInTx(ctx, tx, relativePath, info.Size(), mtimeText, fastSignature, fileIdentity)
 			if err != nil {
-				return 0, false, false, false, err
+				return 0, false, false, false, "", err
 			}
-			return id, true, true, false, nil
+			return id, true, true, false, "", nil
 		}
 		visibilityDirty := existing.assetID.Valid && existing.assetID.String != ""
 		if err := s.resetLocationForMetadataInTx(ctx, tx, existing.id, info.Size(), mtimeText, fastSignature, fileIdentity); err != nil {
-			return 0, false, false, false, err
+			return 0, false, false, false, "", err
 		}
-		return existing.id, true, true, visibilityDirty, nil
+		return existing.id, true, true, visibilityDirty, existing.assetID.String, nil
 	}
 	id, err := s.insertLocationInTx(ctx, tx, relativePath, info.Size(), mtimeText, fastSignature, fileIdentity)
 	if err != nil {
-		return 0, false, false, false, err
+		return 0, false, false, false, "", err
 	}
-	return id, true, true, false, nil
+	return id, true, true, false, "", nil
 }
 
 func (s *localPhase0Scanner) locationByPathInTx(ctx context.Context, tx *sql.Tx, relativePath string, missing bool) (localLocationPathRow, bool, error) {
@@ -1963,14 +2026,19 @@ func (s *localPhase0Scanner) markLocationIDBatch(ctx context.Context, ids []int6
 			AND source_key = ?
 			AND root_key = ?
 			AND status != 'missing'
-			AND updated_at < ?`)
+			AND updated_at < ?
+		RETURNING relative_path, COALESCE(asset_id, '')`)
 	if err != nil {
 		_ = tx.Rollback()
 		return 0, fmt.Errorf("prepare local phase0 location status update: %w", err)
 	}
 	updated := 0
+	updatedRelativePaths := make([]string, 0, len(ids))
+	updatedAssetIDs := make([]string, 0, len(ids))
 	for _, id := range ids {
-		result, err := statement.ExecContext(
+		var relativePath string
+		var assetID string
+		err := statement.QueryRowContext(
 			ctx,
 			status,
 			reason,
@@ -1979,28 +2047,178 @@ func (s *localPhase0Scanner) markLocationIDBatch(ctx context.Context, ids []int6
 			s.datasource.SourceKey,
 			s.root.Key,
 			s.nowText,
-		)
+		).Scan(&relativePath, &assetID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
 		if err != nil {
 			_ = statement.Close()
 			_ = tx.Rollback()
 			return 0, fmt.Errorf("mark local asset location %s: %w", status, err)
 		}
-		affected, err := result.RowsAffected()
-		if err != nil {
-			_ = statement.Close()
-			_ = tx.Rollback()
-			return 0, fmt.Errorf("read marked local asset location %s rows: %w", status, err)
-		}
-		updated += int(affected)
+		updated++
+		updatedRelativePaths = append(updatedRelativePaths, relativePath)
+		updatedAssetIDs = append(updatedAssetIDs, assetID)
 	}
 	if err := statement.Close(); err != nil {
 		_ = tx.Rollback()
 		return 0, fmt.Errorf("close local phase0 location status update: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	canonicalChanged := false
+	if len(updatedRelativePaths) > 0 {
+		changedCanonicalIDs, err := refreshLocalAssetVisibilityForAssetIDsInTx(ctx, tx, s.datasource.SourceKey, s.root.Key, updatedAssetIDs, s.nowText)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		if err := s.service.catalog.rebuildCatalogCanonicalIDsInTx(ctx, tx, changedCanonicalIDs, s.nowText); err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		externalIdentityChanges, err := s.service.catalog.reconcileImmichExternalIdentitiesForLocalIdentityLossInTx(
+			ctx,
+			tx,
+			s.externalContentIdentityMappings,
+			s.externalContentIdentityScopeKey,
+			s.datasource.SourceKey,
+			s.root.Key,
+			updatedRelativePaths,
+			s.nowText,
+		)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		canonicalChanged = externalIdentityChanges > 0 || len(changedCanonicalIDs) > 0
+	}
+	if canonicalChanged {
+		if err := s.service.catalog.commitCatalogAssetChanges(ctx, tx, canonicalChanged); err != nil {
+			return 0, fmt.Errorf("commit local phase0 identity-loss status update: %w", err)
+		}
+	} else if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit local phase0 location status update: %w", err)
 	}
 	return updated, nil
+}
+
+// refreshLocalAssetVisibilityForAssetIDsInTx keeps Phase 0 identity-loss
+// batches atomic without rescanning every Local asset for each bounded batch.
+// The full-root helper remains the final reconciliation boundary.
+func refreshLocalAssetVisibilityForAssetIDsInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	sourceKey string,
+	rootKey string,
+	assetIDs []string,
+	nowText string,
+) (map[string]struct{}, error) {
+	sourceKey = strings.TrimSpace(sourceKey)
+	rootKey = strings.TrimSpace(rootKey)
+	changedCanonicalIDs := map[string]struct{}{}
+	uniqueAssetIDs := make(map[string]struct{}, len(assetIDs))
+	for _, assetID := range assetIDs {
+		assetID = strings.TrimSpace(assetID)
+		if assetID != "" {
+			uniqueAssetIDs[assetID] = struct{}{}
+		}
+	}
+	orderedAssetIDs := make([]string, 0, len(uniqueAssetIDs))
+	for assetID := range uniqueAssetIDs {
+		orderedAssetIDs = append(orderedAssetIDs, assetID)
+	}
+	sort.Strings(orderedAssetIDs)
+
+	for _, assetID := range orderedAssetIDs {
+		visibilityStatus := "missing"
+		var primaryLocationID sql.NullInt64
+		err := tx.QueryRowContext(ctx, `SELECT id
+			FROM local_asset_locations
+			WHERE source_key = ?
+				AND root_key = ?
+				AND asset_id = ?
+				AND status = 'active'
+			ORDER BY COALESCE(verified_at, '') DESC,
+				mtime DESC,
+				root_key ASC,
+				relative_path ASC,
+				id ASC
+			LIMIT 1`, sourceKey, rootKey, assetID).Scan(&primaryLocationID)
+		if err == nil {
+			visibilityStatus = "active"
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("select scoped Local primary location: %w", err)
+		} else {
+			var permissionBlocked int
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+				SELECT 1 FROM local_asset_locations
+				WHERE source_key = ?
+					AND root_key = ?
+					AND asset_id = ?
+					AND status = 'permission_blocked'
+			)`, sourceKey, rootKey, assetID).Scan(&permissionBlocked); err != nil {
+				return nil, fmt.Errorf("read scoped Local permission state: %w", err)
+			}
+			if permissionBlocked != 0 {
+				visibilityStatus = "permission_blocked"
+			}
+		}
+
+		var primaryLocationValue any
+		if primaryLocationID.Valid {
+			primaryLocationValue = primaryLocationID.Int64
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE local_assets
+			SET visibility_status = ?, primary_location_id = ?, updated_at = ?
+			WHERE source_key = ?
+				AND asset_id = ?
+				AND (visibility_status != ? OR primary_location_id IS NOT ?)`,
+			visibilityStatus,
+			primaryLocationValue,
+			nowText,
+			sourceKey,
+			assetID,
+			visibilityStatus,
+			primaryLocationValue,
+		); err != nil {
+			return nil, fmt.Errorf("refresh scoped Local asset visibility: %w", err)
+		}
+
+		var canonicalAssetID string
+		var catalogVisibility string
+		err = tx.QueryRowContext(ctx, `SELECT COALESCE(canonical_asset_id, ''), visibility_status
+			FROM catalog_assets
+			WHERE source_key = ?
+				AND datasource_kind = ?
+				AND upstream_asset_id = ?`, sourceKey, config.DatasourceKindLocalFiles, assetID).
+			Scan(&canonicalAssetID, &catalogVisibility)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read scoped Local catalog visibility: %w", err)
+		}
+		if catalogVisibility == visibilityStatus {
+			continue
+		}
+		canonicalAssetID = strings.TrimSpace(canonicalAssetID)
+		if canonicalAssetID != "" {
+			changedCanonicalIDs[canonicalAssetID] = struct{}{}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE catalog_assets
+			SET visibility_status = ?, updated_at = ?
+			WHERE source_key = ?
+				AND datasource_kind = ?
+				AND upstream_asset_id = ?`,
+			visibilityStatus,
+			nowText,
+			sourceKey,
+			config.DatasourceKindLocalFiles,
+			assetID,
+		); err != nil {
+			return nil, fmt.Errorf("refresh scoped Local catalog visibility: %w", err)
+		}
+	}
+	return changedCanonicalIDs, nil
 }
 
 func refreshLocalAssetVisibilityInTx(ctx context.Context, tx *sql.Tx, sourceKey string, rootKey string, nowText string) (map[string]struct{}, error) {

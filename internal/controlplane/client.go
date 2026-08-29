@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	contractscontrolplane "github.com/rsahara/timich-agent/packages/contracts/controlplane"
@@ -23,6 +24,10 @@ import (
 const (
 	heartbeatInterval              = 15 * time.Second
 	hostedRelayResponseMaxBodySize = controlplanetransport.MaxRelayMessageBytes
+	hostedRelaySessionWorkers      = 1
+	hostedRelayMediaWorkers        = 4
+	hostedRelaySessionQueueSize    = 8
+	hostedRelayMediaQueueSize      = 32
 )
 
 var controlPlaneDialTimeout = 15 * time.Second
@@ -242,7 +247,9 @@ func (c *Client) runOnce(ctx context.Context) error {
 	}
 	defer conn.Close()
 
-	stream, err := conn.NewStream(ctx, controlplanetransport.ControlStreamDesc, OpenControlStreamFullMethod())
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	stream, err := conn.NewStream(runCtx, controlplanetransport.ControlStreamDesc, OpenControlStreamFullMethod())
 	if err != nil {
 		return err
 	}
@@ -255,9 +262,44 @@ func (c *Client) runOnce(ctx context.Context) error {
 		return err
 	}
 
-	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
-	defer cancelHeartbeat()
-	go c.heartbeatLoop(heartbeatCtx, stream)
+	go c.heartbeatLoop(runCtx, stream)
+
+	sessionJobs := make(chan *RelayRequest, hostedRelaySessionQueueSize)
+	mediaJobs := make(chan *RelayRequest, hostedRelayMediaQueueSize)
+	workerErrors := make(chan error, 1)
+	var workers sync.WaitGroup
+	startWorkers := func(count int, jobs <-chan *RelayRequest) {
+		for range count {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				for {
+					select {
+					case <-runCtx.Done():
+						return
+					case request := <-jobs:
+						if request == nil {
+							continue
+						}
+						if err := c.processRelayRequest(runCtx, conn, request); err != nil {
+							select {
+							case workerErrors <- err:
+							default:
+							}
+							cancelRun()
+							return
+						}
+					}
+				}
+			}()
+		}
+	}
+	startWorkers(hostedRelaySessionWorkers, sessionJobs)
+	startWorkers(hostedRelayMediaWorkers, mediaJobs)
+	defer func() {
+		cancelRun()
+		workers.Wait()
+	}()
 
 	for {
 		command, err := newMessage("ServerCommand")
@@ -265,6 +307,11 @@ func (c *Client) runOnce(ctx context.Context) error {
 			return err
 		}
 		if err := stream.RecvMsg(command); err != nil {
+			select {
+			case workerErr := <-workerErrors:
+				return workerErr
+			default:
+			}
 			return err
 		}
 
@@ -273,19 +320,59 @@ func (c *Client) runOnce(ctx context.Context) error {
 			continue
 		}
 
-		result := c.handleRelayRequest(relayRequest)
-		uploadRequest, err := newUploadRequest(result)
-		if err != nil {
-			return err
+		jobs := mediaJobs
+		if relayRequestUsesSessionWorker(relayRequest) {
+			jobs = sessionJobs
 		}
-		uploadResponse, err := newMessage("FetchResultUploadResponse")
-		if err != nil {
-			return err
-		}
-		if err := conn.Invoke(ctx, UploadFetchResultFullMethod(), uploadRequest, uploadResponse); err != nil {
-			return err
+		select {
+		case jobs <- relayRequest:
+		case <-runCtx.Done():
+			select {
+			case workerErr := <-workerErrors:
+				return workerErr
+			default:
+				return runCtx.Err()
+			}
+		default:
+			result := jsonErrorResponse(
+				relayRequest.FetchID,
+				http.StatusServiceUnavailable,
+				"relay_busy",
+				"The Agent is already handling the maximum number of Remote Browsing requests.",
+			)
+			if err := uploadRelayResult(runCtx, conn, result); err != nil {
+				return err
+			}
 		}
 	}
+}
+
+func (c *Client) processRelayRequest(ctx context.Context, conn *grpc.ClientConn, request *RelayRequest) error {
+	return uploadRelayResult(ctx, conn, c.handleRelayRequestContext(ctx, request))
+}
+
+func uploadRelayResult(ctx context.Context, conn *grpc.ClientConn, result RelayResponse) error {
+	uploadRequest, err := newUploadRequest(result)
+	if err != nil {
+		return err
+	}
+	uploadResponse, err := newMessage("FetchResultUploadResponse")
+	if err != nil {
+		return err
+	}
+	return conn.Invoke(ctx, UploadFetchResultFullMethod(), uploadRequest, uploadResponse)
+}
+
+func relayRequestUsesSessionWorker(request *RelayRequest) bool {
+	if request == nil {
+		return false
+	}
+	parsedURL, err := url.ParseRequestURI(request.Path)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(parsedURL.Path, "/v1/session/") ||
+		strings.HasPrefix(parsedURL.Path, "/v1/pairing/")
 }
 
 func (c *Client) heartbeatLoop(ctx context.Context, stream grpc.ClientStream) {
@@ -316,9 +403,26 @@ func (c *Client) heartbeatLoop(ctx context.Context, stream grpc.ClientStream) {
 }
 
 func (c *Client) handleRelayRequest(request *RelayRequest) RelayResponse {
+	return c.handleRelayRequestContext(context.Background(), request)
+}
+
+func (c *Client) handleRelayRequestContext(ctx context.Context, request *RelayRequest) RelayResponse {
 	if request == nil {
 		return jsonErrorResponse("", http.StatusBadRequest, "invalid_request", "The control-plane request is not valid.")
 	}
+	if err := ctx.Err(); err != nil {
+		return jsonErrorResponse(request.FetchID, http.StatusGatewayTimeout, "relay_request_expired", "The Remote Browsing request expired before the Agent could start it.")
+	}
+	requestCtx := ctx
+	cancel := func() {}
+	if request.DeadlineUnixMillis > 0 {
+		deadline := time.UnixMilli(request.DeadlineUnixMillis).UTC()
+		if !time.Now().UTC().Before(deadline) {
+			return jsonErrorResponse(request.FetchID, http.StatusGatewayTimeout, "relay_request_expired", "The Remote Browsing request expired before the Agent could start it.")
+		}
+		requestCtx, cancel = context.WithDeadline(ctx, deadline)
+	}
+	defer cancel()
 
 	parsedURL, err := url.ParseRequestURI(request.Path)
 	if err != nil {
@@ -329,7 +433,7 @@ func (c *Client) handleRelayRequest(request *RelayRequest) RelayResponse {
 	case request.Method == http.MethodPost && parsedURL.Path == "/v1/pairing/redeem":
 		return c.handleHostedPairing(request)
 	default:
-		return c.handleMediaRequest(request, parsedURL)
+		return c.handleMediaRequestContext(requestCtx, request, parsedURL)
 	}
 }
 
@@ -375,6 +479,10 @@ func (c *Client) handleHostedPairing(request *RelayRequest) RelayResponse {
 }
 
 func (c *Client) handleMediaRequest(request *RelayRequest, parsedURL *url.URL) RelayResponse {
+	return c.handleMediaRequestContext(context.Background(), request, parsedURL)
+}
+
+func (c *Client) handleMediaRequestContext(ctx context.Context, request *RelayRequest, parsedURL *url.URL) RelayResponse {
 	baseURL := hostedBaseURLFromHeaders(request.Headers, c.hostedBaseURL)
 	if baseURL == "" {
 		return jsonErrorResponse(
@@ -390,7 +498,7 @@ func (c *Client) handleMediaRequest(request *RelayRequest, parsedURL *url.URL) R
 		return jsonErrorResponse(request.FetchID, http.StatusBadRequest, "invalid_request", "The control-plane request path is not valid.")
 	}
 
-	httpRequest, err := http.NewRequest(request.Method, targetURL.String(), bytes.NewReader(request.Body))
+	httpRequest, err := http.NewRequestWithContext(ctx, request.Method, targetURL.String(), bytes.NewReader(request.Body))
 	if err != nil {
 		return jsonErrorResponse(request.FetchID, http.StatusBadRequest, "invalid_request", "The control-plane request could not be created.")
 	}

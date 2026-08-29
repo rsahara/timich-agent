@@ -59,12 +59,13 @@ func parseServerCommand(command *dynamicpb.Message) (commandID string, ackMessag
 		return commandID, stringFieldFromReflect(payload, "message"), nil, nil
 	case "relay_fetch":
 		request := &RelayRequest{
-			FetchID:     strings.TrimSpace(stringFieldFromReflect(payload, "fetch_id")),
-			Method:      strings.TrimSpace(stringFieldFromReflect(payload, "method")),
-			Path:        strings.TrimSpace(stringFieldFromReflect(payload, "path")),
-			Headers:     contractscontrolplane.ParseHeaders(payload),
-			Body:        contractscontrolplane.BytesFieldFromReflect(payload, "body"),
-			ContentType: strings.TrimSpace(contractscontrolplane.StringFieldFromReflect(payload, "content_type")),
+			FetchID:            strings.TrimSpace(stringFieldFromReflect(payload, "fetch_id")),
+			Method:             strings.TrimSpace(stringFieldFromReflect(payload, "method")),
+			Path:               strings.TrimSpace(stringFieldFromReflect(payload, "path")),
+			Headers:            contractscontrolplane.ParseHeaders(payload),
+			Body:               contractscontrolplane.BytesFieldFromReflect(payload, "body"),
+			ContentType:        strings.TrimSpace(contractscontrolplane.StringFieldFromReflect(payload, "content_type")),
+			DeadlineUnixMillis: contractscontrolplane.Int64FieldFromReflect(payload, "deadline_unix_millis"),
 		}
 		return commandID, "", request, nil
 	default:

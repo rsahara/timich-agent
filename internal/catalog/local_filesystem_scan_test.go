@@ -1211,6 +1211,7 @@ func TestLocalMetadataRegistrationRequeuesWhenRediscoveredAfterClaim(t *testing.
 	err = service.registerLocalMetadata(
 		context.Background(),
 		*datasource,
+		service.datasourceStateSnapshot().externalContentIdentityScopeKey,
 		location,
 		sha1Hex,
 		"image",
@@ -1252,6 +1253,99 @@ func TestLocalMetadataRegistrationRequeuesWhenRediscoveredAfterClaim(t *testing.
 	if result.RegisteredAssets != 1 || result.FailedJobs != 0 {
 		t.Fatalf("metadata retry result = %+v, want one registration", result)
 	}
+}
+
+func TestLocalMetadataRegistrationRequeuesWhenExternalIdentityScopeChangesAfterClaim(t *testing.T) {
+	const (
+		localSource  = "1111111111111111"
+		immichSource = "2222222222222222"
+	)
+	rootPath := t.TempDir()
+	mediaPath := filepath.Join(rootPath, "family.jpg")
+	if err := os.WriteFile(mediaPath, []byte("complete-photo"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	service := newLocalPhase0SettlingTestService(t, rootPath, "2m")
+	if _, err := service.RunLocalReconciliationScan(context.Background(), localSource); err != nil {
+		t.Fatalf("RunLocalReconciliationScan() error = %v", err)
+	}
+
+	var job localMetadataJob
+	if err := service.catalog.db.QueryRowContext(context.Background(), `SELECT id, source_key, COALESCE(root_key, ''), root_generation, location_id
+		FROM local_scan_jobs
+		WHERE job_kind = 'metadata' AND status = 'queued'`).Scan(&job.ID, &job.SourceKey, &job.RootKey, &job.RootGeneration, &job.LocationID); err != nil {
+		t.Fatalf("read metadata job: %v", err)
+	}
+	past := formatCatalogTime(time.Now().UTC().Add(-time.Minute))
+	if _, err := service.catalog.db.ExecContext(context.Background(), `UPDATE local_asset_locations SET metadata_not_before = ? WHERE id = ?`, past, job.LocationID); err != nil {
+		t.Fatalf("make location eligible: %v", err)
+	}
+	if _, err := service.catalog.db.ExecContext(context.Background(), `UPDATE local_scan_jobs SET scheduled_at = ? WHERE id = ?`, past, job.ID); err != nil {
+		t.Fatalf("make metadata job eligible: %v", err)
+	}
+	trustedRoot, err := service.acquireTrustedLocalMediaRoot(context.Background(), localSource)
+	if err != nil {
+		t.Fatalf("acquireTrustedLocalMediaRoot() error = %v", err)
+	}
+	staleDatasource := trustedRoot.datasource
+	staleScopeKey := trustedRoot.externalContentIdentityScopeKey
+	claimed, err := service.claimLocalMetadataJob(context.Background(), job, trustedRoot, formatCatalogTime(time.Now().UTC()))
+	_ = trustedRoot.Close()
+	if err != nil || !claimed {
+		t.Fatalf("claimLocalMetadataJob() claimed=%t error=%v", claimed, err)
+	}
+	location, err := service.localLocationForMetadata(context.Background(), job.LocationID)
+	if err != nil {
+		t.Fatalf("localLocationForMetadata() error = %v", err)
+	}
+	info, err := os.Stat(mediaPath)
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	sha1Hex, _, err := sha1File(mediaPath)
+	if err != nil {
+		t.Fatalf("sha1File() error = %v", err)
+	}
+
+	service.ReconfigureDatasources([]config.DatasourceConfig{
+		{
+			SourceKey: localSource,
+			Name:      "Local",
+			Kind:      config.DatasourceKindLocalFiles,
+			RootKey:   "nas-photos",
+			Scan: &config.LocalDatasourceScanConfig{
+				ImmichExternalLibraryMappings: []config.LocalDatasourceImmichExternalLibraryMapping{{
+					SourceKey:          immichSource,
+					OriginalPathPrefix: "/mnt/photos",
+				}},
+			},
+		},
+		{
+			SourceKey:   immichSource,
+			Name:        "Immich",
+			Kind:        config.DatasourceKindImmichIndexed,
+			URL:         "http://immich.test",
+			AccessToken: "test-key",
+		},
+	})
+	err = service.registerLocalMetadata(
+		context.Background(),
+		staleDatasource,
+		staleScopeKey,
+		location,
+		sha1Hex,
+		"image",
+		filepath.Base(mediaPath),
+		info.ModTime().UTC(),
+		info,
+		formatCatalogTime(time.Now().UTC()),
+		job.ID,
+	)
+	if !errors.Is(err, errLocalMetadataSourceChanged) {
+		t.Fatalf("registerLocalMetadata(stale scope) error = %v, want source changed", err)
+	}
+	assertLocalScanCount(t, service, `SELECT COUNT(*) FROM local_scan_jobs WHERE id = `+fmt.Sprint(job.ID)+` AND status = 'queued'`, 1)
+	assertLocalScanCount(t, service, `SELECT COUNT(*) FROM local_assets`, 0)
 }
 
 func TestLocalThumbnailReturnsChangedSourceToSettling(t *testing.T) {
@@ -1434,14 +1528,17 @@ func TestLocalPhase0MissingUpdateRechecksScanStartBoundary(t *testing.T) {
 		t.Fatalf("localDatasourceAndRoot() error = %v", err)
 	}
 	startedAt := time.Now().UTC()
+	datasourceState := service.datasourceStateSnapshot()
 	scanner := &localPhase0Scanner{
-		service:    service,
-		datasource: *datasource,
-		root:       *root,
-		startedAt:  startedAt,
-		nowText:    formatCatalogTime(startedAt),
-		seen:       map[string]struct{}{},
-		scanMode:   localPhase0ScanModeReconciliation,
+		service:                         service,
+		datasource:                      *datasource,
+		root:                            *root,
+		startedAt:                       startedAt,
+		nowText:                         formatCatalogTime(startedAt),
+		seen:                            map[string]struct{}{},
+		scanMode:                        localPhase0ScanModeReconciliation,
+		externalContentIdentityMappings: datasourceState.externalContentIdentityMappings,
+		externalContentIdentityScopeKey: datasourceState.externalContentIdentityScopeKey,
 	}
 	missingIDs, _, _, err := scanner.missingLocationIDs(context.Background())
 	if err != nil {

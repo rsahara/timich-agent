@@ -65,6 +65,7 @@ func TestDeviceRegistryStoreCreateRedeemAndRotate(t *testing.T) {
 
 	rotated, err := registry.RotateRefreshToken(
 		device.CurrentRefreshToken,
+		"replacement-refresh-token",
 		now.Add(2*time.Minute),
 		now.Add(48*time.Hour),
 	)
@@ -73,6 +74,135 @@ func TestDeviceRegistryStoreCreateRedeemAndRotate(t *testing.T) {
 	}
 	if rotated.CurrentRefreshToken == device.CurrentRefreshToken {
 		t.Fatal("RotateRefreshToken() did not rotate the refresh token")
+	}
+	registry, err = LoadOrCreateDeviceRegistry(dataDir, 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry(after rotation) error = %v", err)
+	}
+	// The immediate predecessor survives a process restart only within the short
+	// replay grace and can recover only the deterministic replacement.
+	recovered, err := registry.RotateRefreshToken(
+		device.CurrentRefreshToken,
+		"replacement-refresh-token",
+		now.Add(3*time.Minute),
+		now.Add(48*time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("RotateRefreshToken(previous retry) error = %v", err)
+	}
+	if recovered.CurrentRefreshToken != rotated.CurrentRefreshToken {
+		t.Fatalf("previous-token retry returned %q, want current replacement", recovered.CurrentRefreshToken)
+	}
+	advanced, err := registry.RotateRefreshToken(
+		rotated.CurrentRefreshToken,
+		"next-refresh-token",
+		now.Add(4*time.Minute),
+		now.Add(72*time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("RotateRefreshToken(current generation) error = %v", err)
+	}
+	if advanced.CurrentRefreshToken != "next-refresh-token" {
+		t.Fatalf("current generation replacement = %q, want next-refresh-token", advanced.CurrentRefreshToken)
+	}
+	if _, err := registry.RotateRefreshToken(
+		device.CurrentRefreshToken,
+		"replacement-refresh-token",
+		now.Add(5*time.Minute),
+		now.Add(72*time.Hour),
+	); !errors.Is(err, ErrRefreshTokenNotFound) {
+		t.Fatalf("RotateRefreshToken(two generations old) error = %v, want %v", err, ErrRefreshTokenNotFound)
+	}
+}
+
+func TestDeviceRegistryStorePreviousGenerationExpiresAfterReplayGrace(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	registry, err := LoadOrCreateDeviceRegistry(dataDir, 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+
+	now := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	device, err := registry.CreateHostedDevice("Test iPhone", now, now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("CreateHostedDevice() error = %v", err)
+	}
+	currentExpiresAt := now.Add(30 * 24 * time.Hour)
+	rotatedAt := now.Add(59 * time.Minute)
+	if _, err := registry.RotateRefreshToken(
+		device.CurrentRefreshToken,
+		"replacement-refresh-token",
+		rotatedAt,
+		currentExpiresAt,
+	); err != nil {
+		t.Fatalf("RotateRefreshToken() error = %v", err)
+	}
+
+	registry, err = LoadOrCreateDeviceRegistry(dataDir, 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry(after rotation) error = %v", err)
+	}
+	if _, err := registry.RotateRefreshToken(
+		device.CurrentRefreshToken,
+		"replacement-refresh-token",
+		rotatedAt.Add(previousRefreshTokenReplayGrace-time.Second),
+		currentExpiresAt,
+	); err != nil {
+		t.Fatalf("RotateRefreshToken(previous before replay grace) error = %v", err)
+	}
+	if _, err := registry.RotateRefreshToken(
+		device.CurrentRefreshToken,
+		"replacement-refresh-token",
+		rotatedAt.Add(previousRefreshTokenReplayGrace),
+		currentExpiresAt.Add(30*24*time.Hour),
+	); !errors.Is(err, ErrRefreshTokenNotFound) {
+		t.Fatalf("RotateRefreshToken(previous at replay grace) error = %v, want %v", err, ErrRefreshTokenNotFound)
+	}
+}
+
+func TestDeviceRegistryStoreCapsPersistedPredecessorReplayGraceOnLoad(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	registry, err := LoadOrCreateDeviceRegistry(dataDir, 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+	now := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	device, err := registry.CreateHostedDevice("Test iPhone", now, now.Add(30*24*time.Hour))
+	if err != nil {
+		t.Fatalf("CreateHostedDevice() error = %v", err)
+	}
+	if _, err := registry.RotateRefreshToken(
+		device.CurrentRefreshToken,
+		"replacement-refresh-token",
+		now.Add(time.Minute),
+		now.Add(30*24*time.Hour),
+	); err != nil {
+		t.Fatalf("RotateRefreshToken() error = %v", err)
+	}
+
+	registry.mu.Lock()
+	registry.registry.Devices[0].PreviousRefreshTokenValidUntil = now.Add(30 * 24 * time.Hour)
+	if err := registry.persistLocked(); err != nil {
+		registry.mu.Unlock()
+		t.Fatalf("persist legacy predecessor lifetime: %v", err)
+	}
+	registry.mu.Unlock()
+
+	reloaded, err := LoadOrCreateDeviceRegistry(dataDir, 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry(legacy predecessor) error = %v", err)
+	}
+	snapshot := reloaded.Snapshot()
+	if len(snapshot.Devices) != 1 {
+		t.Fatalf("device count after reload = %d, want 1", len(snapshot.Devices))
+	}
+	loaded := snapshot.Devices[0]
+	if loaded.PreviousRefreshTokenHash != "" || loaded.PreviousRefreshTokenSalt != "" || !loaded.PreviousRefreshTokenValidUntil.IsZero() {
+		t.Fatalf("legacy predecessor after reload = %+v, want expired replay state cleared", loaded)
 	}
 }
 
@@ -522,6 +652,7 @@ func TestDeviceRegistryStoreLoadsLegacyPlaintextRefreshToken(t *testing.T) {
 
 	rotated, err := registry.RotateRefreshToken(
 		"legacy-refresh-token",
+		"replacement-refresh-token",
 		expiresAt,
 		now.Add(48*time.Hour),
 	)

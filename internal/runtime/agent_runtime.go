@@ -13,6 +13,7 @@ import (
 	goruntime "runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rsahara/timich-agent/internal/catalog"
@@ -46,78 +47,79 @@ var (
 
 // AgentRuntime exposes redacted runtime state to the local admin and media APIs.
 type AgentRuntime struct {
-	mu                              sync.RWMutex
-	configMutationMu                sync.Mutex
-	build                           BuildInfo
-	config                          config.ResolvedConfig
-	state                           store.LoadedState
-	assetIDKey                      assetIDKeys
-	startedAt                       time.Time
-	registry                        *store.DeviceRegistryStore
-	profiles                        *store.DeviceProfileStore
-	uploads                         *store.UploadStore
-	uploadMu                        sync.Mutex
-	maintenanceMu                   sync.Mutex
-	maintenanceCancel               context.CancelFunc
-	maintenanceWG                   sync.WaitGroup
-	mirrorSyncMu                    sync.Mutex
-	datasourceTaskMu                sync.Mutex
-	datasourceDiscoveryActive       int
-	datasourceTaskActive            map[string]int
-	datasourceSnapshot              *DatasourceIndexingResponse
-	datasourceSnapshotAt            time.Time
-	datasourceSnapshotHash          string
-	datasourceSnapshotBusy          bool
-	datasourceSnapshotStarted       time.Time
-	datasourceSnapshotFinished      time.Time
-	datasourceSnapshotInvalid       bool
-	datasourceStatusLastAdminAccess time.Time
-	datasourceStatusRefreshMu       sync.Mutex
-	datasourceStatusCancel          context.CancelFunc
-	datasourceStatusWG              sync.WaitGroup
-	semanticModelSnapshotMu         sync.Mutex
-	semanticModelSnapshot           *catalog.SemanticModelRegistryStatus
-	semanticModelSnapshotAt         time.Time
-	mirrorSchedulerMu               sync.Mutex
-	mirrorCancel                    context.CancelFunc
-	mirrorWG                        sync.WaitGroup
-	localScanMu                     sync.Mutex
-	localDiscovery                  localDiscoverySingleFlight
-	localScanSchedulerMu            sync.Mutex
-	localScanCancel                 context.CancelFunc
-	localScanWG                     sync.WaitGroup
-	localScanScheduleReset          chan struct{}
-	localVerifyScheduleReset        chan struct{}
-	localBackgroundWorkMu           sync.Mutex
-	localContentVerificationLast    string
-	localBackgroundWorkRetryAt      map[string]time.Time
-	localPhase3Mu                   sync.Mutex
-	localPhase3Next                 string
-	semanticBackfillMu              sync.Mutex
-	semanticBackfillCancel          context.CancelFunc
-	backgroundWorkerWake            chan struct{}
-	backgroundWorkerMu              sync.Mutex
-	backgroundWorkerActive          map[string]int
-	backgroundWorkerRandom          func() float64
-	schedulerWorkStateMu            sync.Mutex
-	schedulerWorkState              schedulerWorkState
-	schedulerWorkStateSeq           uint64
-	semanticBackfillWG              sync.WaitGroup
-	semanticWorkMu                  sync.Mutex
-	semanticTaskMu                  sync.Mutex
-	semanticActiveWorkers           int
-	semanticIndexActive             int
-	semanticIndexingNextRun         *time.Time
-	semanticIndexingRetryNotBefore  *time.Time
-	semanticPublishRetryNotBefore   *time.Time
-	pairing                         *pairing.Service
-	catalog                         *catalog.Service
-	semanticModels                  *catalog.SemanticModelPackStore
-	semanticRuntimePacks            *catalog.SemanticRuntimePackStore
-	semanticPackLifecycleMu         sync.Mutex
-	semanticTopologyGeneration      uint64
-	semanticONNXRuntime             *semanticONNXRuntimeManager
-	webrtc                          *webrtcmedia.Manager
+	mu                             sync.RWMutex
+	configMutationMu               sync.Mutex
+	build                          BuildInfo
+	config                         config.ResolvedConfig
+	state                          store.LoadedState
+	assetIDKey                     assetIDKeys
+	startedAt                      time.Time
+	registry                       *store.DeviceRegistryStore
+	profiles                       *store.DeviceProfileStore
+	uploads                        *store.UploadStore
+	uploadMu                       sync.Mutex
+	maintenanceMu                  sync.Mutex
+	maintenanceCancel              context.CancelFunc
+	maintenanceWG                  sync.WaitGroup
+	mirrorSyncMu                   sync.Mutex
+	datasourceMirrorSyncActive     atomic.Int64
+	datasourceTaskMu               sync.Mutex
+	datasourceDiscoveryActive      int
+	datasourceTaskActive           map[string]int
+	datasourceSnapshot             *DatasourceIndexingResponse
+	datasourceSnapshotAt           time.Time
+	datasourceSnapshotHash         string
+	datasourceSnapshotBusy         bool
+	datasourceSnapshotStarted      time.Time
+	datasourceSnapshotFinished     time.Time
+	datasourceSnapshotInvalid      bool
+	datasourceStatusRefreshMu      sync.Mutex
+	datasourceStatusCancel         context.CancelFunc
+	datasourceStatusWG             sync.WaitGroup
+	semanticModelSnapshotMu        sync.Mutex
+	semanticModelSnapshot          *catalog.SemanticModelRegistryStatus
+	semanticModelSnapshotAt        time.Time
+	mirrorSchedulerMu              sync.Mutex
+	mirrorCancel                   context.CancelFunc
+	mirrorWG                       sync.WaitGroup
+	localScanMu                    sync.Mutex
+	localDiscovery                 localDiscoverySingleFlight
+	localScanSchedulerMu           sync.Mutex
+	localScanCancel                context.CancelFunc
+	localScanWG                    sync.WaitGroup
+	localScanScheduleReset         chan struct{}
+	localVerifyScheduleReset       chan struct{}
+	localBackgroundWorkMu          sync.Mutex
+	localContentVerificationLast   string
+	localBackgroundWorkRetryAt     map[string]time.Time
+	localPhase3Mu                  sync.Mutex
+	localPhase3Next                string
+	semanticBackfillMu             sync.Mutex
+	semanticBackfillCancel         context.CancelFunc
+	backgroundWorkerWake           chan struct{}
+	backgroundWorkerMu             sync.Mutex
+	backgroundWorkerActive         map[string]int
+	backgroundWorkerRandom         func() float64
+	schedulerWorkStateMu           sync.Mutex
+	schedulerWorkState             schedulerWorkState
+	schedulerWorkStateSeq          uint64
+	semanticBackfillWG             sync.WaitGroup
+	semanticWorkMu                 sync.Mutex
+	semanticTaskMu                 sync.Mutex
+	semanticActiveWorkers          int
+	semanticIndexActive            int
+	foregroundCatalog              foregroundActivityGate
+	semanticIndexingNextRun        *time.Time
+	semanticIndexingRetryNotBefore *time.Time
+	semanticPublishRetryNotBefore  *time.Time
+	pairing                        *pairing.Service
+	catalog                        *catalog.Service
+	semanticModels                 *catalog.SemanticModelPackStore
+	semanticRuntimePacks           *catalog.SemanticRuntimePackStore
+	semanticPackLifecycleMu        sync.Mutex
+	semanticTopologyGeneration     uint64
+	semanticONNXRuntime            *semanticONNXRuntimeManager
+	webrtc                         *webrtcmedia.Manager
 }
 
 type BuildInfo struct {
@@ -1808,12 +1810,23 @@ func (a *AgentRuntime) UpdatePrimaryDatasource(input config.DatasourceConfig) (P
 	if catalogService == nil {
 		return PrimaryDatasourceResponse{}, catalog.ErrNoDatasourceConfigured
 	}
-	if _, err := config.UpdatePrimaryDatasourceFile(nextConfig.ConfigPath, nextDatasource); err != nil {
+	configSnapshot, err := snapshotConfigFile(nextConfig.ConfigPath)
+	if err != nil {
+		return PrimaryDatasourceResponse{}, err
+	}
+	if err := applyConfigFileMutation(configSnapshot, func() error {
+		_, err := config.UpdatePrimaryDatasourceFile(nextConfig.ConfigPath, nextDatasource)
+		return err
+	}); err != nil {
 		return PrimaryDatasourceResponse{}, err
 	}
 
 	a.mirrorSyncMu.Lock()
-	catalogService.ReconfigureDatasources(nextConfig.Datasources)
+	if err := catalogService.ReconfigureDatasources(nextConfig.Datasources); err != nil {
+		rollbackErr := configSnapshot.restore()
+		a.mirrorSyncMu.Unlock()
+		return PrimaryDatasourceResponse{}, errors.Join(err, rollbackErr)
+	}
 	a.mu.Lock()
 	nextConfig.ConfigSource = "file"
 	a.config = nextConfig
@@ -1865,13 +1878,24 @@ func (a *AgentRuntime) AddDatasource(input config.DatasourceConfig) (DatasourceS
 	if catalogService == nil {
 		return DatasourceSummary{}, catalog.ErrNoDatasourceConfigured
 	}
-	if _, err := config.AddDatasourceFile(nextConfig.ConfigPath, nextDatasource); err != nil {
+	configSnapshot, err := snapshotConfigFile(nextConfig.ConfigPath)
+	if err != nil {
+		return DatasourceSummary{}, err
+	}
+	if err := applyConfigFileMutation(configSnapshot, func() error {
+		_, err := config.AddDatasourceFile(nextConfig.ConfigPath, nextDatasource)
+		return err
+	}); err != nil {
 		return DatasourceSummary{}, err
 	}
 	nextConfig.ConfigSource = "file"
 
 	a.mirrorSyncMu.Lock()
-	catalogService.ReconfigureDatasources(nextConfig.Datasources)
+	if err := catalogService.ReconfigureDatasources(nextConfig.Datasources); err != nil {
+		rollbackErr := configSnapshot.restore()
+		a.mirrorSyncMu.Unlock()
+		return DatasourceSummary{}, errors.Join(err, rollbackErr)
+	}
 	a.mu.Lock()
 	a.config = nextConfig
 	a.semanticTopologyGeneration++
@@ -1937,12 +1961,23 @@ func (a *AgentRuntime) UpdateLocalDatasourceImmichFallback(sourceKey string, ena
 	if catalogService == nil {
 		return DatasourceSummary{}, catalog.ErrNoDatasourceConfigured
 	}
-	if _, err := config.UpdateLocalDatasourceImmichFallbackFile(nextConfig.ConfigPath, sourceKey, enabled); err != nil {
+	configSnapshot, err := snapshotConfigFile(nextConfig.ConfigPath)
+	if err != nil {
+		return DatasourceSummary{}, err
+	}
+	if err := applyConfigFileMutation(configSnapshot, func() error {
+		_, err := config.UpdateLocalDatasourceImmichFallbackFile(nextConfig.ConfigPath, sourceKey, enabled)
+		return err
+	}); err != nil {
 		return DatasourceSummary{}, err
 	}
 
 	a.mirrorSyncMu.Lock()
-	catalogService.ReconfigureDatasources(nextConfig.Datasources)
+	if err := catalogService.ReconfigureDatasources(nextConfig.Datasources); err != nil {
+		rollbackErr := configSnapshot.restore()
+		a.mirrorSyncMu.Unlock()
+		return DatasourceSummary{}, errors.Join(err, rollbackErr)
+	}
 	a.mu.Lock()
 	nextConfig.ConfigSource = "file"
 	a.config = nextConfig
@@ -2499,6 +2534,8 @@ func (a *AgentRuntime) SearchAssets(request catalog.AssetSearchRequest) (catalog
 
 // SearchAssetsWithContext returns one app-facing search page with Timich-owned opaque asset IDs.
 func (a *AgentRuntime) SearchAssetsWithContext(ctx context.Context, request catalog.AssetSearchRequest) (catalog.AssetSearchPage, error) {
+	foregroundDone := a.foregroundCatalog.begin()
+	defer foregroundDone()
 	catalogService, assetIDKey, sourceKey := a.catalogSnapshot()
 	page, err := catalogService.SearchAssetsWithOptionsContext(ctx, request, catalog.AssetSearchOptions{})
 	if err != nil {
@@ -2509,6 +2546,8 @@ func (a *AgentRuntime) SearchAssetsWithContext(ctx context.Context, request cata
 
 // SearchAssetsForAdminPreview returns one signed page with Admin-only search diagnostics.
 func (a *AgentRuntime) SearchAssetsForAdminPreview(ctx context.Context, request catalog.AssetSearchRequest, options catalog.AssetSearchOptions) (catalog.AssetSearchPage, error) {
+	foregroundDone := a.foregroundCatalog.begin()
+	defer foregroundDone()
 	catalogService, assetIDKey, sourceKey := a.catalogSnapshot()
 	options.IncludeSemanticScores = true
 	page, err := catalogService.SearchAssetsWithOptionsContext(ctx, request, options)
@@ -2814,6 +2853,9 @@ func (a *AgentRuntime) backfillSemanticModelCandidate(ctx context.Context, maxAs
 	if options.Workers <= 0 && maxAssets > 0 {
 		options.Workers = a.effectiveHeavyTaskWorkers()
 	}
+	if maxAssets > 0 && options.BeforeEmbed == nil {
+		options.BeforeEmbed = a.foregroundCatalog.waitUntilIdle
+	}
 	if options.Workers <= 0 && maxAssets > 0 {
 		result := catalog.SemanticBackfillResult{}
 		if backfill, err := catalogService.SemanticModelBackfillStatus(ctx, *candidate); err == nil && backfill != nil {
@@ -3067,19 +3109,34 @@ func semanticModelBackfillMatchesIdentity(status catalog.SemanticModelBackfillSt
 	return strings.TrimSpace(status.ModelID) == modelID && strings.TrimSpace(status.VectorSpaceID) == vectorSpaceID
 }
 
+type semanticBackfillStatusLookup func(profile catalog.SemanticModelProfileStatus) (*catalog.SemanticModelBackfillStatus, error)
+
+type semanticIndexPublishNeedLookup func(profile catalog.SemanticModelProfileStatus) (bool, int, error)
+
 func semanticCandidateNeedingBackfill(ctx context.Context, catalogService *catalog.Service, status catalog.SemanticModelRegistryStatus, modelStore *catalog.SemanticModelPackStore) *catalog.SemanticModelProfileStatus {
+	if catalogService == nil {
+		return nil
+	}
+	profiles := semanticBackfillCandidateProfiles(ctx, status, modelStore)
+	return semanticCandidateNeedingBackfillWithLookup(profiles, func(profile catalog.SemanticModelProfileStatus) (*catalog.SemanticModelBackfillStatus, error) {
+		return catalogService.SemanticModelBackfillStatus(ctx, profile)
+	})
+}
+
+func semanticCandidateNeedingBackfillWithLookup(profiles []catalog.SemanticModelProfileStatus, lookup semanticBackfillStatusLookup) *catalog.SemanticModelProfileStatus {
 	var selected *catalog.SemanticModelProfileStatus
 	selectedRemaining := 0
 	selectedPriority := 0
-	for _, profile := range semanticBackfillCandidateProfiles(ctx, status, modelStore) {
+	for _, profile := range profiles {
 		rolePriority := semanticBackfillRolePriority(profile)
 		if rolePriority == 0 ||
 			profile.Runtime == nil ||
 			!profile.Runtime.Loaded ||
-			!profile.Runtime.CanEmbed {
+			!profile.Runtime.CanEmbed ||
+			lookup == nil {
 			continue
 		}
-		backfill, err := catalogService.SemanticModelBackfillStatus(ctx, profile)
+		backfill, err := lookup(profile)
 		workCount := semanticCandidateVectorBackfillWorkCount(backfill)
 		if err != nil || backfill == nil || workCount <= 0 {
 			continue
@@ -3096,19 +3153,30 @@ func semanticCandidateNeedingBackfill(ctx context.Context, catalogService *catal
 }
 
 func semanticCandidateNeedingMixedBackfill(ctx context.Context, catalogService *catalog.Service, status catalog.SemanticModelRegistryStatus, modelStore *catalog.SemanticModelPackStore, schedule semanticIndexingSchedule) (*catalog.SemanticModelProfileStatus, *catalog.SemanticModelBackfillStatus) {
+	if catalogService == nil {
+		return nil, nil
+	}
+	profiles := semanticBackfillCandidateProfiles(ctx, status, modelStore)
+	return semanticCandidateNeedingMixedBackfillWithLookup(profiles, schedule, func(profile catalog.SemanticModelProfileStatus) (*catalog.SemanticModelBackfillStatus, error) {
+		return catalogService.SemanticModelBackfillStatus(ctx, profile)
+	})
+}
+
+func semanticCandidateNeedingMixedBackfillWithLookup(profiles []catalog.SemanticModelProfileStatus, schedule semanticIndexingSchedule, lookup semanticBackfillStatusLookup) (*catalog.SemanticModelProfileStatus, *catalog.SemanticModelBackfillStatus) {
 	var selected *catalog.SemanticModelProfileStatus
 	var selectedStatus *catalog.SemanticModelBackfillStatus
 	selectedQueued := 0
 	selectedPriority := 0
-	for _, profile := range semanticBackfillCandidateProfiles(ctx, status, modelStore) {
+	for _, profile := range profiles {
 		rolePriority := semanticBackfillRolePriority(profile)
 		if rolePriority == 0 ||
 			profile.Runtime == nil ||
 			!profile.Runtime.Loaded ||
-			!profile.Runtime.CanEmbed {
+			!profile.Runtime.CanEmbed ||
+			lookup == nil {
 			continue
 		}
-		backfill, err := catalogService.SemanticModelBackfillStatus(ctx, profile)
+		backfill, err := lookup(profile)
 		if err != nil || backfill == nil {
 			continue
 		}
@@ -3130,18 +3198,29 @@ func semanticCandidateNeedingMixedBackfill(ctx context.Context, catalogService *
 }
 
 func semanticCandidateNeedingIndexPublish(ctx context.Context, catalogService *catalog.Service, status catalog.SemanticModelRegistryStatus, modelStore *catalog.SemanticModelPackStore) *catalog.SemanticModelProfileStatus {
+	if catalogService == nil {
+		return nil
+	}
+	profiles := semanticBackfillCandidateProfiles(ctx, status, modelStore)
+	return semanticCandidateNeedingIndexPublishWithLookup(profiles, func(profile catalog.SemanticModelProfileStatus) (bool, int, error) {
+		return catalogService.SemanticModelIndexPublishNeeded(ctx, modelStore, profile, nil, false)
+	})
+}
+
+func semanticCandidateNeedingIndexPublishWithLookup(profiles []catalog.SemanticModelProfileStatus, lookup semanticIndexPublishNeedLookup) *catalog.SemanticModelProfileStatus {
 	var selected *catalog.SemanticModelProfileStatus
 	selectedWork := 0
 	selectedPriority := 0
-	for _, profile := range semanticBackfillCandidateProfiles(ctx, status, modelStore) {
+	for _, profile := range profiles {
 		rolePriority := semanticBackfillRolePriority(profile)
 		if rolePriority == 0 ||
 			profile.Runtime == nil ||
 			!profile.Runtime.Loaded ||
-			!profile.Runtime.CanEmbed {
+			!profile.Runtime.CanEmbed ||
+			lookup == nil {
 			continue
 		}
-		needed, workCount, err := catalogService.SemanticModelIndexPublishNeeded(ctx, modelStore, profile, nil, false)
+		needed, workCount, err := lookup(profile)
 		if err != nil || !needed || workCount <= 0 {
 			continue
 		}
@@ -3157,18 +3236,29 @@ func semanticCandidateNeedingIndexPublish(ctx context.Context, catalogService *c
 }
 
 func semanticCandidateNeedingPriorityIndexPublish(ctx context.Context, catalogService *catalog.Service, status catalog.SemanticModelRegistryStatus, modelStore *catalog.SemanticModelPackStore) *catalog.SemanticModelProfileStatus {
+	if catalogService == nil {
+		return nil
+	}
+	profiles := semanticBackfillCandidateProfiles(ctx, status, modelStore)
+	return semanticCandidateNeedingPriorityIndexPublishWithLookup(profiles, func(profile catalog.SemanticModelProfileStatus) (*catalog.SemanticModelBackfillStatus, error) {
+		return catalogService.SemanticModelBackfillStatus(ctx, profile)
+	})
+}
+
+func semanticCandidateNeedingPriorityIndexPublishWithLookup(profiles []catalog.SemanticModelProfileStatus, lookup semanticBackfillStatusLookup) *catalog.SemanticModelProfileStatus {
 	var selected *catalog.SemanticModelProfileStatus
 	selectedWork := 0
 	selectedPriority := 0
-	for _, profile := range semanticBackfillCandidateProfiles(ctx, status, modelStore) {
+	for _, profile := range profiles {
 		rolePriority := semanticBackfillRolePriority(profile)
 		if rolePriority == 0 ||
 			profile.Runtime == nil ||
 			!profile.Runtime.Loaded ||
-			!profile.Runtime.CanEmbed {
+			!profile.Runtime.CanEmbed ||
+			lookup == nil {
 			continue
 		}
-		backfill, err := catalogService.SemanticModelBackfillStatus(ctx, profile)
+		backfill, err := lookup(profile)
 		if err != nil || backfill == nil || !semanticPriorityIndexPublishDue(*backfill) {
 			continue
 		}
@@ -3597,6 +3687,8 @@ func (a *AgentRuntime) SyncPrimaryDatasourceMirror(ctx context.Context, mode str
 
 // Asset returns metadata for one Timich-owned opaque asset ID.
 func (a *AgentRuntime) Asset(assetID string) (catalog.Asset, error) {
+	foregroundDone := a.foregroundCatalog.begin()
+	defer foregroundDone()
 	catalogService, assetIDKey, sourceKey := a.catalogSnapshot()
 	assetSourceKey, upstreamAssetID, err := decodeClientAssetID(assetIDKey, sourceKey, assetID)
 	if err != nil {
@@ -3624,32 +3716,41 @@ func (a *AgentRuntime) CatalogPage(pageIndex int, pageSize int) (catalog.AssetSe
 
 // Preview proxies a preview image response for a local client.
 func (a *AgentRuntime) Preview(request *http.Request, assetID string) (*catalog.UpstreamMediaResponse, error) {
+	foregroundDone := a.foregroundCatalog.begin()
 	catalogService, assetIDKey, sourceKey := a.catalogSnapshot()
 	assetSourceKey, upstreamAssetID, err := decodeClientAssetID(assetIDKey, sourceKey, assetID)
 	if err != nil {
+		foregroundDone()
 		return nil, err
 	}
-	return catalogService.PreviewFromSource(request, assetSourceKey, upstreamAssetID)
+	response, err := catalogService.PreviewFromSource(request, assetSourceKey, upstreamAssetID)
+	return a.foregroundMediaResponse(response, err, foregroundDone)
 }
 
 // DetailPreview returns a detail-preview image response for a client.
 func (a *AgentRuntime) DetailPreview(request *http.Request, assetID string) (*catalog.UpstreamMediaResponse, error) {
+	foregroundDone := a.foregroundCatalog.begin()
 	catalogService, assetIDKey, sourceKey := a.catalogSnapshot()
 	assetSourceKey, upstreamAssetID, err := decodeClientAssetID(assetIDKey, sourceKey, assetID)
 	if err != nil {
+		foregroundDone()
 		return nil, err
 	}
-	return catalogService.DetailPreviewFromSource(request, assetSourceKey, upstreamAssetID)
+	response, err := catalogService.DetailPreviewFromSource(request, assetSourceKey, upstreamAssetID)
+	return a.foregroundMediaResponse(response, err, foregroundDone)
 }
 
 // Original proxies an original asset response for a local client.
 func (a *AgentRuntime) Original(request *http.Request, assetID string) (*catalog.UpstreamMediaResponse, error) {
+	foregroundDone := a.foregroundCatalog.begin()
 	catalogService, assetIDKey, sourceKey := a.catalogSnapshot()
 	assetSourceKey, upstreamAssetID, err := decodeClientAssetID(assetIDKey, sourceKey, assetID)
 	if err != nil {
+		foregroundDone()
 		return nil, err
 	}
-	return catalogService.OriginalFromSource(request, assetSourceKey, upstreamAssetID)
+	response, err := catalogService.OriginalFromSource(request, assetSourceKey, upstreamAssetID)
+	return a.foregroundMediaResponse(response, err, foregroundDone)
 }
 
 // AnswerWebRTCOffer answers a remote media DataChannel offer for prototype streaming.

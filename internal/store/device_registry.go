@@ -18,6 +18,7 @@ import (
 
 const deviceRegistryFileName = "device-registry.json"
 const maxPairingFailedAttempts = 5
+const previousRefreshTokenReplayGrace = 2 * time.Minute
 
 var (
 	ErrPairingSessionNotFound = errors.New("pairing session not found")
@@ -41,14 +42,17 @@ type PairingSession struct {
 
 // DeviceRecord stores one paired app device and its refresh-token family.
 type DeviceRecord struct {
-	DeviceID                string    `json:"deviceId"`
-	DeviceName              string    `json:"deviceName"`
-	CreatedAt               time.Time `json:"createdAt"`
-	LastRefreshedAt         time.Time `json:"lastRefreshedAt"`
-	CurrentRefreshToken     string    `json:"-"`
-	CurrentRefreshTokenHash string    `json:"currentRefreshTokenHash,omitempty"`
-	RefreshTokenSalt        string    `json:"refreshTokenSalt,omitempty"`
-	RefreshTokenExpiresAt   time.Time `json:"refreshTokenExpiresAt"`
+	DeviceID                       string    `json:"deviceId"`
+	DeviceName                     string    `json:"deviceName"`
+	CreatedAt                      time.Time `json:"createdAt"`
+	LastRefreshedAt                time.Time `json:"lastRefreshedAt"`
+	CurrentRefreshToken            string    `json:"-"`
+	CurrentRefreshTokenHash        string    `json:"currentRefreshTokenHash,omitempty"`
+	RefreshTokenSalt               string    `json:"refreshTokenSalt,omitempty"`
+	RefreshTokenExpiresAt          time.Time `json:"refreshTokenExpiresAt"`
+	PreviousRefreshTokenHash       string    `json:"previousRefreshTokenHash,omitempty"`
+	PreviousRefreshTokenSalt       string    `json:"previousRefreshTokenSalt,omitempty"`
+	PreviousRefreshTokenValidUntil time.Time `json:"previousRefreshTokenValidUntil,omitempty"`
 }
 
 // DeviceRegistry holds the persisted local pairing/device state.
@@ -68,14 +72,17 @@ type DeviceRegistryStore struct {
 }
 
 type deviceRecordJSON struct {
-	DeviceID                string    `json:"deviceId"`
-	DeviceName              string    `json:"deviceName"`
-	CreatedAt               time.Time `json:"createdAt"`
-	LastRefreshedAt         time.Time `json:"lastRefreshedAt"`
-	CurrentRefreshToken     string    `json:"currentRefreshToken,omitempty"`
-	CurrentRefreshTokenHash string    `json:"currentRefreshTokenHash,omitempty"`
-	RefreshTokenSalt        string    `json:"refreshTokenSalt,omitempty"`
-	RefreshTokenExpiresAt   time.Time `json:"refreshTokenExpiresAt"`
+	DeviceID                       string    `json:"deviceId"`
+	DeviceName                     string    `json:"deviceName"`
+	CreatedAt                      time.Time `json:"createdAt"`
+	LastRefreshedAt                time.Time `json:"lastRefreshedAt"`
+	CurrentRefreshToken            string    `json:"currentRefreshToken,omitempty"`
+	CurrentRefreshTokenHash        string    `json:"currentRefreshTokenHash,omitempty"`
+	RefreshTokenSalt               string    `json:"refreshTokenSalt,omitempty"`
+	RefreshTokenExpiresAt          time.Time `json:"refreshTokenExpiresAt"`
+	PreviousRefreshTokenHash       string    `json:"previousRefreshTokenHash,omitempty"`
+	PreviousRefreshTokenSalt       string    `json:"previousRefreshTokenSalt,omitempty"`
+	PreviousRefreshTokenValidUntil time.Time `json:"previousRefreshTokenValidUntil,omitempty"`
 }
 
 // LoadOrCreateDeviceRegistry loads or creates the local paired-device registry.
@@ -223,6 +230,7 @@ func (s *DeviceRegistryStore) RedeemPairingSession(
 // RotateRefreshToken rotates the refresh-token family for an existing device.
 func (s *DeviceRegistryStore) RotateRefreshToken(
 	refreshToken string,
+	replacementRefreshToken string,
 	now time.Time,
 	refreshTokenExpiresAt time.Time,
 ) (DeviceRecord, error) {
@@ -234,29 +242,47 @@ func (s *DeviceRegistryStore) RotateRefreshToken(
 	if normalizedToken == "" {
 		return DeviceRecord{}, ErrRefreshTokenNotFound
 	}
+	normalizedReplacement := strings.TrimSpace(replacementRefreshToken)
+	if normalizedReplacement == "" {
+		return DeviceRecord{}, ErrRefreshTokenNotFound
+	}
 
 	for index, device := range s.registry.Devices {
-		if !device.matchesRefreshToken(normalizedToken) {
-			continue
+		switch {
+		case device.matchesRefreshToken(normalizedToken):
+			if now.After(device.RefreshTokenExpiresAt) {
+				return DeviceRecord{}, ErrRefreshTokenExpired
+			}
+			device.PreviousRefreshTokenHash = device.CurrentRefreshTokenHash
+			device.PreviousRefreshTokenSalt = device.RefreshTokenSalt
+			// Keep exactly one predecessor recoverable only long enough for an
+			// immediate retry of a lost rotation response. A long-lived predecessor
+			// would let a leaked, already-used bearer recover the current token and
+			// advance the sliding family indefinitely.
+			previousValidUntil := now.UTC().Add(previousRefreshTokenReplayGrace)
+			if refreshTokenExpiresAt.Before(previousValidUntil) {
+				previousValidUntil = refreshTokenExpiresAt.UTC()
+			}
+			device.PreviousRefreshTokenValidUntil = previousValidUntil
+			if err := device.setRefreshToken(normalizedReplacement); err != nil {
+				return DeviceRecord{}, fmt.Errorf("persist refresh token: %w", err)
+			}
+			device.LastRefreshedAt = now.UTC()
+			device.RefreshTokenExpiresAt = refreshTokenExpiresAt.UTC()
+			updated := cloneRegistry(s.registry)
+			updated.Devices[index] = device
+			if err := writeDeviceRegistryFile(s.path, updated); err != nil {
+				return DeviceRecord{}, err
+			}
+			s.registry = updated
+			return device, nil
+		case device.matchesPreviousRefreshToken(normalizedToken, now):
+			if !device.matchesRefreshToken(normalizedReplacement) {
+				return DeviceRecord{}, ErrRefreshTokenNotFound
+			}
+			device.CurrentRefreshToken = normalizedReplacement
+			return device, nil
 		}
-		if now.After(device.RefreshTokenExpiresAt) {
-			return DeviceRecord{}, ErrRefreshTokenExpired
-		}
-
-		rotatedToken, err := randomBase64(32)
-		if err != nil {
-			return DeviceRecord{}, fmt.Errorf("generate refresh token: %w", err)
-		}
-		if err := device.setRefreshToken(rotatedToken); err != nil {
-			return DeviceRecord{}, fmt.Errorf("persist refresh token: %w", err)
-		}
-		device.LastRefreshedAt = now.UTC()
-		device.RefreshTokenExpiresAt = refreshTokenExpiresAt.UTC()
-		s.registry.Devices[index] = device
-		if err := s.persistLocked(); err != nil {
-			return DeviceRecord{}, err
-		}
-		return device, nil
 	}
 
 	return DeviceRecord{}, ErrRefreshTokenNotFound
@@ -384,6 +410,27 @@ func (s *DeviceRegistryStore) cleanupExpiredLocked(now time.Time) {
 		activeNearbyLinks = append(activeNearbyLinks, link)
 	}
 	s.registry.NearbyLinks = activeNearbyLinks
+	for index := range s.registry.Devices {
+		device := &s.registry.Devices[index]
+		if device.PreviousRefreshTokenValidUntil.IsZero() {
+			device.PreviousRefreshTokenHash = ""
+			device.PreviousRefreshTokenSalt = ""
+			continue
+		}
+		// Cap predecessor state written by older Agents that retained it for the
+		// full sliding token lifetime. LastRefreshedAt is the rotation time that
+		// introduced the persisted predecessor.
+		maxPreviousValidUntil := device.LastRefreshedAt.UTC().Add(previousRefreshTokenReplayGrace)
+		if device.PreviousRefreshTokenValidUntil.After(maxPreviousValidUntil) {
+			device.PreviousRefreshTokenValidUntil = maxPreviousValidUntil
+		}
+		if now.Before(device.PreviousRefreshTokenValidUntil) {
+			continue
+		}
+		device.PreviousRefreshTokenHash = ""
+		device.PreviousRefreshTokenSalt = ""
+		device.PreviousRefreshTokenValidUntil = time.Time{}
+	}
 }
 
 func (s *DeviceRegistryStore) recordFailedPairingAttemptLocked(now time.Time) error {
@@ -466,13 +513,16 @@ func (d *DeviceRecord) UnmarshalJSON(data []byte) error {
 	}
 
 	*d = DeviceRecord{
-		DeviceID:                payload.DeviceID,
-		DeviceName:              payload.DeviceName,
-		CreatedAt:               payload.CreatedAt,
-		LastRefreshedAt:         payload.LastRefreshedAt,
-		CurrentRefreshTokenHash: strings.TrimSpace(payload.CurrentRefreshTokenHash),
-		RefreshTokenSalt:        strings.TrimSpace(payload.RefreshTokenSalt),
-		RefreshTokenExpiresAt:   payload.RefreshTokenExpiresAt,
+		DeviceID:                       payload.DeviceID,
+		DeviceName:                     payload.DeviceName,
+		CreatedAt:                      payload.CreatedAt,
+		LastRefreshedAt:                payload.LastRefreshedAt,
+		CurrentRefreshTokenHash:        strings.TrimSpace(payload.CurrentRefreshTokenHash),
+		RefreshTokenSalt:               strings.TrimSpace(payload.RefreshTokenSalt),
+		RefreshTokenExpiresAt:          payload.RefreshTokenExpiresAt,
+		PreviousRefreshTokenHash:       strings.TrimSpace(payload.PreviousRefreshTokenHash),
+		PreviousRefreshTokenSalt:       strings.TrimSpace(payload.PreviousRefreshTokenSalt),
+		PreviousRefreshTokenValidUntil: payload.PreviousRefreshTokenValidUntil,
 	}
 
 	switch {
@@ -510,6 +560,16 @@ func (d DeviceRecord) matchesRefreshToken(token string) bool {
 
 	expectedHash := hashRefreshToken(normalizedToken, d.RefreshTokenSalt)
 	return subtle.ConstantTimeCompare([]byte(expectedHash), []byte(d.CurrentRefreshTokenHash)) == 1
+}
+
+func (d DeviceRecord) matchesPreviousRefreshToken(token string, now time.Time) bool {
+	normalizedToken := strings.TrimSpace(token)
+	if normalizedToken == "" || d.PreviousRefreshTokenHash == "" || d.PreviousRefreshTokenSalt == "" ||
+		d.PreviousRefreshTokenValidUntil.IsZero() || !now.Before(d.PreviousRefreshTokenValidUntil) {
+		return false
+	}
+	expectedHash := hashRefreshToken(normalizedToken, d.PreviousRefreshTokenSalt)
+	return subtle.ConstantTimeCompare([]byte(expectedHash), []byte(d.PreviousRefreshTokenHash)) == 1
 }
 
 func hashRefreshToken(token string, salt string) string {
