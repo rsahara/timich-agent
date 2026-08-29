@@ -99,15 +99,25 @@ type LocalMediaRootConfig struct {
 
 // LocalDatasourceScanConfig controls local filesystem scan scheduling and behavior.
 type LocalDatasourceScanConfig struct {
-	FirstViewThumbnailCount int    `json:"firstViewThumbnailCount,omitempty"`
-	ImmichFallbackEnabled   *bool  `json:"immichFallbackEnabled,omitempty"`
-	QuickScanInterval       string `json:"quickScanInterval,omitempty"`
-	ReconciliationTime      string `json:"reconciliationTime,omitempty"`
-	ContentVerificationTime string `json:"contentVerificationTime,omitempty"`
+	FirstViewThumbnailCount       int                                           `json:"firstViewThumbnailCount,omitempty"`
+	ImmichFallbackEnabled         *bool                                         `json:"immichFallbackEnabled,omitempty"`
+	ImmichExternalLibraryMappings []LocalDatasourceImmichExternalLibraryMapping `json:"immichExternalLibraryMappings,omitempty"`
+	QuickScanInterval             string                                        `json:"quickScanInterval,omitempty"`
+	ReconciliationTime            string                                        `json:"reconciliationTime,omitempty"`
+	ContentVerificationTime       string                                        `json:"contentVerificationTime,omitempty"`
 	// ContentVerificationDuration accepts zero as an explicit disabled state.
 	ContentVerificationDuration string `json:"contentVerificationDuration,omitempty"`
 	SettlingDuration            string `json:"settlingDuration,omitempty"`
 	IncludeHiddenDirs           bool   `json:"includeHiddenDirectories,omitempty"`
+}
+
+// LocalDatasourceImmichExternalLibraryMapping declares that one Immich
+// external-library path prefix and one Local datasource root expose the same
+// underlying files. The explicit relationship permits exact canonical
+// identity reuse without filename, timestamp, or visual-similarity guessing.
+type LocalDatasourceImmichExternalLibraryMapping struct {
+	SourceKey          string `json:"sourceKey"`
+	OriginalPathPrefix string `json:"originalPathPrefix"`
 }
 
 // LocalDatasourceImmichFallbackEnabled preserves the historical enabled
@@ -564,6 +574,9 @@ func cloneConfigForValidation(cfg Config) Config {
 			}
 			if cfg.Datasources[index].Scan != nil {
 				scan := *cfg.Datasources[index].Scan
+				if scan.ImmichExternalLibraryMappings != nil {
+					scan.ImmichExternalLibraryMappings = append([]LocalDatasourceImmichExternalLibraryMapping(nil), scan.ImmichExternalLibraryMappings...)
+				}
 				if scan.ImmichFallbackEnabled != nil {
 					enabled := *scan.ImmichFallbackEnabled
 					scan.ImmichFallbackEnabled = &enabled
@@ -846,6 +859,11 @@ func normalizeConfig(cfg *Config) {
 			cfg.Datasources[index].Indexing.DailyFullSweepWindow = strings.TrimSpace(cfg.Datasources[index].Indexing.DailyFullSweepWindow)
 		}
 		if cfg.Datasources[index].Scan != nil {
+			for mappingIndex := range cfg.Datasources[index].Scan.ImmichExternalLibraryMappings {
+				mapping := &cfg.Datasources[index].Scan.ImmichExternalLibraryMappings[mappingIndex]
+				mapping.SourceKey = strings.TrimSpace(mapping.SourceKey)
+				mapping.OriginalPathPrefix = normalizeImmichExternalOriginalPathPrefix(mapping.OriginalPathPrefix)
+			}
 			cfg.Datasources[index].Scan.QuickScanInterval = strings.TrimSpace(cfg.Datasources[index].Scan.QuickScanInterval)
 			cfg.Datasources[index].Scan.ReconciliationTime = strings.TrimSpace(cfg.Datasources[index].Scan.ReconciliationTime)
 			cfg.Datasources[index].Scan.ContentVerificationTime = strings.TrimSpace(cfg.Datasources[index].Scan.ContentVerificationTime)
@@ -1212,6 +1230,15 @@ func validate(cfg Config) error {
 	for _, root := range cfg.LocalMediaRoots {
 		localRootKeys[root.Key] = struct{}{}
 	}
+	datasourceKindsBySourceKey := make(map[string]string, len(cfg.Datasources))
+	for _, datasource := range cfg.Datasources {
+		datasourceKindsBySourceKey[strings.TrimSpace(datasource.SourceKey)] = strings.TrimSpace(datasource.Kind)
+	}
+	type configuredExternalPrefix struct {
+		localSourceKey string
+		prefix         string
+	}
+	externalPrefixesByImmichSource := map[string][]configuredExternalPrefix{}
 	passthroughImmichCount := 0
 	for index, datasource := range cfg.Datasources {
 		if err := ValidateDatasourceSourceKey(datasource.SourceKey); err != nil {
@@ -1259,6 +1286,28 @@ func validate(cfg Config) error {
 				return fmt.Errorf("datasource %d: rootKey %q is not configured", index, rootKey)
 			}
 			if datasource.Scan != nil {
+				for mappingIndex, mapping := range datasource.Scan.ImmichExternalLibraryMappings {
+					immichSourceKey := strings.TrimSpace(mapping.SourceKey)
+					if err := ValidateDatasourceSourceKey(immichSourceKey); err != nil {
+						return fmt.Errorf("datasource %d: scan immichExternalLibraryMappings[%d] sourceKey: %w", index, mappingIndex, err)
+					}
+					if datasourceKindsBySourceKey[immichSourceKey] != DatasourceKindImmichIndexed {
+						return fmt.Errorf("datasource %d: scan immichExternalLibraryMappings[%d] sourceKey %q is not an immich_indexed datasource", index, mappingIndex, immichSourceKey)
+					}
+					prefix := normalizeImmichExternalOriginalPathPrefix(mapping.OriginalPathPrefix)
+					if prefix == "" || !path.IsAbs(prefix) || prefix == "/" {
+						return fmt.Errorf("datasource %d: scan immichExternalLibraryMappings[%d] originalPathPrefix must be an absolute non-root path", index, mappingIndex)
+					}
+					for _, existing := range externalPrefixesByImmichSource[immichSourceKey] {
+						if immichExternalPrefixesOverlap(existing.prefix, prefix) {
+							return fmt.Errorf("datasource %d: scan immichExternalLibraryMappings[%d] originalPathPrefix %q overlaps mapping for local datasource %q", index, mappingIndex, prefix, existing.localSourceKey)
+						}
+					}
+					externalPrefixesByImmichSource[immichSourceKey] = append(externalPrefixesByImmichSource[immichSourceKey], configuredExternalPrefix{
+						localSourceKey: datasource.SourceKey,
+						prefix:         prefix,
+					})
+				}
 				if datasource.Scan.FirstViewThumbnailCount < 0 {
 					return fmt.Errorf("datasource %d: scan firstViewThumbnailCount must be non-negative", index)
 				}
@@ -1319,6 +1368,20 @@ func validate(cfg Config) error {
 	}
 
 	return nil
+}
+
+func normalizeImmichExternalOriginalPathPrefix(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return path.Clean(value)
+}
+
+func immichExternalPrefixesOverlap(left string, right string) bool {
+	left = normalizeImmichExternalOriginalPathPrefix(left)
+	right = normalizeImmichExternalOriginalPathPrefix(right)
+	return left == right || strings.HasPrefix(left, right+"/") || strings.HasPrefix(right, left+"/")
 }
 
 func validDailyFullSweepWindow(value string) bool {

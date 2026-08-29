@@ -41,6 +41,7 @@ func TestLocalFilesystemCatalogSchemaCreatesCoreTables(t *testing.T) {
 		"catalog_canonical_state",
 		"catalog_gallery_timeline_state",
 		"catalog_gallery_timeline",
+		"catalog_external_identity_state",
 		"local_assets",
 		"local_asset_locations",
 		"local_renditions",
@@ -71,6 +72,22 @@ func TestLocalFilesystemCatalogSchemaCreatesCoreTables(t *testing.T) {
 	}
 	if redundantMembershipIndexCount != 0 {
 		t.Fatalf("redundant membership index count = %d, want 0", redundantMembershipIndexCount)
+	}
+	assetColumns, err := store.tableColumns("catalog_assets")
+	if err != nil {
+		t.Fatalf("inspect catalog_assets columns: %v", err)
+	}
+	if !assetColumns["upstream_checksum_algorithm"] ||
+		!assetColumns["canonical_content_sha1_hex"] ||
+		!assetColumns["canonical_content_size_bytes"] {
+		t.Fatalf("catalog_assets columns = %#v, want upstream and canonical content identity fields", assetColumns)
+	}
+	externalChecksumIndex, err := store.indexColumns("idx_catalog_assets_external_checksum")
+	if err != nil {
+		t.Fatalf("inspect external checksum index: %v", err)
+	}
+	if !hasStringPrefix(externalChecksumIndex, []string{"source_key", "upstream_checksum_algorithm", "content_sha1_hex"}) {
+		t.Fatalf("external checksum index = %#v, want source, algorithm, checksum prefix", externalChecksumIndex)
 	}
 	runColumns, err := store.tableColumns("local_scan_runs")
 	if err != nil {

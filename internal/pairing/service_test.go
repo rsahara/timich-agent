@@ -137,8 +137,22 @@ func TestHostedSessionRefreshAndAuthenticationLifecycle(t *testing.T) {
 	if refreshed.BaseURL != "https://timich.example/v1" {
 		t.Fatalf("RefreshSession() BaseURL = %q, want normalized URL", refreshed.BaseURL)
 	}
+	recovered, err := service.RefreshSession(bundle.RefreshToken, bundle.BaseURL)
+	if err != nil {
+		t.Fatalf("RefreshSession(lost-response retry) error = %v", err)
+	}
+	if recovered.RefreshToken != refreshed.RefreshToken || recovered.DeviceID != refreshed.DeviceID {
+		t.Fatalf("RefreshSession(lost-response retry) = device %q token %q, want same replacement", recovered.DeviceID, recovered.RefreshToken)
+	}
+	advanced, err := service.RefreshSession(refreshed.RefreshToken, refreshed.BaseURL)
+	if err != nil {
+		t.Fatalf("RefreshSession(current token) error = %v", err)
+	}
+	if advanced.RefreshToken == refreshed.RefreshToken {
+		t.Fatal("RefreshSession(current token) did not advance rotation")
+	}
 	if _, err := service.RefreshSession(bundle.RefreshToken, bundle.BaseURL); !errors.Is(err, store.ErrRefreshTokenNotFound) {
-		t.Fatalf("RefreshSession(old token) error = %v, want %v", err, store.ErrRefreshTokenNotFound)
+		t.Fatalf("RefreshSession(two generations old token) error = %v, want %v", err, store.ErrRefreshTokenNotFound)
 	}
 	if _, err := service.AuthenticateAccessToken(refreshed.AccessToken); err != nil {
 		t.Fatalf("AuthenticateAccessToken(refreshed) error = %v", err)
@@ -150,7 +164,7 @@ func TestHostedSessionRefreshAndAuthenticationLifecycle(t *testing.T) {
 	if _, err := service.AuthenticateAccessToken(refreshed.AccessToken); !errors.Is(err, security.ErrAccessTokenInvalid) {
 		t.Fatalf("AuthenticateAccessToken(revoked device) error = %v, want %v", err, security.ErrAccessTokenInvalid)
 	}
-	if _, err := service.RefreshSession(refreshed.RefreshToken, refreshed.BaseURL); !errors.Is(err, store.ErrRefreshTokenNotFound) {
+	if _, err := service.RefreshSession(advanced.RefreshToken, advanced.BaseURL); !errors.Is(err, store.ErrRefreshTokenNotFound) {
 		t.Fatalf("RefreshSession(revoked device) error = %v, want %v", err, store.ErrRefreshTokenNotFound)
 	}
 }

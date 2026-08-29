@@ -382,13 +382,15 @@ type semanticSourceRetryState struct {
 }
 
 type serviceDatasourceState struct {
-	generation       uint64
-	primary          *config.DatasourceConfig
-	datasources      map[string]config.DatasourceConfig
-	localRoots       map[string]config.LocalMediaRootConfig
-	staticDemo       *staticDemoSource
-	staticDemoErr    error
-	galleryReadiness catalogGalleryReadiness
+	generation                      uint64
+	primary                         *config.DatasourceConfig
+	datasources                     map[string]config.DatasourceConfig
+	localRoots                      map[string]config.LocalMediaRootConfig
+	staticDemo                      *staticDemoSource
+	staticDemoErr                   error
+	galleryReadiness                catalogGalleryReadiness
+	externalContentIdentityMappings []immichExternalLibraryMapping
+	externalContentIdentityScopeKey string
 }
 
 func (s *serviceDatasourceState) ready() bool {
@@ -447,6 +449,7 @@ type SemanticModelBackfillOptions struct {
 	SourceKeys               []string
 	DrainIndexJobs           bool
 	AllowPartialIndexPublish bool
+	BeforeEmbed              func(context.Context) error
 }
 
 // NewService creates a local catalog/media proxy for the first configured datasource.
@@ -478,9 +481,17 @@ func NewServiceWithOptions(datasources []config.DatasourceConfig, options Servic
 			return nil, err
 		}
 		catalogStore.datasourceState = &service.datasourceState
+		if _, err := catalogStore.reconcileConfiguredImmichExternalIdentities(context.Background(), datasources); err != nil {
+			_ = catalogStore.Close()
+			return nil, fmt.Errorf("prepare external content identities: %w", err)
+		}
 		if err := catalogStore.ensureGalleryTimeline(context.Background(), state.galleryReadiness); err != nil {
 			_ = catalogStore.Close()
 			return nil, fmt.Errorf("prepare gallery timeline: %w", err)
+		}
+		if err := catalogStore.ensureGalleryProjection(context.Background(), state.galleryReadiness); err != nil {
+			_ = catalogStore.Close()
+			return nil, fmt.Errorf("prepare mixed gallery projection: %w", err)
 		}
 		service.catalog = catalogStore
 	}
@@ -497,7 +508,11 @@ func catalogStoreNeededForDatasources(datasources []config.DatasourceConfig) boo
 }
 
 func newServiceDatasourceState(datasources []config.DatasourceConfig, localRoots []config.LocalMediaRootConfig, generation uint64) *serviceDatasourceState {
-	state := &serviceDatasourceState{generation: generation}
+	state := &serviceDatasourceState{
+		generation:                      generation,
+		externalContentIdentityMappings: configuredImmichExternalLibraryMappings(datasources),
+		externalContentIdentityScopeKey: immichExternalIdentityScopeKey(datasources),
+	}
 	if len(localRoots) > 0 {
 		state.localRoots = make(map[string]config.LocalMediaRootConfig, len(localRoots))
 		for _, root := range localRoots {
@@ -535,6 +550,9 @@ func cloneServiceDatasourceConfig(datasource config.DatasourceConfig) config.Dat
 	}
 	if datasource.Scan != nil {
 		scan := *datasource.Scan
+		if scan.ImmichExternalLibraryMappings != nil {
+			scan.ImmichExternalLibraryMappings = append([]config.LocalDatasourceImmichExternalLibraryMapping(nil), scan.ImmichExternalLibraryMappings...)
+		}
 		if scan.ImmichFallbackEnabled != nil {
 			enabled := *scan.ImmichFallbackEnabled
 			scan.ImmichFallbackEnabled = &enabled
@@ -553,9 +571,9 @@ func (s *Service) datasourceStateSnapshot() *serviceDatasourceState {
 
 // ReconfigureDatasources atomically replaces immutable datasource policy while
 // retaining the Catalog's long-lived database and media runtime resources.
-func (s *Service) ReconfigureDatasources(datasources []config.DatasourceConfig) {
+func (s *Service) ReconfigureDatasources(datasources []config.DatasourceConfig) error {
 	if s == nil {
-		return
+		return nil
 	}
 	current := s.datasourceStateSnapshot()
 	localRoots := []config.LocalMediaRootConfig{}
@@ -567,9 +585,13 @@ func (s *Service) ReconfigureDatasources(datasources []config.DatasourceConfig) 
 	}
 	nextState := newServiceDatasourceState(datasources, localRoots, s.datasourceGeneration.Add(1))
 	if s.catalog != nil {
-		if err := s.catalog.ensureGalleryTimeline(context.Background(), nextState.galleryReadiness); err != nil {
-			log.Printf("timich-agent gallery timeline reconfigure failed error=%v", err)
+		// Reconcile the durable worker commit fence before touching derived read
+		// models. A failure therefore leaves the external-identity, timeline, and
+		// projection scopes aligned with the still-published datasource state.
+		if _, err := s.catalog.reconcileConfiguredImmichExternalIdentities(context.Background(), datasources); err != nil {
+			return fmt.Errorf("reconcile external content identities for datasource reconfiguration: %w", err)
 		}
+		s.ensureGalleryReadModels(nextState.galleryReadiness, "reconfigure")
 	}
 	s.mu.Lock()
 	s.datasourceState.Store(nextState)
@@ -580,10 +602,35 @@ func (s *Service) ReconfigureDatasources(datasources []config.DatasourceConfig) 
 	// prebuild and the atomic datasource-state swap cannot leave the new scope
 	// without a current Gallery generation.
 	if s.catalog != nil {
-		if err := s.catalog.ensureGalleryTimeline(context.Background(), nextState.galleryReadiness); err != nil {
-			log.Printf("timich-agent gallery timeline post-reconfigure repair failed error=%v", err)
+		s.ensureGalleryReadModels(nextState.galleryReadiness, "post-reconfigure repair")
+	}
+	return nil
+}
+
+func (s *Service) ensureGalleryReadModels(readiness catalogGalleryReadiness, phase string) {
+	if s == nil || s.catalog == nil {
+		return
+	}
+	ensureTimeline := func() {
+		if err := s.catalog.ensureGalleryTimeline(context.Background(), readiness); err != nil {
+			log.Printf("timich-agent gallery timeline %s failed error=%v", phase, err)
 		}
 	}
+	ensureProjection := func() {
+		if err := s.catalog.ensureGalleryProjection(context.Background(), readiness); err != nil {
+			log.Printf("timich-agent mixed gallery projection %s failed error=%v", phase, err)
+		}
+	}
+	// Build the read model required by the next state before retiring the one
+	// used by the current state. Its transaction keeps the old model visible to
+	// concurrent readers until the replacement commits.
+	if readiness.immichOnly {
+		ensureTimeline()
+		ensureProjection()
+		return
+	}
+	ensureProjection()
+	ensureTimeline()
 }
 
 func semanticRetryDelay(attempts int) time.Duration {
@@ -658,6 +705,7 @@ func catalogGalleryReadinessForDatasources(datasources []config.DatasourceConfig
 		switch datasource.Kind {
 		case config.DatasourceKindLocalFiles:
 			readiness.immichOnly = false
+			readiness.localSourceKeys = append(readiness.localSourceKeys, sourceKey)
 			if config.LocalDatasourceImmichFallbackEnabled(datasource) {
 				readiness.localImmichFallbackSourceKeys = append(readiness.localImmichFallbackSourceKeys, sourceKey)
 			}
@@ -1159,6 +1207,18 @@ func (s *Service) MirrorStatusForDatasource(ctx context.Context, sourceKey strin
 
 // SemanticModelBackfillStatus reports candidate semantic vector coverage for all indexed datasources.
 func (s *Service) SemanticModelBackfillStatus(ctx context.Context, candidate SemanticModelProfileStatus) (*SemanticModelBackfillStatus, error) {
+	snapshot, err := s.SemanticModelBackfillSnapshot(ctx, candidate)
+	if err != nil || snapshot == nil {
+		return nil, err
+	}
+	status := snapshot.Status
+	return &status, nil
+}
+
+// SemanticModelBackfillSnapshot reports aggregate and per-datasource semantic
+// progress from one pass over the catalog. Scheduler decisions reuse this
+// snapshot instead of issuing the same large-library counts repeatedly.
+func (s *Service) SemanticModelBackfillSnapshot(ctx context.Context, candidate SemanticModelProfileStatus) (*SemanticModelBackfillSnapshot, error) {
 	if !s.catalogStoreEnabled() {
 		return nil, nil
 	}
@@ -1183,7 +1243,11 @@ func (s *Service) SemanticModelBackfillStatus(ctx context.Context, candidate Sem
 		candidate.InputKind,
 		len(sourceKeys),
 	)
-	status, err := s.semanticModelBackfillStatusForSourceKeys(ctx, sourceKeys, candidate)
+	snapshot, err := s.semanticModelBackfillSnapshotForSourceKeys(ctx, sourceKeys, candidate)
+	var status *SemanticModelBackfillStatus
+	if snapshot != nil {
+		status = &snapshot.Status
+	}
 	log.Printf(
 		"timich-agent semantic model backfill status completed model=%s vector_space=%s sources=%d elapsed=%s err=%v status=%s indexed=%d completed=%d eligible=%d",
 		candidate.ModelID,
@@ -1196,7 +1260,7 @@ func (s *Service) SemanticModelBackfillStatus(ctx context.Context, candidate Sem
 		semanticBackfillCompletedLogValue(status),
 		semanticBackfillEligibleLogValue(status),
 	)
-	return status, err
+	return snapshot, err
 }
 
 // SemanticModelBackfillStatusForDatasource reports semantic vector coverage for one datasource.
@@ -1215,12 +1279,22 @@ func (s *Service) SemanticModelBackfillStatusForDatasource(ctx context.Context, 
 }
 
 func (s *Service) semanticModelBackfillStatusForSourceKeys(ctx context.Context, sourceKeys []string, candidate SemanticModelProfileStatus) (*SemanticModelBackfillStatus, error) {
+	snapshot, err := s.semanticModelBackfillSnapshotForSourceKeys(ctx, sourceKeys, candidate)
+	if err != nil || snapshot == nil {
+		return nil, err
+	}
+	status := snapshot.Status
+	return &status, nil
+}
+
+func (s *Service) semanticModelBackfillSnapshotForSourceKeys(ctx context.Context, sourceKeys []string, candidate SemanticModelProfileStatus) (*SemanticModelBackfillSnapshot, error) {
 	status := SemanticModelBackfillStatus{
 		SourceKind:    "catalog",
 		ModelID:       strings.TrimSpace(candidate.ModelID),
 		VectorSpaceID: strings.TrimSpace(candidate.VectorSpaceID),
 		EmbeddingDim:  candidate.EmbeddingDim,
 	}
+	sourceStatuses := make([]SemanticBackfillSource, 0, len(sourceKeys))
 	for _, sourceKey := range sourceKeys {
 		sourceStarted := time.Now()
 		log.Printf(
@@ -1248,6 +1322,8 @@ func (s *Service) semanticModelBackfillStatusForSourceKeys(ctx context.Context, 
 				sourceStatus.NextEligibleAt = &nextEligibleAt
 			}
 		}
+		sourceStatusCopy := sourceStatus
+		sourceStatuses = append(sourceStatuses, SemanticBackfillSource{SourceKey: sourceKey, Status: sourceStatusCopy})
 		log.Printf(
 			"timich-agent semantic model backfill source status completed source_key=%s model=%s vector_space=%s status=%s indexed=%d completed=%d eligible=%d pending_index=%d elapsed=%s",
 			sourceKey,
@@ -1281,7 +1357,7 @@ func (s *Service) semanticModelBackfillStatusForSourceKeys(ctx context.Context, 
 		}
 	}
 	finalizeSemanticBackfillStatus(&status)
-	return &status, nil
+	return &SemanticModelBackfillSnapshot{Status: status, SourceStatuses: sourceStatuses}, nil
 }
 
 func (s *Service) BackfillSemanticModelCandidateWithOptions(ctx context.Context, modelStore *SemanticModelPackStore, candidate SemanticModelProfileStatus, options SemanticModelBackfillOptions) (SemanticBackfillResult, error) {
@@ -1331,6 +1407,7 @@ func (s *Service) BackfillSemanticModelCandidateWithOptions(ctx context.Context,
 			ImageLoader: s,
 			MaxAssets:   maxAssets,
 			Workers:     options.Workers,
+			BeforeEmbed: options.BeforeEmbed,
 		})
 		if err != nil {
 			if errors.Is(err, ErrSemanticSourceUnavailable) {
@@ -1509,6 +1586,59 @@ func (s *Service) SemanticModelIndexPublishNeeded(ctx context.Context, modelStor
 		return false, 0, ErrCatalogNotConfigured
 	}
 	return s.catalog.SemanticIndexPublishNeeded(ctx, sourceKeys, profile, allowPartial)
+}
+
+// SemanticModelIndexPublishNeededFromSnapshot preserves the normal per-source
+// publication checks while reusing progress counts already collected for the
+// current scheduler decision.
+func (s *Service) SemanticModelIndexPublishNeededFromSnapshot(ctx context.Context, modelStore *SemanticModelPackStore, candidate SemanticModelProfileStatus, snapshot *SemanticModelBackfillSnapshot, allowPartial bool) (bool, int, error) {
+	if snapshot == nil {
+		return s.SemanticModelIndexPublishNeeded(ctx, modelStore, candidate, nil, allowPartial)
+	}
+	if !s.catalogStoreEnabled() {
+		return false, 0, ErrCatalogNotConfigured
+	}
+	if modelStore == nil {
+		return false, 0, ErrSemanticModelPackInvalid
+	}
+	profile, ok := modelStore.CandidateEmbeddingProfileWithContext(ctx, candidate.ModelID, candidate.VectorSpaceID)
+	if !ok {
+		return false, 0, ErrSemanticModelPackInvalid
+	}
+	allowedSourceKeys := s.semanticDatasourceSourceKeysFor(nil)
+	allowed := make(map[string]struct{}, len(allowedSourceKeys))
+	for _, sourceKey := range allowedSourceKeys {
+		allowed[sourceKey] = struct{}{}
+	}
+	needed := false
+	workCount := 0
+	for _, source := range snapshot.SourceStatuses {
+		if _, ok := allowed[strings.TrimSpace(source.SourceKey)]; !ok {
+			continue
+		}
+		status := source.Status
+		if !semanticModelBackfillSnapshotMatchesProfile(status, candidate) {
+			return false, 0, ErrSemanticModelPackInvalid
+		}
+		jobCount := status.PendingIndexJobCount + status.FailedIndexJobCount
+		if jobCount > 0 && status.EligibleIndexJobCount <= 0 {
+			continue
+		}
+		if jobCount <= 0 && !s.catalog.semanticIndexPublishNeeded(ctx, source.SourceKey, profile, status, allowPartial) {
+			continue
+		}
+		if sourceWork := semanticIndexPublishNeededWorkCount(status); sourceWork > 0 {
+			needed = true
+			workCount += sourceWork
+		}
+	}
+	return needed, workCount, nil
+}
+
+func semanticModelBackfillSnapshotMatchesProfile(status SemanticModelBackfillStatus, profile SemanticModelProfileStatus) bool {
+	return strings.TrimSpace(status.ModelID) == strings.TrimSpace(profile.ModelID) &&
+		strings.TrimSpace(status.VectorSpaceID) == strings.TrimSpace(profile.VectorSpaceID) &&
+		status.EmbeddingDim == profile.EmbeddingDim
 }
 
 func (s *Service) ResetRunningSemanticIndexJobs(ctx context.Context) (int, error) {
@@ -1967,6 +2097,13 @@ func (s *Service) fetchImmichMirrorAssets(ctx context.Context, datasource *confi
 	}
 	const pageSize = maxPageSize
 	assets := []ImmichMirrorAsset{}
+	datasourceState := s.datasourceStateSnapshot()
+	datasourceConfigs := datasourceConfigsFromState(datasourceState)
+	externalMappings := configuredImmichExternalLibraryMappings(datasourceConfigs)
+	externalContentIdentityScopeKey := ""
+	if datasourceState != nil {
+		externalContentIdentityScopeKey = datasourceState.externalContentIdentityScopeKey
+	}
 	for page := 1; ; page++ {
 		body := map[string]any{
 			"page":  page,
@@ -2014,22 +2151,39 @@ func (s *Service) fetchImmichMirrorAssets(ctx context.Context, datasource *confi
 				updatedAt = &value
 			}
 			city, state, country, description := asset.LocationMetadata()
-			contentSHA1Hex, contentSizeBytes := asset.ContentIdentity()
+			checksumAlgorithm, checksumHex := asset.UpstreamChecksumIdentity()
+			contentSizeBytes := int64(0)
+			if checksumAlgorithm == upstreamChecksumAlgorithmSHA1 {
+				contentSizeBytes = asset.ContentSizeBytes()
+			}
+			canonicalContentSHA1Hex, canonicalContentSizeBytes := asset.ContentIdentity()
+			mappedLocal, mappedLocalRelativePath, _ := mappedImmichExternalPath(
+				externalMappings,
+				datasource.SourceKey,
+				asset.OriginalPath,
+			)
 			assets = append(assets, ImmichMirrorAsset{
-				UpstreamAssetID:  asset.ID,
-				MediaType:        normalizeAssetType(asset.Type),
-				Filename:         asset.OriginalFileName,
-				CapturedAt:       asset.FileCreatedAt.Time.UTC(),
-				Duration:         asset.Duration,
-				SourceUpdatedAt:  updatedAt,
-				ContentSHA1Hex:   contentSHA1Hex,
-				ContentSizeBytes: contentSizeBytes,
-				IsFavorite:       asset.IsFavorite,
-				City:             city,
-				State:            state,
-				Country:          country,
-				PlaceLabel:       mirrorPlaceLabel(city, state, country),
-				Description:      description,
+				UpstreamAssetID:                 asset.ID,
+				MediaType:                       normalizeAssetType(asset.Type),
+				Filename:                        asset.OriginalFileName,
+				CapturedAt:                      asset.FileCreatedAt.Time.UTC(),
+				Duration:                        asset.Duration,
+				SourceUpdatedAt:                 updatedAt,
+				UpstreamChecksumAlgorithm:       checksumAlgorithm,
+				ContentSHA1Hex:                  checksumHex,
+				ContentSizeBytes:                contentSizeBytes,
+				CanonicalContentSHA1Hex:         canonicalContentSHA1Hex,
+				CanonicalContentSizeBytes:       canonicalContentSizeBytes,
+				MappedLocalSourceKey:            mappedLocal.LocalSourceKey,
+				MappedLocalRootKey:              mappedLocal.LocalRootKey,
+				MappedLocalRelativePath:         mappedLocalRelativePath,
+				ExternalContentIdentityScopeKey: externalContentIdentityScopeKey,
+				IsFavorite:                      asset.IsFavorite,
+				City:                            city,
+				State:                           state,
+				Country:                         country,
+				PlaceLabel:                      mirrorPlaceLabel(city, state, country),
+				Description:                     description,
 			})
 			if detailLimit > 0 && !mirrorAssetHasRichMetadata(assets[len(assets)-1]) {
 				detail, detailErr := s.fetchImmichMirrorAssetDetail(ctx, datasource, asset.ID)
@@ -2082,7 +2236,7 @@ func (s *Service) fetchImmichMirrorAssetDetail(ctx context.Context, datasource *
 }
 
 func mirrorAssetHasRichMetadata(asset ImmichMirrorAsset) bool {
-	hasContentIdentity := strings.TrimSpace(asset.ContentSHA1Hex) != "" && asset.ContentSizeBytes > 0
+	hasContentIdentity := strings.TrimSpace(asset.CanonicalContentSHA1Hex) != "" && asset.CanonicalContentSizeBytes > 0
 	hasRichMetadata := asset.IsFavorite ||
 		strings.TrimSpace(asset.City) != "" ||
 		strings.TrimSpace(asset.State) != "" ||
@@ -2111,10 +2265,14 @@ func enrichMirrorAssetFromImmichAsset(target *ImmichMirrorAsset, asset immichAss
 		value := asset.UpdatedAt.Time.UTC()
 		target.SourceUpdatedAt = &value
 	}
-	if contentSHA1Hex, contentSizeBytes := asset.ContentIdentity(); contentSHA1Hex != "" && contentSizeBytes > 0 {
-		target.ContentSHA1Hex = contentSHA1Hex
-		target.ContentSizeBytes = contentSizeBytes
+	checksumAlgorithm, checksumHex := asset.UpstreamChecksumIdentity()
+	target.UpstreamChecksumAlgorithm = checksumAlgorithm
+	target.ContentSHA1Hex = checksumHex
+	target.ContentSizeBytes = 0
+	if checksumAlgorithm == upstreamChecksumAlgorithmSHA1 {
+		target.ContentSizeBytes = asset.ContentSizeBytes()
 	}
+	target.CanonicalContentSHA1Hex, target.CanonicalContentSizeBytes = asset.ContentIdentity()
 	target.IsFavorite = asset.IsFavorite
 	city, state, country, description := asset.LocationMetadata()
 	target.City = city
@@ -3335,6 +3493,7 @@ type immichAsset struct {
 	IsTrashed        bool            `json:"isTrashed,omitempty"`
 	IsFavorite       bool            `json:"isFavorite,omitempty"`
 	Checksum         string          `json:"checksum,omitempty"`
+	OriginalPath     string          `json:"originalPath,omitempty"`
 	FileSizeInByte   json.RawMessage `json:"fileSizeInByte,omitempty"`
 	FileSize         json.RawMessage `json:"fileSize,omitempty"`
 	Visibility       string          `json:"visibility,omitempty"`
@@ -3368,19 +3527,42 @@ func (a immichAsset) LocationMetadata() (string, string, string, string) {
 }
 
 func (a immichAsset) ContentIdentity() (string, int64) {
-	sha1Hex := normalizeImmichSHA1Checksum(a.Checksum)
+	algorithm, sha1Hex := a.UpstreamChecksumIdentity()
+	if algorithm != upstreamChecksumAlgorithmSHA1 {
+		return "", 0
+	}
+	return sha1Hex, a.ContentSizeBytes()
+}
+
+func (a immichAsset) ContentSizeBytes() int64 {
 	sizeBytes := decodeFlexibleInt64Raw(a.FileSizeInByte)
 	if sizeBytes <= 0 {
 		sizeBytes = decodeFlexibleInt64Raw(a.FileSize)
 	}
-	return sha1Hex, sizeBytes
+	if sizeBytes <= 0 && a.ExifInfo != nil {
+		sizeBytes = decodeFlexibleInt64Raw(a.ExifInfo.FileSizeInByte)
+	}
+	return sizeBytes
+}
+
+func (a immichAsset) UpstreamChecksumIdentity() (string, string) {
+	sha1Hex := normalizeImmichSHA1Checksum(a.Checksum)
+	if sha1Hex == "" {
+		return upstreamChecksumAlgorithmUnknown, ""
+	}
+	originalPath := strings.TrimSpace(a.OriginalPath)
+	if originalPath != "" && sha1Hex == immichExternalPathChecksumHex(originalPath) {
+		return upstreamChecksumAlgorithmSHA1Path, sha1Hex
+	}
+	return upstreamChecksumAlgorithmSHA1, sha1Hex
 }
 
 type immichExif struct {
-	City        string `json:"city,omitempty"`
-	State       string `json:"state,omitempty"`
-	Country     string `json:"country,omitempty"`
-	Description string `json:"description,omitempty"`
+	City           string          `json:"city,omitempty"`
+	State          string          `json:"state,omitempty"`
+	Country        string          `json:"country,omitempty"`
+	Description    string          `json:"description,omitempty"`
+	FileSizeInByte json.RawMessage `json:"fileSizeInByte,omitempty"`
 }
 
 type flexibleTime struct {

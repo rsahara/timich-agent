@@ -24,22 +24,25 @@ type CatalogDeduplicationStatus struct {
 }
 
 type catalogCanonicalSourceRow struct {
-	SourceKey        string
-	DatasourceKind   string
-	UpstreamAssetID  string
-	CanonicalAssetID string
-	ContentSHA1Hex   sql.NullString
-	ContentSizeBytes sql.NullInt64
-	MediaType        string
-	Filename         string
-	CapturedAtText   string
-	Duration         sql.NullString
-	VisibilityStatus string
-	IsFavorite       bool
-	PlaceLabel       sql.NullString
-	Description      sql.NullString
-	FirstSeenAtText  string
-	UpdatedAtText    string
+	SourceKey                 string
+	DatasourceKind            string
+	UpstreamAssetID           string
+	CanonicalAssetID          string
+	UpstreamChecksumAlgorithm string
+	ContentSHA1Hex            sql.NullString
+	ContentSizeBytes          sql.NullInt64
+	CanonicalContentSHA1Hex   sql.NullString
+	CanonicalContentSizeBytes sql.NullInt64
+	MediaType                 string
+	Filename                  string
+	CapturedAtText            string
+	Duration                  sql.NullString
+	VisibilityStatus          string
+	IsFavorite                bool
+	PlaceLabel                sql.NullString
+	Description               sql.NullString
+	FirstSeenAtText           string
+	UpdatedAtText             string
 }
 
 type catalogMediaSource struct {
@@ -143,7 +146,9 @@ func (s *CatalogStore) catalogCanonicalLinksNeedRepair(ctx context.Context) (boo
 
 func (s *CatalogStore) rebuildCatalogCanonicalAssetsInTx(ctx context.Context, tx *sql.Tx, nowText string) error {
 	rows, err := tx.QueryContext(ctx, `SELECT source_key, datasource_kind, upstream_asset_id, COALESCE(canonical_asset_id, ''),
-			content_sha1_hex, content_size_bytes, media_type, filename, captured_at, duration,
+			upstream_checksum_algorithm, content_sha1_hex, content_size_bytes,
+			canonical_content_sha1_hex, canonical_content_size_bytes,
+			media_type, filename, captured_at, duration,
 			visibility_status, is_favorite, place_label, description, first_seen_at, updated_at
 		FROM catalog_assets`)
 	if err != nil {
@@ -186,7 +191,9 @@ func (s *CatalogStore) rebuildCatalogCanonicalAssetsInTx(ctx context.Context, tx
 
 func (s *CatalogStore) refreshCatalogCanonicalAssetInTx(ctx context.Context, tx *sql.Tx, sourceKey string, upstreamAssetID string, nowText string) error {
 	row := tx.QueryRowContext(ctx, `SELECT source_key, datasource_kind, upstream_asset_id, COALESCE(canonical_asset_id, ''),
-			content_sha1_hex, content_size_bytes, media_type, filename, captured_at, duration,
+			upstream_checksum_algorithm, content_sha1_hex, content_size_bytes,
+			canonical_content_sha1_hex, canonical_content_size_bytes,
+			media_type, filename, captured_at, duration,
 			visibility_status, is_favorite, place_label, description, first_seen_at, updated_at
 		FROM catalog_assets
 		WHERE source_key = ? AND upstream_asset_id = ?`, strings.TrimSpace(sourceKey), strings.TrimSpace(upstreamAssetID))
@@ -235,7 +242,9 @@ func (s *CatalogStore) rebuildCatalogCanonicalIDsInTx(ctx context.Context, tx *s
 
 func (s *CatalogStore) rebuildCatalogCanonicalIDInTx(ctx context.Context, tx *sql.Tx, id string, nowText string) error {
 	rows, err := tx.QueryContext(ctx, `SELECT source_key, datasource_kind, upstream_asset_id, COALESCE(canonical_asset_id, ''),
-			content_sha1_hex, content_size_bytes, media_type, filename, captured_at, duration,
+			upstream_checksum_algorithm, content_sha1_hex, content_size_bytes,
+			canonical_content_sha1_hex, canonical_content_size_bytes,
+			media_type, filename, captured_at, duration,
 			visibility_status, is_favorite, place_label, description, first_seen_at, updated_at
 		FROM catalog_assets
 		WHERE canonical_asset_id = ?`, id)
@@ -282,6 +291,7 @@ func (s *CatalogStore) rebuildCatalogCanonicalIDInTx(ctx context.Context, tx *sq
 		return sources[i].UpstreamAssetID < sources[j].UpstreamAssetID
 	})
 	primary := sources[0]
+	primaryContentSHA1Hex, primaryContentSizeBytes := catalogCanonicalContentIdentity(primary)
 	firstSeen := primary.FirstSeenAtText
 	isFavorite := primary.IsFavorite
 	for _, source := range sources {
@@ -313,8 +323,8 @@ func (s *CatalogStore) rebuildCatalogCanonicalIDInTx(ctx context.Context, tx *sq
 			description = excluded.description,
 			updated_at = excluded.updated_at`,
 		id,
-		nullStringToAny(primary.ContentSHA1Hex),
-		nullInt64ToAny(primary.ContentSizeBytes),
+		nullStringToAny(primaryContentSHA1Hex),
+		nullInt64ToAny(primaryContentSizeBytes),
 		primary.MediaType,
 		primary.Filename,
 		primary.CapturedAtText,
@@ -337,11 +347,24 @@ func (s *CatalogStore) rebuildCatalogCanonicalIDInTx(ctx context.Context, tx *sq
 }
 
 func catalogCanonicalAssetID(row catalogCanonicalSourceRow) string {
-	sha1Hex := normalizeCatalogSHA1Hex(nullStringValue(row.ContentSHA1Hex))
-	if sha1Hex != "" && row.ContentSizeBytes.Valid && row.ContentSizeBytes.Int64 > 0 {
-		return hashCatalogCanonicalID("content", row.MediaType, sha1Hex, strconv.FormatInt(row.ContentSizeBytes.Int64, 10))
+	sha1Value, sizeValue := catalogCanonicalContentIdentity(row)
+	sha1Hex := normalizeCatalogSHA1Hex(nullStringValue(sha1Value))
+	if sha1Hex != "" && sizeValue.Valid && sizeValue.Int64 > 0 {
+		return hashCatalogCanonicalID("content", row.MediaType, sha1Hex, strconv.FormatInt(sizeValue.Int64, 10))
 	}
 	return hashCatalogCanonicalID("source", row.SourceKey, row.UpstreamAssetID)
+}
+
+func catalogCanonicalContentIdentity(row catalogCanonicalSourceRow) (sql.NullString, sql.NullInt64) {
+	if normalizeCatalogSHA1Hex(nullStringValue(row.CanonicalContentSHA1Hex)) != "" &&
+		row.CanonicalContentSizeBytes.Valid && row.CanonicalContentSizeBytes.Int64 > 0 {
+		return row.CanonicalContentSHA1Hex, row.CanonicalContentSizeBytes
+	}
+	algorithm := strings.TrimSpace(row.UpstreamChecksumAlgorithm)
+	if algorithm == "" || algorithm == upstreamChecksumAlgorithmSHA1 {
+		return row.ContentSHA1Hex, row.ContentSizeBytes
+	}
+	return sql.NullString{}, sql.NullInt64{}
 }
 
 func hashCatalogCanonicalID(parts ...string) string {
@@ -375,8 +398,11 @@ func scanCatalogCanonicalSourceRow(scanner interface {
 		&row.DatasourceKind,
 		&row.UpstreamAssetID,
 		&row.CanonicalAssetID,
+		&row.UpstreamChecksumAlgorithm,
 		&row.ContentSHA1Hex,
 		&row.ContentSizeBytes,
+		&row.CanonicalContentSHA1Hex,
+		&row.CanonicalContentSizeBytes,
 		&row.MediaType,
 		&row.Filename,
 		&row.CapturedAtText,

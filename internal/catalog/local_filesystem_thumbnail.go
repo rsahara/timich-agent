@@ -128,15 +128,19 @@ func (input localMediaInput) stat() (os.FileInfo, error) {
 }
 
 func (s *Service) RunLocalThumbnailBatch(ctx context.Context, maxJobs int) (LocalThumbnailBatchResult, error) {
-	return s.runLocalThumbnailBatch(ctx, "", maxJobs, 1, true)
+	return s.runLocalThumbnailBatch(ctx, "", maxJobs, 1, true, LocalBackgroundBatchOptions{})
 }
 
 func (s *Service) RunLocalThumbnailBatchForSource(ctx context.Context, sourceKey string, maxJobs int) (LocalThumbnailBatchResult, error) {
-	return s.runLocalThumbnailBatch(ctx, sourceKey, maxJobs, 1, true)
+	return s.runLocalThumbnailBatch(ctx, sourceKey, maxJobs, 1, true, LocalBackgroundBatchOptions{})
 }
 
 func (s *Service) RunLocalThumbnailBatchWithWorkers(ctx context.Context, maxJobs int, workers int) (LocalThumbnailBatchResult, error) {
-	return s.runLocalThumbnailBatch(ctx, "", maxJobs, workers, true)
+	return s.runLocalThumbnailBatch(ctx, "", maxJobs, workers, true, LocalBackgroundBatchOptions{})
+}
+
+func (s *Service) RunLocalThumbnailBatchWithOptions(ctx context.Context, maxJobs int, workers int, options LocalBackgroundBatchOptions) (LocalThumbnailBatchResult, error) {
+	return s.runLocalThumbnailBatch(ctx, "", maxJobs, workers, true, options)
 }
 
 func (s *Service) RequeueFailedLocalThumbnails(ctx context.Context) (LocalThumbnailRequeueResult, error) {
@@ -161,7 +165,7 @@ func (s *Service) RequeueFailedLocalThumbnails(ctx context.Context) (LocalThumbn
 	return LocalThumbnailRequeueResult{Queued: totalQueued}, nil
 }
 
-func (s *Service) runLocalThumbnailBatch(ctx context.Context, sourceKey string, maxJobs int, workers int, queuePending bool) (LocalThumbnailBatchResult, error) {
+func (s *Service) runLocalThumbnailBatch(ctx context.Context, sourceKey string, maxJobs int, workers int, queuePending bool, options LocalBackgroundBatchOptions) (LocalThumbnailBatchResult, error) {
 	if s == nil || s.catalog == nil {
 		return LocalThumbnailBatchResult{}, ErrNoDatasourceConfigured
 	}
@@ -199,6 +203,8 @@ func (s *Service) runLocalThumbnailBatch(ctx context.Context, sourceKey string, 
 	if err != nil {
 		return LocalThumbnailBatchResult{}, err
 	}
+	workCtx, cancelWork := context.WithCancel(ctx)
+	defer cancelWork()
 	jobsChannel := make(chan localThumbnailJob)
 	var resultMu sync.Mutex
 	var batchErr error
@@ -209,11 +215,20 @@ func (s *Service) runLocalThumbnailBatch(ctx context.Context, sourceKey string, 
 		go func() {
 			defer wait.Done()
 			for job := range jobsChannel {
-				if ctx.Err() != nil {
+				if workCtx.Err() != nil {
 					return
 				}
-				generated, jobErr := s.processLocalThumbnailJob(ctx, job)
-				if ctx.Err() != nil {
+				if options.BeforeJob != nil {
+					if admissionErr := options.BeforeJob(workCtx); admissionErr != nil {
+						resultMu.Lock()
+						batchErr = errors.Join(batchErr, admissionErr)
+						resultMu.Unlock()
+						cancelWork()
+						return
+					}
+				}
+				generated, jobErr := s.processLocalThumbnailJob(workCtx, job)
+				if workCtx.Err() != nil {
 					if _, recoveryErr := s.deferClaimedLocalThumbnailJob(job); recoveryErr != nil {
 						log.Printf("timich-agent local thumbnail canceled job recovery failed job_id=%d error=%v", job.ID, recoveryErr)
 						s.rememberLocalThumbnailClaimRecovery(job)
@@ -230,7 +245,7 @@ func (s *Service) runLocalThumbnailBatch(ctx context.Context, sourceKey string, 
 						resultMu.Unlock()
 					}
 				} else if jobErr != nil && !errors.Is(jobErr, errLocalThumbnailSourceChanged) {
-					failureDeferred, failureErr := s.failLocalThumbnailJob(ctx, job, jobErr)
+					failureDeferred, failureErr := s.failLocalThumbnailJob(workCtx, job, jobErr)
 					if failureErr != nil {
 						recovered, recoveryErr := s.deferClaimedLocalThumbnailJob(job)
 						if recoveryErr != nil {
@@ -278,7 +293,7 @@ sendJobs:
 	for _, job := range jobs {
 		select {
 		case jobsChannel <- job:
-		case <-ctx.Done():
+		case <-workCtx.Done():
 			break sendJobs
 		}
 	}
@@ -856,7 +871,7 @@ func (s *Service) generateLocalThumbnailRenditions(ctx context.Context, asset lo
 		defer source.File.Close()
 	}
 	if !localActiveLocationMatchesFileInfo(location, infoBefore) {
-		if err := s.resettleLocalThumbnailSource(ctx, asset, location, infoBefore, "source_changed_before_thumbnail"); err != nil {
+		if err := s.resettleLocalThumbnailSource(ctx, trustedRoot, asset, location, infoBefore, "source_changed_before_thumbnail"); err != nil {
 			return err
 		}
 		return errLocalThumbnailSourceChanged
@@ -866,7 +881,7 @@ func (s *Service) generateLocalThumbnailRenditions(ctx context.Context, asset lo
 		if err != nil {
 			return err
 		}
-		if err := s.verifyLocalThumbnailSourceAfterRender(ctx, asset, location, source, infoBefore); err != nil {
+		if err := s.verifyLocalThumbnailSourceAfterRender(ctx, trustedRoot, asset, location, source, infoBefore); err != nil {
 			return err
 		}
 		return s.persistLocalRenderedRenditions(ctx, asset, renditions)
@@ -892,7 +907,7 @@ func (s *Service) generateLocalThumbnailRenditions(ctx context.Context, asset lo
 	if err != nil {
 		return err
 	}
-	if err := s.verifyLocalThumbnailSourceAfterRender(ctx, asset, location, source, infoBefore); err != nil {
+	if err := s.verifyLocalThumbnailSourceAfterRender(ctx, trustedRoot, asset, location, source, infoBefore); err != nil {
 		return err
 	}
 	return s.persistLocalRenderedRenditions(ctx, asset, []localRenderedRendition{preview, detailPreview})
@@ -1227,7 +1242,7 @@ func localActiveLocationMatchesFileInfo(location localActiveLocation, info os.Fi
 		location.FileIdentity == localFileIdentity(info)
 }
 
-func (s *Service) verifyLocalThumbnailSourceAfterRender(ctx context.Context, asset localThumbnailAsset, location localActiveLocation, source localMediaInput, before os.FileInfo) error {
+func (s *Service) verifyLocalThumbnailSourceAfterRender(ctx context.Context, trustedRoot *trustedLocalMediaRoot, asset localThumbnailAsset, location localActiveLocation, source localMediaInput, before os.FileInfo) error {
 	after, err := source.stat()
 	if err != nil {
 		return err
@@ -1240,34 +1255,33 @@ func (s *Service) verifyLocalThumbnailSourceAfterRender(ctx context.Context, ass
 	if localFileInfoUnchanged(before, after) && pathnameMatches && localActiveLocationMatchesFileInfo(location, pathInfo) {
 		return nil
 	}
-	if err := s.resettleLocalThumbnailSource(ctx, asset, location, pathInfo, "source_changed_during_thumbnail"); err != nil {
+	if err := s.resettleLocalThumbnailSource(ctx, trustedRoot, asset, location, pathInfo, "source_changed_during_thumbnail"); err != nil {
 		return err
 	}
 	return errLocalThumbnailSourceChanged
 }
 
-func (s *Service) resettleLocalThumbnailSource(ctx context.Context, asset localThumbnailAsset, location localActiveLocation, info os.FileInfo, reason string) error {
-	return s.resettleLocalSource(ctx, asset, location, info, reason, true)
+func (s *Service) resettleLocalThumbnailSource(ctx context.Context, trustedRoot *trustedLocalMediaRoot, asset localThumbnailAsset, location localActiveLocation, info os.FileInfo, reason string) error {
+	return s.resettleLocalSource(ctx, trustedRoot, asset, location, info, reason, true)
 }
 
-func (s *Service) resettleLocalOriginalSource(ctx context.Context, asset localThumbnailAsset, location localActiveLocation, info os.FileInfo, reason string) error {
-	return s.resettleLocalSource(ctx, asset, location, info, reason, false)
+func (s *Service) resettleLocalOriginalSource(ctx context.Context, trustedRoot *trustedLocalMediaRoot, asset localThumbnailAsset, location localActiveLocation, info os.FileInfo, reason string) error {
+	return s.resettleLocalSource(ctx, trustedRoot, asset, location, info, reason, false)
 }
 
-func (s *Service) resettleLocalSource(ctx context.Context, asset localThumbnailAsset, location localActiveLocation, info os.FileInfo, reason string, invalidateThumbnail bool) error {
+func (s *Service) resettleLocalSource(ctx context.Context, trustedRoot *trustedLocalMediaRoot, asset localThumbnailAsset, location localActiveLocation, info os.FileInfo, reason string, invalidateThumbnail bool) error {
 	if info == nil || !info.Mode().IsRegular() {
 		return fmt.Errorf("resettle local source: path is not a regular file")
 	}
-	datasource, _, err := s.localDatasourceAndRoot(location.SourceKey)
-	if err != nil {
-		return err
+	if trustedRoot == nil || trustedRoot.datasource.SourceKey != location.SourceKey || trustedRoot.root.Key != location.RootKey {
+		return ErrLocalMediaRootNotTrusted
 	}
 	now := time.Now().UTC()
 	nowText := formatCatalogTime(now)
 	mtimeText := formatCatalogTime(info.ModTime().UTC())
 	fastSignature := fmt.Sprintf("%d:%s", info.Size(), mtimeText)
 	fileIdentity := localFileIdentity(info)
-	notBeforeText := formatCatalogTime(now.Add(localDatasourceSettlingDuration(*datasource)))
+	notBeforeText := formatCatalogTime(now.Add(localDatasourceSettlingDuration(trustedRoot.datasource)))
 	tx, err := s.catalog.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin local source resettle: %w", err)
@@ -1324,6 +1338,20 @@ func (s *Service) resettleLocalSource(ctx context.Context, asset localThumbnailA
 			return fmt.Errorf("reset local thumbnail asset: %w", err)
 		}
 	}
+	externalIdentityChanges, err := s.catalog.reconcileImmichExternalIdentitiesForLocalIdentityLossInTx(
+		ctx,
+		tx,
+		trustedRoot.externalContentIdentityMappings,
+		trustedRoot.externalContentIdentityScopeKey,
+		location.SourceKey,
+		location.RootKey,
+		[]string{location.RelativePath},
+		nowText,
+	)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	changedCanonicalIDs, err := refreshLocalAssetVisibilityInTx(ctx, tx, asset.SourceKey, location.RootKey, nowText)
 	if err != nil {
 		_ = tx.Rollback()
@@ -1333,7 +1361,7 @@ func (s *Service) resettleLocalSource(ctx context.Context, asset localThumbnailA
 		_ = tx.Rollback()
 		return err
 	}
-	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0); err != nil {
+	if err := s.catalog.commitCatalogAssetChanges(ctx, tx, len(changedCanonicalIDs) > 0 || externalIdentityChanges > 0); err != nil {
 		return fmt.Errorf("commit local source resettle: %w", err)
 	}
 	return nil

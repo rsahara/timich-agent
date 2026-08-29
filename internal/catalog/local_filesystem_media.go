@@ -65,7 +65,7 @@ func (s *Service) localOriginalMediaResponse(clientRequest *http.Request, dataso
 	}()
 	if !localActiveLocationMatchesFileInfo(location, info) {
 		asset := localThumbnailAsset{SourceKey: location.SourceKey, AssetID: assetID}
-		if err := s.resettleLocalOriginalSource(ctx, asset, location, info, "source_changed_before_original"); err != nil {
+		if err := s.resettleLocalOriginalSource(ctx, trustedRoot, asset, location, info, "source_changed_before_original"); err != nil {
 			return nil, err
 		}
 		s.notifyLocalWorkQueued()

@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -3289,6 +3290,134 @@ func TestAddDatasourcePersistsLocalFilesystem(t *testing.T) {
 	}
 }
 
+func TestAddDatasourceRestoresConfigAfterReconfigureFailure(t *testing.T) {
+	const immichSourceKey = "1111111111111111"
+	rootPath := t.TempDir()
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey:   immichSourceKey,
+		Name:        "Home Immich",
+		Kind:        config.DatasourceKindImmichIndexed,
+		URL:         "http://immich.local:2283",
+		AccessToken: "immich-api-key",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{
+			Key:  "nas-photos",
+			Path: rootPath,
+		}}
+		if err := config.WriteFile(cfg.ConfigPath, cfg.Config); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+	})
+	configPath := runtime.ConfigResponse().ConfigPath
+	originalConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(original config) error = %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(configPath), "catalog-state-v1", "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog DB: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	var originalTimelineScope string
+	if err := db.QueryRow(`SELECT scope_key FROM catalog_gallery_timeline_state WHERE singleton_id = 1`).Scan(&originalTimelineScope); err != nil {
+		t.Fatalf("read original Gallery timeline scope: %v", err)
+	}
+	var projectionStateCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM catalog_gallery_projection_state`).Scan(&projectionStateCount); err != nil {
+		t.Fatalf("count original Gallery projection state: %v", err)
+	}
+	if projectionStateCount != 0 {
+		t.Fatalf("original Gallery projection states = %d, want zero for Immich-only", projectionStateCount)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER fail_external_identity_scope_change
+		BEFORE UPDATE ON catalog_external_identity_state
+		WHEN NEW.scope_key <> OLD.scope_key
+		BEGIN
+			SELECT RAISE(FAIL, 'injected external identity scope failure');
+		END`); err != nil {
+		t.Fatalf("create reconciliation failure trigger: %v", err)
+	}
+
+	input := config.DatasourceConfig{
+		Name:    "NAS Photos",
+		Kind:    config.DatasourceKindLocalFiles,
+		RootKey: "nas-photos",
+		Scan: &config.LocalDatasourceScanConfig{
+			ImmichExternalLibraryMappings: []config.LocalDatasourceImmichExternalLibraryMapping{{
+				SourceKey:          immichSourceKey,
+				OriginalPathPrefix: "/mnt/photos",
+			}},
+		},
+	}
+	if _, err := runtime.AddDatasource(input); err == nil || !strings.Contains(err.Error(), "injected external identity scope failure") {
+		t.Fatalf("AddDatasource(failing) error = %v, want injected failure", err)
+	}
+	if got := runtime.StatusResponse().Datasources; len(got) != 1 {
+		t.Fatalf("live datasources after failure = %+v, want one", got)
+	}
+	afterFailure, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(config after failure) error = %v", err)
+	}
+	if !bytes.Equal(afterFailure, originalConfig) {
+		t.Fatal("config file changed after failed datasource reconfiguration")
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load(config after failure) error = %v", err)
+	}
+	if len(loaded.Datasources) != 1 {
+		t.Fatalf("persisted datasources after failure = %+v, want one", loaded.Datasources)
+	}
+	var timelineScopeAfterFailure string
+	if err := db.QueryRow(`SELECT scope_key FROM catalog_gallery_timeline_state WHERE singleton_id = 1`).Scan(&timelineScopeAfterFailure); err != nil {
+		t.Fatalf("read Gallery timeline scope after failure: %v", err)
+	}
+	if timelineScopeAfterFailure != originalTimelineScope {
+		t.Fatalf("Gallery timeline scope after failure = %q, want %q", timelineScopeAfterFailure, originalTimelineScope)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM catalog_gallery_projection_state`).Scan(&projectionStateCount); err != nil {
+		t.Fatalf("count Gallery projection state after failure: %v", err)
+	}
+	if projectionStateCount != 0 {
+		t.Fatalf("Gallery projection states after failure = %d, want zero", projectionStateCount)
+	}
+
+	if _, err := db.Exec(`DROP TRIGGER fail_external_identity_scope_change`); err != nil {
+		t.Fatalf("drop reconciliation failure trigger: %v", err)
+	}
+	added, err := runtime.AddDatasource(input)
+	if err != nil {
+		t.Fatalf("AddDatasource(retry) error = %v", err)
+	}
+	if added.Kind != config.DatasourceKindLocalFiles || added.RootKey != "nas-photos" {
+		t.Fatalf("AddDatasource(retry) = %+v, want Local datasource", added)
+	}
+	if got := runtime.StatusResponse().Datasources; len(got) != 2 {
+		t.Fatalf("live datasources after retry = %+v, want two", got)
+	}
+	loaded, err = config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load(config after retry) error = %v", err)
+	}
+	if len(loaded.Datasources) != 2 {
+		t.Fatalf("persisted datasources after retry = %+v, want two", loaded.Datasources)
+	}
+	var timelineStateCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM catalog_gallery_timeline_state`).Scan(&timelineStateCount); err != nil {
+		t.Fatalf("count Gallery timeline state after retry: %v", err)
+	}
+	if timelineStateCount != 0 {
+		t.Fatalf("Gallery timeline states after retry = %d, want zero for mixed scope", timelineStateCount)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM catalog_gallery_projection_state`).Scan(&projectionStateCount); err != nil {
+		t.Fatalf("count Gallery projection state after retry: %v", err)
+	}
+	if projectionStateCount != 1 {
+		t.Fatalf("Gallery projection states after retry = %d, want one", projectionStateCount)
+	}
+}
+
 func TestConcurrentConfigMutationsPreserveAllUpdates(t *testing.T) {
 	t.Parallel()
 
@@ -3648,6 +3777,79 @@ func TestStartDatasourceMirrorSyncRunsStartupFullSync(t *testing.T) {
 	}
 }
 
+func TestScheduledDatasourceMirrorSyncBlocksDatasourceRepair(t *testing.T) {
+	t.Parallel()
+
+	requestStarted := make(chan struct{}, 1)
+	releaseRequest := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-releaseRequest:
+		default:
+			close(releaseRequest)
+		}
+	})
+	datasourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/search/metadata" {
+			t.Fatalf("unexpected datasource path %s", r.URL.Path)
+		}
+		select {
+		case requestStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-releaseRequest:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"assets":{"total":0,"items":[],"nextPage":null}}`)
+	}))
+	defer datasourceServer.Close()
+
+	runtime := newTestAgentRuntime(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey:   "1111111111111111",
+		Name:        "Home Immich",
+		Kind:        config.DatasourceKindImmichIndexed,
+		URL:         datasourceServer.URL,
+		AccessToken: "immich-api-key",
+	}})
+	syncDone := make(chan struct{})
+	go func() {
+		defer close(syncDone)
+		runtime.runScheduledDatasourceMirrorSync(context.Background(), "startup")
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduled mirror sync did not reach datasource")
+	}
+	if active := runtime.datasourceMirrorSyncActive.Load(); active != 1 {
+		t.Fatalf("datasourceMirrorSyncActive = %d, want 1", active)
+	}
+	if runtime.datasourceIndexingReconciliationReady() {
+		t.Fatal("datasourceIndexingReconciliationReady() = true during scheduled mirror sync")
+	}
+	runtime.runDatasourceIndexingSnapshotRefresh(runtime.catalogService(), 0)
+	runtime.datasourceTaskMu.Lock()
+	finishedAt := runtime.datasourceSnapshotFinished
+	runtime.datasourceTaskMu.Unlock()
+	if !finishedAt.IsZero() {
+		t.Fatalf("datasource repair finished during scheduled mirror sync at %v", finishedAt)
+	}
+
+	close(releaseRequest)
+	select {
+	case <-syncDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduled mirror sync did not finish")
+	}
+	if active := runtime.datasourceMirrorSyncActive.Load(); active != 0 {
+		t.Fatalf("datasourceMirrorSyncActive = %d, want 0 after sync", active)
+	}
+}
+
 func TestDatasourceMirrorSyncTimeoutForMode(t *testing.T) {
 	t.Parallel()
 
@@ -3730,6 +3932,7 @@ func TestScheduledDatasourceMirrorIntervalRunsIncrementalSync(t *testing.T) {
 	if _, err := runtime.SyncPrimaryDatasourceMirror(context.Background(), catalog.MirrorSyncModeFull); err != nil {
 		t.Fatalf("full SyncPrimaryDatasourceMirror() error = %v", err)
 	}
+	runtime.rememberDatasourceIndexingSnapshot(nil, runtime.emptyDatasourceIndexingResponse())
 	runtime.runScheduledDatasourceMirrorSync(context.Background(), "interval")
 
 	if len(requestBodies) != 2 {
@@ -3747,6 +3950,16 @@ func TestScheduledDatasourceMirrorIntervalRunsIncrementalSync(t *testing.T) {
 	}
 	if status.ActiveCount != 2 || status.LastIncrementalSyncAt == nil {
 		t.Fatalf("mirror status after interval = %#v", status)
+	}
+	adminStatus, err := runtime.DatasourceIndexingStatus(context.Background())
+	if err != nil {
+		t.Fatalf("DatasourceIndexingStatus() error = %v", err)
+	}
+	if len(adminStatus.Datasources) != 1 ||
+		adminStatus.Datasources[0].Status != status.Status ||
+		adminStatus.Datasources[0].ActiveAssets != 2 ||
+		adminStatus.Datasources[0].LastIncrementalSyncAt == nil {
+		t.Fatalf("Admin datasource snapshot after interval = %+v, want completed mirror state", adminStatus.Datasources)
 	}
 }
 
@@ -4636,9 +4849,9 @@ func TestAutomaticLocalPhase0ScanUsesQuickModeUntilNextReconciliationSchedule(t 
 	if third.ScanMode != "reconciliation" {
 		t.Fatalf("third automatic scan mode = %q, want reconciliation", third.ScanMode)
 	}
-	status, err := runtime.RefreshDatasourceIndexingStatus(context.Background())
+	status, err := runtime.refreshDatasourceIndexingSnapshot(context.Background(), catalogService)
 	if err != nil {
-		t.Fatalf("RefreshDatasourceIndexingStatus() error = %v", err)
+		t.Fatalf("refreshDatasourceIndexingSnapshot() error = %v", err)
 	}
 	var discovery DatasourceTaskStatus
 	for _, task := range status.Tasks {
@@ -5428,20 +5641,180 @@ func TestAutoHeavyTaskWorkersForCPU(t *testing.T) {
 	}
 }
 
-func TestDatasourceIndexingAdminActiveWindow(t *testing.T) {
+func TestDatasourceIndexingStatusReadsDoNotScheduleExactRefresh(t *testing.T) {
 	t.Parallel()
 
 	runtime := newTestAgentRuntimeWithAdminToken(t, BuildInfo{}, nil, "test-admin-token")
-	now := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
-	if runtime.datasourceIndexingAdminActive(now) {
-		t.Fatal("datasourceIndexingAdminActive() = true before any Admin access")
+	runtime.rememberDatasourceIndexingSnapshot(nil, DatasourceIndexingResponse{
+		Tasks: []DatasourceTaskStatus{{
+			Phase:       "metadata",
+			Label:       "Metadata",
+			QueuedTasks: 12,
+			Status:      "queued",
+		}},
+	})
+
+	for _, read := range []func(context.Context) (DatasourceIndexingResponse, error){
+		runtime.DatasourceIndexingStatus,
+		runtime.RefreshDatasourceIndexingStatus,
+		runtime.DatasourceIndexingStatus,
+	} {
+		status, err := read(context.Background())
+		if err != nil {
+			t.Fatalf("status read error = %v", err)
+		}
+		if len(status.Tasks) != 1 || status.Tasks[0].QueuedTasks != 12 {
+			t.Fatalf("status tasks = %+v, want cached snapshot", status.Tasks)
+		}
 	}
-	runtime.markDatasourceIndexingAdminAccess(now)
-	if !runtime.datasourceIndexingAdminActive(now.Add(datasourceIndexingAdminActiveWindow)) {
-		t.Fatal("datasourceIndexingAdminActive() = false at the active window boundary")
+
+	runtime.datasourceTaskMu.Lock()
+	busy := runtime.datasourceSnapshotBusy
+	started := runtime.datasourceSnapshotStarted
+	finished := runtime.datasourceSnapshotFinished
+	runtime.datasourceTaskMu.Unlock()
+	if busy || !started.IsZero() || !finished.IsZero() {
+		t.Fatalf("Admin reads changed exact refresh state: busy=%t started=%v finished=%v", busy, started, finished)
 	}
-	if runtime.datasourceIndexingAdminActive(now.Add(datasourceIndexingAdminActiveWindow + time.Second)) {
-		t.Fatal("datasourceIndexingAdminActive() = true after the active window")
+}
+
+func TestDatasourceIndexingStatusReturnsIndependentDatasourceSnapshot(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntime(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey:   "1111111111111111",
+		Name:        "Home Immich",
+		Kind:        config.DatasourceKindImmichIndexed,
+		URL:         "http://immich.local:2283",
+		AccessToken: "immich-api-key",
+	}})
+	runtime.rememberDatasourceIndexingSnapshot(nil, runtime.emptyDatasourceIndexingResponse())
+
+	observed, err := runtime.DatasourceIndexingStatus(context.Background())
+	if err != nil {
+		t.Fatalf("DatasourceIndexingStatus() error = %v", err)
+	}
+	if len(observed.Datasources) != 1 || observed.Datasources[0].Status != "not_indexed" {
+		t.Fatalf("observed datasources = %+v, want initial not_indexed snapshot", observed.Datasources)
+	}
+
+	completedAt := time.Now().UTC()
+	runtime.rememberRemoteDatasourceSyncSnapshot(nil, "1111111111111111", catalog.MirrorSyncResult{
+		Mode:        catalog.MirrorSyncModeFull,
+		Status:      "completed",
+		CompletedAt: completedAt,
+		Mirror: catalog.MirrorStatus{
+			Enabled:        true,
+			Status:         "ready",
+			ActiveCount:    1,
+			LastFullSyncAt: &completedAt,
+		},
+	})
+
+	if observed.Datasources[0].Status != "not_indexed" || observed.Datasources[0].ActiveAssets != 0 {
+		t.Fatalf("previously returned datasource was mutated: %+v", observed.Datasources[0])
+	}
+	current, err := runtime.DatasourceIndexingStatus(context.Background())
+	if err != nil {
+		t.Fatalf("current DatasourceIndexingStatus() error = %v", err)
+	}
+	if len(current.Datasources) != 1 || current.Datasources[0].Status != "ready" || current.Datasources[0].ActiveAssets != 1 {
+		t.Fatalf("current datasources = %+v, want completed mirror snapshot", current.Datasources)
+	}
+}
+
+func TestDatasourceIndexingStatusOverlaysCachedSchedulerProgress(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntimeWithAdminToken(t, BuildInfo{}, nil, "test-admin-token")
+	runtime.rememberDatasourceIndexingSnapshot(nil, DatasourceIndexingResponse{
+		Tasks: []DatasourceTaskStatus{{
+			Phase:       "metadata",
+			Label:       "Metadata",
+			QueuedTasks: 99,
+			Status:      "queued",
+		}},
+	})
+	schedule, semanticScheduled := runtime.semanticIndexingSchedule()
+	runtime.schedulerWorkStateMu.Lock()
+	runtime.schedulerWorkState = schedulerWorkState{
+		ConfigHash:       runtime.schedulerWorkStateConfigHash(semanticSingleWorkerSchedule(schedule), semanticScheduled),
+		UpdatedAt:        time.Now().UTC(),
+		MetadataQueued:   7,
+		MetadataSettling: 3,
+	}
+	runtime.schedulerWorkStateMu.Unlock()
+
+	status, err := runtime.DatasourceIndexingStatus(context.Background())
+	if err != nil {
+		t.Fatalf("DatasourceIndexingStatus() error = %v", err)
+	}
+	if len(status.Tasks) != 1 || status.Tasks[0].QueuedTasks != 7 || status.Tasks[0].SettlingTasks != 3 {
+		t.Fatalf("status tasks = %+v, want cached scheduler progress overlay", status.Tasks)
+	}
+}
+
+func TestDatasourceIndexingReconciliationWaitsForDrainedSchedulerWork(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "NAS Photos",
+		Kind:      config.DatasourceKindLocalFiles,
+		RootKey:   "nas-photos",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{Key: "nas-photos", Path: t.TempDir()}}
+	})
+	if runtime.datasourceIndexingReconciliationReady() {
+		t.Fatal("datasourceIndexingReconciliationReady() = true without required local scheduler cache")
+	}
+	schedule, semanticScheduled := runtime.semanticIndexingSchedule()
+	configHash := runtime.schedulerWorkStateConfigHash(semanticSingleWorkerSchedule(schedule), semanticScheduled)
+	runtime.schedulerWorkStateMu.Lock()
+	runtime.schedulerWorkState = schedulerWorkState{
+		ConfigHash:     configHash,
+		UpdatedAt:      time.Now().UTC(),
+		MetadataQueued: 1,
+	}
+	runtime.schedulerWorkStateMu.Unlock()
+	if runtime.datasourceIndexingReconciliationReady() {
+		t.Fatal("datasourceIndexingReconciliationReady() = true with queued metadata")
+	}
+
+	runtime.schedulerWorkStateMu.Lock()
+	runtime.schedulerWorkState.MetadataQueued = 0
+	runtime.schedulerWorkStateMu.Unlock()
+	if !runtime.datasourceIndexingReconciliationReady() {
+		t.Fatal("datasourceIndexingReconciliationReady() = false after background work drained")
+	}
+}
+
+func TestDatasourceIndexingReconciliationRunsWithoutUnusedSchedulerCache(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntime(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey:   "1111111111111111",
+		Name:        "Home Immich",
+		Kind:        config.DatasourceKindImmichIndexed,
+		URL:         "http://immich.local:2283",
+		AccessToken: "immich-api-key",
+	}})
+	if runtime.backgroundWorkerSchedulerConfigured() {
+		t.Fatal("backgroundWorkerSchedulerConfigured() = true for remote-only semantic-disabled runtime")
+	}
+	if !runtime.datasourceIndexingReconciliationReady() {
+		t.Fatal("datasourceIndexingReconciliationReady() = false without a configured scheduler")
+	}
+
+	runtime.runDatasourceIndexingSnapshotRefresh(runtime.catalogService(), 0)
+	runtime.datasourceTaskMu.Lock()
+	finishedAt := runtime.datasourceSnapshotFinished
+	runtime.datasourceTaskMu.Unlock()
+	if finishedAt.IsZero() {
+		t.Fatal("idle datasource snapshot repair did not run")
+	}
+	if _, ok := runtime.CachedDatasourceIndexingStatus(context.Background()); !ok {
+		t.Fatal("CachedDatasourceIndexingStatus() ok = false after idle repair")
 	}
 }
 
@@ -5631,6 +6004,9 @@ func TestRefreshDatasourceIndexingStatusShowsPausedInstalledSemanticWork(t *test
 	pack := runtimeSemanticPackForTest("timich-siglip2-base-patch16-224-onnx-multilingual-v1")
 	installRuntimeSemanticPackForTest(t, runtime, pack)
 
+	if _, err := runtime.refreshDatasourceIndexingSnapshot(ctx, runtime.catalogService()); err != nil {
+		t.Fatalf("refreshDatasourceIndexingSnapshot() error = %v", err)
+	}
 	status, err := runtime.RefreshDatasourceIndexingStatus(ctx)
 	if err != nil {
 		t.Fatalf("RefreshDatasourceIndexingStatus() error = %v", err)
@@ -7750,9 +8126,9 @@ func TestRunDatasourceIndexingWithLocalSourceKeyDoesNotProcessOtherLocalDatasour
 		t.Fatalf("indexing result = %+v, want media discovery only without immediate metadata/thumbnail work", result)
 	}
 
-	status, err := runtime.RefreshDatasourceIndexingStatus(context.Background())
+	status, err := runtime.refreshDatasourceIndexingSnapshot(context.Background(), catalogService)
 	if err != nil {
-		t.Fatalf("RefreshDatasourceIndexingStatus() error = %v", err)
+		t.Fatalf("refreshDatasourceIndexingSnapshot() error = %v", err)
 	}
 	bySource := map[string]DatasourceIndexingStatus{}
 	for _, datasource := range status.Datasources {

@@ -215,7 +215,7 @@ const dashboardHTML = `<!doctype html>
     .datasource-task-table-wrap { overflow-x: auto; }
     .datasource-task-table { min-width: 980px; table-layout: fixed; }
     .datasource-task-activity { width: 104px; min-width: 104px; max-width: 104px; white-space: nowrap; }
-    .datasource-task-status { width: 330px; min-width: 330px; max-width: 330px; white-space: nowrap; }
+    .datasource-task-status { width: 330px; min-width: 330px; max-width: 330px; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
     .datasource-task-label { display: inline-flex; align-items: center; gap: 6px; }
     .datasource-task-note-trigger { width: 24px; min-width: 24px; height: 24px; min-height: 24px; padding: 0; border-radius: 999px; color: var(--muted); font-family: ui-serif, Georgia, serif; font-size: 15px; font-weight: 700; line-height: 1; }
     .datasource-task-note-trigger:hover, .datasource-task-note-trigger:focus-visible, .datasource-task-note-trigger[aria-expanded="true"] { border-color: var(--accent); color: var(--accent); outline: none; }
@@ -604,7 +604,7 @@ const dashboardHTML = `<!doctype html>
     let datasourceIndexingRefreshInFlight = false;
     let systemResourcesRefreshInFlight = false;
     const pendingDatasourceTaskActions = new Set();
-    const liveStatusRefreshMs = 5000;
+    const liveStatusRefreshMs = 15000;
     const semanticModelsLoadingRetryMs = 1500;
     const semanticModelsLoadingRetryMaxAttempts = 20;
     const datasourceIndexingSessionStorageKey = 'timich.admin.datasourceIndexingStatus.v1';

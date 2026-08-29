@@ -122,7 +122,11 @@ func (a *AgentRuntime) runScheduledDatasourceMirrorSync(ctx context.Context, rea
 
 func (a *AgentRuntime) syncConfiguredDatasourceMirrors(ctx context.Context, reason string) {
 	a.mirrorSyncMu.Lock()
-	defer a.mirrorSyncMu.Unlock()
+	a.datasourceMirrorSyncActive.Add(1)
+	defer func() {
+		a.mirrorSyncMu.Unlock()
+		a.datasourceMirrorSyncActive.Add(-1)
+	}()
 
 	catalogService := a.catalogService()
 	if catalogService == nil {
@@ -157,6 +161,7 @@ func (a *AgentRuntime) syncConfiguredDatasourceMirrors(ctx context.Context, reas
 			result.OutOfScopeCount,
 			result.MissingCount,
 		)
+		a.rememberRemoteDatasourceSyncSnapshot(catalogService, sourceKey, result)
 		a.notifyDatasourceMirrorSyncCompleted()
 	}
 }

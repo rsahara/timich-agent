@@ -22,6 +22,7 @@ const (
 	catalogDatabaseName                = "catalog.db"
 	catalogAdminDBName                 = "catalog-admin.db"
 	catalogReadConns                   = 4
+	catalogBackgroundReadConns         = 1
 	catalogSchemaVersion               = 3
 	catalogGallerySourceCanonicalIndex = "idx_catalog_assets_gallery_source_canonical"
 	// "TMCH" identifies the final Timich catalog format. Earlier unreleased
@@ -44,20 +45,27 @@ var (
 // ImmichMirrorAsset is one normalized Immich metadata row stored in the Agent
 // catalog.
 type ImmichMirrorAsset struct {
-	UpstreamAssetID  string
-	MediaType        string
-	Filename         string
-	CapturedAt       time.Time
-	Duration         *string
-	SourceUpdatedAt  *time.Time
-	ContentSHA1Hex   string
-	ContentSizeBytes int64
-	IsFavorite       bool
-	City             string
-	State            string
-	Country          string
-	PlaceLabel       string
-	Description      string
+	UpstreamAssetID                 string
+	MediaType                       string
+	Filename                        string
+	CapturedAt                      time.Time
+	Duration                        *string
+	SourceUpdatedAt                 *time.Time
+	UpstreamChecksumAlgorithm       string
+	ContentSHA1Hex                  string
+	ContentSizeBytes                int64
+	CanonicalContentSHA1Hex         string
+	CanonicalContentSizeBytes       int64
+	MappedLocalSourceKey            string
+	MappedLocalRootKey              string
+	MappedLocalRelativePath         string
+	ExternalContentIdentityScopeKey string
+	IsFavorite                      bool
+	City                            string
+	State                           string
+	Country                         string
+	PlaceLabel                      string
+	Description                     string
 }
 
 // MirrorStatus summarizes the Agent-owned datasource mirror.
@@ -111,6 +119,7 @@ type CatalogStore struct {
 	path                          string
 	db                            *sql.DB
 	readDB                        *sql.DB
+	backgroundReadDB              *sql.DB
 	semanticBinaryIntegrityMu     sync.Mutex
 	semanticBinaryIntegrity       map[string]semanticBinaryIntegrityCacheEntry
 	semanticVectorPayloadMu       sync.Mutex
@@ -148,6 +157,9 @@ func (s *CatalogStore) setStandaloneGalleryReadiness(readiness catalogGalleryRea
 	s.standaloneGalleryReadiness.Store(&readiness)
 	if err := s.ensureGalleryTimeline(context.Background(), readiness); err != nil {
 		log.Printf("timich-agent gallery timeline refresh failed error=%v", err)
+	}
+	if err := s.ensureGalleryProjection(context.Background(), readiness); err != nil {
+		log.Printf("timich-agent mixed gallery projection refresh failed error=%v", err)
 	}
 }
 
@@ -187,6 +199,10 @@ func LoadOrCreateCatalogStore(dataDir string) (*CatalogStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.ensureGalleryProjectionSchema(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := cleanupSemanticIndexCrashTemps(filepath.Join(root, semanticBinaryIndexDirName)); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -205,6 +221,13 @@ func LoadOrCreateCatalogStore(dataDir string) (*CatalogStore, error) {
 		return nil, err
 	}
 	store.readDB = readDB
+	backgroundReadDB, err := openCatalogReadOnlyDB(context.Background(), path, catalogBackgroundReadConns)
+	if err != nil {
+		_ = readDB.Close()
+		_ = db.Close()
+		return nil, err
+	}
+	store.backgroundReadDB = backgroundReadDB
 	return store, nil
 }
 
@@ -247,6 +270,19 @@ func (s *CatalogStore) queryDB() *sql.DB {
 		return s.readDB
 	}
 	return s.db
+}
+
+// backgroundQueryDB isolates long-running scheduler and indexing reads from
+// latency-sensitive Gallery and search requests. Keeping this pool bounded to
+// one connection also prevents duplicated status work from amplifying NAS I/O.
+func (s *CatalogStore) backgroundQueryDB() *sql.DB {
+	if s == nil {
+		return nil
+	}
+	if s.backgroundReadDB != nil {
+		return s.backgroundReadDB
+	}
+	return s.queryDB()
 }
 
 func (s *CatalogStore) commitCatalogAssetChanges(ctx context.Context, tx *sql.Tx, canonicalChanged bool) error {
@@ -394,8 +430,13 @@ func (s *CatalogStore) Close() error {
 		return nil
 	}
 	var err error
+	if s.backgroundReadDB != nil {
+		err = s.backgroundReadDB.Close()
+	}
 	if s.readDB != nil {
-		err = s.readDB.Close()
+		if closeErr := s.readDB.Close(); err == nil {
+			err = closeErr
+		}
 	}
 	if s.db != nil {
 		if closeErr := s.db.Close(); err == nil {
@@ -432,6 +473,10 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 		return fmt.Errorf("read catalog application id: %w", err)
 	}
 	if version == catalogSchemaVersion && applicationID == catalogApplicationID {
+		assetColumns, err := s.tableColumns("catalog_assets")
+		if err != nil {
+			return fmt.Errorf("inspect catalog external identity schema: %w", err)
+		}
 		rootStateColumns, err := s.tableColumns("local_scan_root_state")
 		if err != nil {
 			return fmt.Errorf("inspect catalog root continuity schema: %w", err)
@@ -483,7 +528,21 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 			!jobColumns["root_generation"] {
 			return fmt.Errorf("%w: catalog schema is missing required local scan state; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, s.root)
 		}
+		if !assetColumns["upstream_checksum_algorithm"] ||
+			!assetColumns["canonical_content_sha1_hex"] ||
+			!assetColumns["canonical_content_size_bytes"] {
+			return fmt.Errorf("%w: catalog schema is missing required external content identity fields; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, s.root)
+		}
+		var externalIdentityStateCount int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+			WHERE type = 'table' AND name = 'catalog_external_identity_state'`).Scan(&externalIdentityStateCount); err != nil {
+			return fmt.Errorf("inspect catalog external identity state: %w", err)
+		}
+		if externalIdentityStateCount != 1 {
+			return fmt.Errorf("%w: catalog schema is missing required external identity state; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, s.root)
+		}
 		requiredIndexPrefixes := map[string][]string{
+			"idx_catalog_assets_external_checksum":           {"source_key", "upstream_checksum_algorithm", "content_sha1_hex"},
 			"idx_local_scan_jobs_metadata_ready":             {"job_kind", "status", "root_generation", "source_key"},
 			"idx_local_scan_jobs_source_metadata_ready":      {"source_key", "root_key", "root_generation", "job_kind", "status"},
 			"idx_local_scan_jobs_thumbnail_ready":            {"job_kind", "status", "root_generation", "source_key"},
@@ -533,8 +592,11 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 			source_updated_at TEXT,
 			is_favorite INTEGER NOT NULL DEFAULT 0,
 			canonical_asset_id TEXT,
+			upstream_checksum_algorithm TEXT NOT NULL DEFAULT 'sha1' CHECK (upstream_checksum_algorithm IN ('sha1', 'sha1-path', 'unknown')),
 			content_sha1_hex TEXT,
 			content_size_bytes INTEGER,
+			canonical_content_sha1_hex TEXT,
+			canonical_content_size_bytes INTEGER,
 			place_label TEXT,
 			description TEXT,
 			first_seen_at TEXT NOT NULL,
@@ -555,6 +617,13 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 			ON catalog_assets(source_key, datasource_kind, visibility_status, canonical_asset_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_catalog_assets_source_updated
 			ON catalog_assets(source_key, datasource_kind, source_updated_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_catalog_assets_external_checksum
+			ON catalog_assets(source_key, upstream_checksum_algorithm, content_sha1_hex)`,
+		`CREATE TABLE IF NOT EXISTS catalog_external_identity_state (
+			singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+			scope_key TEXT NOT NULL,
+			reconciled_at TEXT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS catalog_canonical_assets (
 			canonical_asset_id TEXT PRIMARY KEY,
 			content_sha1_hex TEXT,
@@ -925,6 +994,11 @@ func (s *CatalogStore) ensureCatalogQueryIndexes(ctx context.Context) error {
 				ON catalog_assets(source_key, datasource_kind, visibility_status, canonical_asset_id)`,
 		},
 		{
+			name: "idx_catalog_assets_external_checksum",
+			sql: `CREATE INDEX IF NOT EXISTS idx_catalog_assets_external_checksum
+				ON catalog_assets(source_key, upstream_checksum_algorithm, content_sha1_hex)`,
+		},
+		{
 			name: "idx_catalog_gallery_timeline_captured",
 			sql: `CREATE INDEX IF NOT EXISTS idx_catalog_gallery_timeline_captured
 				ON catalog_gallery_timeline(generation, captured_at DESC, canonical_asset_id, global_position)`,
@@ -1268,6 +1342,9 @@ func (s *CatalogStore) ReplaceFull(
 		return MirrorSyncResult{}, fmt.Errorf("begin immich mirror sync: %w", err)
 	}
 	defer tx.Rollback()
+	if err := lockImmichMirrorExternalIdentityScopeInTx(ctx, tx, assets); err != nil {
+		return MirrorSyncResult{}, err
+	}
 
 	hiddenStatus := MirrorVisibilityMissing
 	if latestAssetLimit > 0 {
@@ -1289,8 +1366,14 @@ func (s *CatalogStore) ReplaceFull(
 		duration TEXT,
 		source_updated_at TEXT,
 		is_favorite INTEGER NOT NULL,
+		upstream_checksum_algorithm TEXT NOT NULL,
 		content_sha1_hex TEXT,
 		content_size_bytes INTEGER,
+		canonical_content_sha1_hex TEXT,
+		canonical_content_size_bytes INTEGER,
+		mapped_local_source_key TEXT,
+		mapped_local_root_key TEXT,
+		mapped_local_relative_path TEXT,
 		place_label TEXT,
 		description TEXT
 	)`); err != nil {
@@ -1298,8 +1381,12 @@ func (s *CatalogStore) ReplaceFull(
 	}
 	statement, err := tx.PrepareContext(ctx, `INSERT INTO immich_full_stage (
 			upstream_asset_id, media_type, filename, captured_at, duration, source_updated_at,
-			is_favorite, content_sha1_hex, content_size_bytes, place_label, description
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			is_favorite, upstream_checksum_algorithm, content_sha1_hex,
+			content_size_bytes, canonical_content_sha1_hex,
+			canonical_content_size_bytes, mapped_local_source_key, mapped_local_root_key,
+			mapped_local_relative_path,
+			place_label, description
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(upstream_asset_id) DO UPDATE SET
 			media_type = excluded.media_type,
 			filename = excluded.filename,
@@ -1307,8 +1394,14 @@ func (s *CatalogStore) ReplaceFull(
 			duration = excluded.duration,
 			source_updated_at = excluded.source_updated_at,
 			is_favorite = excluded.is_favorite,
+			upstream_checksum_algorithm = excluded.upstream_checksum_algorithm,
 			content_sha1_hex = excluded.content_sha1_hex,
 			content_size_bytes = excluded.content_size_bytes,
+			canonical_content_sha1_hex = excluded.canonical_content_sha1_hex,
+			canonical_content_size_bytes = excluded.canonical_content_size_bytes,
+			mapped_local_source_key = excluded.mapped_local_source_key,
+			mapped_local_root_key = excluded.mapped_local_root_key,
+			mapped_local_relative_path = excluded.mapped_local_relative_path,
 			place_label = excluded.place_label,
 			description = excluded.description`)
 	if err != nil {
@@ -1339,8 +1432,14 @@ func (s *CatalogStore) ReplaceFull(
 			duration,
 			updatedAt,
 			boolToSQLiteInt(asset.IsFavorite),
+			normalizeMirrorUpstreamChecksumAlgorithm(asset),
 			nullableCatalogSHA1(asset.ContentSHA1Hex),
 			nullablePositiveInt64(asset.ContentSizeBytes),
+			nullableCatalogSHA1(asset.CanonicalContentSHA1Hex),
+			nullablePositiveInt64(asset.CanonicalContentSizeBytes),
+			nullableCatalogText(asset.MappedLocalSourceKey),
+			nullableCatalogText(asset.MappedLocalRootKey),
+			nullableCatalogText(asset.MappedLocalRelativePath),
 			nullableCatalogText(asset.PlaceLabel),
 			nullableCatalogText(asset.Description),
 		)
@@ -1350,6 +1449,39 @@ func (s *CatalogStore) ReplaceFull(
 	}
 	if err = statement.Close(); err != nil {
 		return MirrorSyncResult{}, fmt.Errorf("close immich full-sync stage: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE immich_full_stage
+		SET canonical_content_sha1_hex = (
+				SELECT local.sha1_hex
+				FROM local_asset_locations location
+				JOIN local_assets local
+				  ON local.source_key = location.source_key
+				 AND local.asset_id = location.asset_id
+				WHERE location.source_key = immich_full_stage.mapped_local_source_key
+					AND location.root_key = immich_full_stage.mapped_local_root_key
+					AND location.relative_path = immich_full_stage.mapped_local_relative_path
+					AND location.status = 'active'
+					AND local.visibility_status = 'active'
+				LIMIT 1
+			),
+			canonical_content_size_bytes = (
+				SELECT local.content_size_bytes
+				FROM local_asset_locations location
+				JOIN local_assets local
+				  ON local.source_key = location.source_key
+				 AND local.asset_id = location.asset_id
+				WHERE location.source_key = immich_full_stage.mapped_local_source_key
+					AND location.root_key = immich_full_stage.mapped_local_root_key
+					AND location.relative_path = immich_full_stage.mapped_local_relative_path
+					AND location.status = 'active'
+					AND local.visibility_status = 'active'
+				LIMIT 1
+			)
+		WHERE upstream_checksum_algorithm = ?
+			AND mapped_local_source_key IS NOT NULL
+			AND mapped_local_root_key IS NOT NULL
+			AND mapped_local_relative_path IS NOT NULL`, upstreamChecksumAlgorithmSHA1Path); err != nil {
+		return MirrorSyncResult{}, fmt.Errorf("resolve full-sync external content identities: %w", err)
 	}
 	changedAssetIDs, semanticChanged, changedErr := immichFullSyncChangesInTx(ctx, tx, sourceKey, hiddenStatus)
 	if changedErr != nil {
@@ -1367,12 +1499,16 @@ func (s *CatalogStore) ReplaceFull(
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO catalog_assets (
 			source_key, datasource_kind, upstream_asset_id, media_type, filename, captured_at, duration,
-			visibility_status, source_updated_at, is_favorite, content_sha1_hex,
-			content_size_bytes, place_label, description, first_seen_at, updated_at
+			visibility_status, source_updated_at, is_favorite, upstream_checksum_algorithm,
+			content_sha1_hex, content_size_bytes, canonical_content_sha1_hex,
+			canonical_content_size_bytes,
+			place_label, description, first_seen_at, updated_at
 		)
 		SELECT ?, 'immich', upstream_asset_id, media_type, filename, captured_at, duration,
-			'active', source_updated_at, is_favorite, content_sha1_hex,
-			content_size_bytes, place_label, description, ?, ?
+			'active', source_updated_at, is_favorite, upstream_checksum_algorithm,
+			content_sha1_hex, content_size_bytes, canonical_content_sha1_hex,
+			canonical_content_size_bytes,
+			place_label, description, ?, ?
 		FROM immich_full_stage
 		WHERE 1
 		ON CONFLICT(source_key, upstream_asset_id) DO UPDATE SET
@@ -1384,8 +1520,11 @@ func (s *CatalogStore) ReplaceFull(
 			visibility_status = excluded.visibility_status,
 			source_updated_at = excluded.source_updated_at,
 			is_favorite = excluded.is_favorite,
+			upstream_checksum_algorithm = excluded.upstream_checksum_algorithm,
 			content_sha1_hex = excluded.content_sha1_hex,
 			content_size_bytes = excluded.content_size_bytes,
+			canonical_content_sha1_hex = excluded.canonical_content_sha1_hex,
+			canonical_content_size_bytes = excluded.canonical_content_size_bytes,
 			place_label = excluded.place_label,
 			description = excluded.description,
 			updated_at = excluded.updated_at
@@ -1397,8 +1536,11 @@ func (s *CatalogStore) ReplaceFull(
 			OR catalog_assets.visibility_status IS NOT excluded.visibility_status
 			OR catalog_assets.source_updated_at IS NOT excluded.source_updated_at
 			OR catalog_assets.is_favorite IS NOT excluded.is_favorite
+			OR catalog_assets.upstream_checksum_algorithm IS NOT excluded.upstream_checksum_algorithm
 			OR catalog_assets.content_sha1_hex IS NOT excluded.content_sha1_hex
 			OR catalog_assets.content_size_bytes IS NOT excluded.content_size_bytes
+			OR catalog_assets.canonical_content_sha1_hex IS NOT excluded.canonical_content_sha1_hex
+			OR catalog_assets.canonical_content_size_bytes IS NOT excluded.canonical_content_size_bytes
 			OR catalog_assets.place_label IS NOT excluded.place_label
 			OR catalog_assets.description IS NOT excluded.description`,
 		sourceKey, nowText, nowText,
@@ -1490,8 +1632,11 @@ func immichFullSyncChangesInTx(ctx context.Context, tx *sql.Tx, sourceKey string
 							OR assets.visibility_status IS NOT 'active'
 							OR assets.source_updated_at IS NOT stage.source_updated_at
 							OR assets.is_favorite IS NOT stage.is_favorite
+							OR assets.upstream_checksum_algorithm IS NOT stage.upstream_checksum_algorithm
 							OR assets.content_sha1_hex IS NOT stage.content_sha1_hex
 							OR assets.content_size_bytes IS NOT stage.content_size_bytes
+							OR assets.canonical_content_sha1_hex IS NOT stage.canonical_content_sha1_hex
+							OR assets.canonical_content_size_bytes IS NOT stage.canonical_content_size_bytes
 							OR assets.place_label IS NOT stage.place_label
 							OR assets.description IS NOT stage.description
 						)
@@ -1554,13 +1699,17 @@ func (s *CatalogStore) MergeIncremental(
 		return MirrorSyncResult{}, fmt.Errorf("begin immich mirror incremental sync: %w", err)
 	}
 	defer tx.Rollback()
+	if err := lockImmichMirrorExternalIdentityScopeInTx(ctx, tx, assets); err != nil {
+		return MirrorSyncResult{}, err
+	}
 
 	statement, err := tx.PrepareContext(ctx, `INSERT INTO catalog_assets (
 			source_key, datasource_kind, upstream_asset_id, media_type, filename, captured_at, duration,
-			visibility_status, source_updated_at, is_favorite, content_sha1_hex,
-			content_size_bytes, place_label, description,
+			visibility_status, source_updated_at, is_favorite, upstream_checksum_algorithm,
+			content_sha1_hex, content_size_bytes, canonical_content_sha1_hex,
+			canonical_content_size_bytes, place_label, description,
 			first_seen_at, updated_at
-		) VALUES (?, 'immich', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, 'immich', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(source_key, upstream_asset_id) DO UPDATE SET
 			datasource_kind = excluded.datasource_kind,
 			media_type = excluded.media_type,
@@ -1570,8 +1719,11 @@ func (s *CatalogStore) MergeIncremental(
 			visibility_status = excluded.visibility_status,
 			source_updated_at = excluded.source_updated_at,
 			is_favorite = excluded.is_favorite,
+			upstream_checksum_algorithm = excluded.upstream_checksum_algorithm,
 			content_sha1_hex = excluded.content_sha1_hex,
 			content_size_bytes = excluded.content_size_bytes,
+			canonical_content_sha1_hex = excluded.canonical_content_sha1_hex,
+			canonical_content_size_bytes = excluded.canonical_content_size_bytes,
 			place_label = excluded.place_label,
 			description = excluded.description,
 			updated_at = excluded.updated_at
@@ -1583,8 +1735,11 @@ func (s *CatalogStore) MergeIncremental(
 			OR catalog_assets.visibility_status IS NOT excluded.visibility_status
 			OR catalog_assets.source_updated_at IS NOT excluded.source_updated_at
 			OR catalog_assets.is_favorite IS NOT excluded.is_favorite
+			OR catalog_assets.upstream_checksum_algorithm IS NOT excluded.upstream_checksum_algorithm
 			OR catalog_assets.content_sha1_hex IS NOT excluded.content_sha1_hex
 			OR catalog_assets.content_size_bytes IS NOT excluded.content_size_bytes
+			OR catalog_assets.canonical_content_sha1_hex IS NOT excluded.canonical_content_sha1_hex
+			OR catalog_assets.canonical_content_size_bytes IS NOT excluded.canonical_content_size_bytes
 			OR catalog_assets.place_label IS NOT excluded.place_label
 			OR catalog_assets.description IS NOT excluded.description`)
 	if err != nil {
@@ -1605,6 +1760,9 @@ func (s *CatalogStore) MergeIncremental(
 			duration.Valid = true
 			duration.String = *asset.Duration
 		}
+		if err := s.resolveImmichMirrorAssetCanonicalIdentityInTx(ctx, tx, &asset); err != nil {
+			return MirrorSyncResult{}, err
+		}
 		updatedAt := sql.NullString{}
 		if asset.SourceUpdatedAt != nil && !asset.SourceUpdatedAt.IsZero() {
 			updatedAt.Valid = true
@@ -1621,8 +1779,11 @@ func (s *CatalogStore) MergeIncremental(
 			MirrorVisibilityActive,
 			updatedAt,
 			boolToSQLiteInt(asset.IsFavorite),
+			normalizeMirrorUpstreamChecksumAlgorithm(asset),
 			nullableCatalogSHA1(asset.ContentSHA1Hex),
 			nullablePositiveInt64(asset.ContentSizeBytes),
+			nullableCatalogSHA1(asset.CanonicalContentSHA1Hex),
+			nullablePositiveInt64(asset.CanonicalContentSizeBytes),
 			nullableCatalogText(asset.PlaceLabel),
 			nullableCatalogText(asset.Description),
 			nowText,

@@ -197,8 +197,9 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 	if !bytes.Contains(body, []byte("datasource-task-table-wrap")) ||
 		!bytes.Contains(body, []byte("width: 104px")) ||
 		!bytes.Contains(body, []byte("width: 330px")) ||
+		!bytes.Contains(body, []byte("white-space: normal; overflow-wrap: anywhere; word-break: break-word")) ||
 		!bytes.Contains(body, []byte("join(' · ')")) {
-		t.Fatalf("dashboard body is missing fixed single-line datasource task columns: %s", recorder.Body.String())
+		t.Fatalf("dashboard body is missing bounded wrapping datasource task columns: %s", recorder.Body.String())
 	}
 	if !bytes.Contains(body, []byte("data-datasource-task-note-trigger")) ||
 		!bytes.Contains(body, []byte("Show task note")) ||
@@ -361,6 +362,7 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 		!bytes.Contains(body, []byte("activeTasks")) ||
 		!bytes.Contains(body, []byte("queuedTasks")) ||
 		!bytes.Contains(body, []byte("settlingTasks")) ||
+		!bytes.Contains(body, []byte("const liveStatusRefreshMs = 15000;")) ||
 		!bytes.Contains(body, []byte("settling: ")) ||
 		!bytes.Contains(body, []byte("remain settling before metadata processing")) ||
 		!bytes.Contains(body, []byte("quick discovery: ")) ||
