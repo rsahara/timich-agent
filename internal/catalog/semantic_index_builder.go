@@ -330,16 +330,35 @@ func (b *semanticIndexBuilder) populate(ctx context.Context) error {
 	if err := b.setMeta(ctx, "phase", "preparing"); err != nil {
 		return err
 	}
-	where, args := semanticCatalogEligibilityWhere(b.sourceKey, b.profile.InputKind(), "a")
-	queryArgs := append(append([]any{}, args...), b.profile.ModelID(), b.profile.VectorSpaceID())
-	rows, err := b.store.backgroundQueryDB().QueryContext(ctx, `SELECT
-			a.upstream_asset_id, a.media_type, a.filename, a.captured_at, a.duration,
-			v.embedding_input, v.payload_batch_id, v.vector_offset, v.vector_length
-		FROM semantic_vectors v
-		JOIN catalog_assets a ON a.source_key = v.source_key AND a.upstream_asset_id = v.upstream_asset_id
-		`+where+`
-			AND v.model_id = ? AND v.vector_space_id = ? AND v.status = 'ready'
-		ORDER BY a.captured_at DESC, a.source_key ASC, a.upstream_asset_id ASC`, queryArgs...)
+	var rows *sql.Rows
+	var err error
+	if b.sourceKey == canonicalSemanticCorpusSourceKey {
+		rows, err = b.store.backgroundQueryDB().QueryContext(ctx, `SELECT
+				canonical.canonical_asset_id, canonical.media_type, canonical.filename, canonical.captured_at, canonical.duration,
+				vector.embedding_input, vector.payload_batch_id, vector.vector_offset, vector.vector_length
+			FROM semantic_vectors vector
+			JOIN catalog_canonical_assets canonical
+				ON canonical.canonical_asset_id = vector.upstream_asset_id
+			WHERE vector.source_key = ?
+				AND vector.model_id = ? AND vector.vector_space_id = ? AND vector.status = 'ready'
+				AND canonical.visibility_status = 'active'
+			ORDER BY canonical.captured_at DESC, canonical.canonical_asset_id ASC`,
+			canonicalSemanticCorpusSourceKey,
+			b.profile.ModelID(),
+			b.profile.VectorSpaceID(),
+		)
+	} else {
+		where, args := semanticCatalogEligibilityWhere(b.sourceKey, b.profile.InputKind(), "a")
+		queryArgs := append(append([]any{}, args...), b.profile.ModelID(), b.profile.VectorSpaceID())
+		rows, err = b.store.backgroundQueryDB().QueryContext(ctx, `SELECT
+				a.upstream_asset_id, a.media_type, a.filename, a.captured_at, a.duration,
+				v.embedding_input, v.payload_batch_id, v.vector_offset, v.vector_length
+			FROM semantic_vectors v
+			JOIN catalog_assets a ON a.source_key = v.source_key AND a.upstream_asset_id = v.upstream_asset_id
+			`+where+`
+				AND v.model_id = ? AND v.vector_space_id = ? AND v.status = 'ready'
+			ORDER BY a.captured_at DESC, a.source_key ASC, a.upstream_asset_id ASC`, queryArgs...)
+	}
 	if err != nil {
 		return fmt.Errorf("query semantic index builder nodes: %w", err)
 	}

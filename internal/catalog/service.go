@@ -328,6 +328,7 @@ type Service struct {
 	localRootTransitionGates     map[localMediaRootTransitionKey]*localMediaRootTransitionGate
 	dataDir                      string
 	mediaHelperPath              string
+	captureLocation              *time.Location
 	mediaHelperAuto              bool
 	mediaHelperCheck             localMediaHelperCapabilityStatus
 	mediaVipsPath                string
@@ -405,6 +406,7 @@ func (s *serviceDatasourceState) ready() bool {
 
 // ServiceOptions configures optional local catalog state.
 type ServiceOptions struct {
+	Timezone                  string
 	DataDir                   string
 	LocalRoots                []config.LocalMediaRootConfig
 	SemanticModels            *SemanticModelPackStore
@@ -460,7 +462,16 @@ func NewService(datasources []config.DatasourceConfig) *Service {
 
 // NewServiceWithOptions creates a catalog service with optional persistent catalog state.
 func NewServiceWithOptions(datasources []config.DatasourceConfig, options ServiceOptions) (*Service, error) {
+	captureLocation := time.Local
+	if timezone := strings.TrimSpace(options.Timezone); timezone != "" {
+		var err error
+		captureLocation, err = time.LoadLocation(timezone)
+		if err != nil {
+			return nil, fmt.Errorf("capture metadata timezone: %w", err)
+		}
+	}
 	service := &Service{
+		captureLocation:   captureLocation,
 		client:            &http.Client{Timeout: 30 * time.Second},
 		dataDir:           strings.TrimSpace(options.DataDir),
 		semanticModels:    options.SemanticModels,
@@ -966,7 +977,7 @@ func (s *Service) semanticSearchHasPublishedIndex(ctx context.Context, profile s
 	if s == nil || s.catalog == nil || profile == nil {
 		return false
 	}
-	for _, sourceKey := range s.semanticDatasourceSourceKeys() {
+	for _, sourceKey := range s.semanticSearchCorpusSourceKeys(ctx, profile) {
 		available, err := s.catalog.hasPublishedSemanticBinaryIndex(ctx, sourceKey, profile)
 		if err != nil {
 			log.Printf(
@@ -990,7 +1001,7 @@ func (s *Service) semanticSearchUnavailableStatus(ctx context.Context, profile s
 	directStatusSeen := false
 	directStatusAllReady := true
 	statusReadSucceeded := false
-	for _, sourceKey := range s.semanticDatasourceSourceKeys() {
+	for _, sourceKey := range s.semanticSearchCorpusSourceKeys(ctx, profile) {
 		current, err := s.catalog.semanticStatusForBinarySearch(ctx, sourceKey, profile)
 		if err != nil {
 			log.Printf(
@@ -1226,7 +1237,7 @@ func (s *Service) SemanticModelBackfillSnapshot(ctx context.Context, candidate S
 		return nil, nil
 	}
 	started := time.Now()
-	sourceKeys := s.semanticDatasourceSourceKeysFor(nil)
+	sourceKeys := s.semanticCorpusSourceKeysFor(nil)
 	if len(sourceKeys) == 0 {
 		log.Printf(
 			"timich-agent semantic model backfill status skipped model=%s vector_space=%s reason=no_sources elapsed=%s",
@@ -1275,7 +1286,7 @@ func (s *Service) SemanticModelBackfillStatusForDatasource(ctx context.Context, 
 	if len(sourceKeys) == 0 {
 		return nil, nil
 	}
-	return s.semanticModelBackfillStatusForSourceKeys(ctx, sourceKeys, candidate)
+	return s.catalog.canonicalSemanticBackfillStatusForSourceKeys(ctx, candidate, sourceKeys)
 }
 
 func (s *Service) semanticModelBackfillStatusForSourceKeys(ctx context.Context, sourceKeys []string, candidate SemanticModelProfileStatus) (*SemanticModelBackfillStatus, error) {
@@ -1303,7 +1314,13 @@ func (s *Service) semanticModelBackfillSnapshotForSourceKeys(ctx context.Context
 			candidate.ModelID,
 			candidate.VectorSpaceID,
 		)
-		sourceStatus, err := s.catalog.SemanticBackfillStatus(ctx, sourceKey, candidate)
+		var sourceStatus SemanticModelBackfillStatus
+		var err error
+		if sourceKey == canonicalSemanticCorpusSourceKey {
+			sourceStatus, err = s.canonicalSemanticBackfillStatus(ctx, candidate)
+		} else {
+			sourceStatus, err = s.catalog.SemanticBackfillStatus(ctx, sourceKey, candidate)
+		}
 		if err != nil {
 			log.Printf(
 				"timich-agent semantic model backfill source status failed source_key=%s model=%s vector_space=%s elapsed=%s error=%v",
@@ -1360,6 +1377,28 @@ func (s *Service) semanticModelBackfillSnapshotForSourceKeys(ctx context.Context
 	return &SemanticModelBackfillSnapshot{Status: status, SourceStatuses: sourceStatuses}, nil
 }
 
+// canonicalSemanticBackfillStatus is the configured-source progress view shared
+// by scheduler snapshots and publication notifications. Durable index counts
+// remain owned by CatalogStore and describe the entire immutable corpus.
+func (s *Service) canonicalSemanticBackfillStatus(ctx context.Context, candidate SemanticModelProfileStatus) (SemanticModelBackfillStatus, error) {
+	configured := s.semanticDatasourceSourceKeysFor(nil)
+	var deferredKeys []string
+	var nextSourceRetry *time.Time
+	for _, key := range configured {
+		if retryAt, deferred := s.semanticSourceRetryDeadline(key, s.semanticSourceRetryTime()); deferred {
+			deferredKeys = append(deferredKeys, key)
+			if nextSourceRetry == nil || retryAt.Before(*nextSourceRetry) {
+				nextSourceRetry = retryAt
+			}
+		}
+	}
+	sourceStatus, err := s.catalog.canonicalSemanticBackfillStatusForScope(ctx, candidate, configured, deferredKeys...)
+	if nextSourceRetry != nil && (sourceStatus.NextEligibleAt == nil || nextSourceRetry.Before(*sourceStatus.NextEligibleAt)) {
+		sourceStatus.NextEligibleAt = nextSourceRetry
+	}
+	return sourceStatus, err
+}
+
 func (s *Service) BackfillSemanticModelCandidateWithOptions(ctx context.Context, modelStore *SemanticModelPackStore, candidate SemanticModelProfileStatus, options SemanticModelBackfillOptions) (SemanticBackfillResult, error) {
 	if !s.catalogStoreEnabled() {
 		return SemanticBackfillResult{}, ErrCatalogNotConfigured
@@ -1372,9 +1411,11 @@ func (s *Service) BackfillSemanticModelCandidateWithOptions(ctx context.Context,
 		return SemanticBackfillResult{}, ErrSemanticModelPackInvalid
 	}
 	sourceKeys := s.semanticDatasourceSourceKeysFor(options.SourceKeys)
+	corpusSourceKeys := []string{canonicalSemanticCorpusSourceKey}
 	if len(sourceKeys) == 0 {
 		return SemanticBackfillResult{}, ErrCatalogNotConfigured
 	}
+	canonicalSourceKeys := s.semanticDatasourceSourceKeysFor(nil)
 	startedAt := time.Now().UTC()
 	sourceKeys = s.semanticBackfillSourceOrder(ctx, candidate, sourceKeys)
 	remaining := options.MaxAssets
@@ -1383,15 +1424,6 @@ func (s *Service) BackfillSemanticModelCandidateWithOptions(ctx context.Context,
 	}
 	result := SemanticBackfillResult{StartedAt: startedAt}
 	var sourceErrors []error
-	upsertSourceStatus := func(sourceKey string, status SemanticModelBackfillStatus) {
-		for index := range result.SourceStatuses {
-			if result.SourceStatuses[index].SourceKey == sourceKey {
-				result.SourceStatuses[index].Status = status
-				return
-			}
-		}
-		result.SourceStatuses = append(result.SourceStatuses, SemanticBackfillSource{SourceKey: sourceKey, Status: status})
-	}
 	processSource := func(sourceKey string, maxAssets int) (int, bool, error) {
 		now := s.semanticSourceRetryTime()
 		if retryAt, deferred := s.semanticSourceRetryDeadline(sourceKey, now); deferred {
@@ -1403,11 +1435,13 @@ func (s *Service) BackfillSemanticModelCandidateWithOptions(ctx context.Context,
 			))
 			return 0, false, nil
 		}
-		sourceResult, err := s.catalog.BackfillSemanticVectors(ctx, sourceKey, profile, startedAt, SemanticBackfillOptions{
-			ImageLoader: s,
-			MaxAssets:   maxAssets,
-			Workers:     options.Workers,
-			BeforeEmbed: options.BeforeEmbed,
+		sourceResult, err := s.catalog.BackfillSemanticVectors(ctx, canonicalSemanticCorpusSourceKey, profile, startedAt, SemanticBackfillOptions{
+			ImageLoader:                 s,
+			MaxAssets:                   maxAssets,
+			Workers:                     options.Workers,
+			CanonicalSourceKeys:         canonicalSourceKeys,
+			CanonicalEmbeddingSourceKey: sourceKey,
+			BeforeEmbed:                 options.BeforeEmbed,
 		})
 		if err != nil {
 			if errors.Is(err, ErrSemanticSourceUnavailable) {
@@ -1421,9 +1455,6 @@ func (s *Service) BackfillSemanticModelCandidateWithOptions(ctx context.Context,
 		s.clearSemanticSourceRetry(sourceKey)
 		result.ProcessedVectorCount += sourceResult.ProcessedVectorCount
 		result.CompletedAt = sourceResult.CompletedAt
-		if sourceResult.Status.ModelID != "" || sourceResult.Status.VectorSpaceID != "" {
-			upsertSourceStatus(sourceKey, sourceResult.Status)
-		}
 		return sourceResult.ProcessedVectorCount, maxAssets > 0 && sourceResult.ProcessedVectorCount >= maxAssets, nil
 	}
 
@@ -1479,11 +1510,11 @@ func (s *Service) BackfillSemanticModelCandidateWithOptions(ctx context.Context,
 	if result.ProcessedVectorCount == 0 && len(sourceErrors) > 0 {
 		return result, errors.Join(sourceErrors...)
 	}
-	if _, err := s.catalog.ReconcileSemanticIndexJobs(ctx, sourceKeys, profile, options.AllowPartialIndexPublish, time.Now().UTC()); err != nil {
+	if _, err := s.catalog.ReconcileSemanticIndexJobs(ctx, corpusSourceKeys, profile, options.AllowPartialIndexPublish, time.Now().UTC(), canonicalSourceKeys...); err != nil {
 		return SemanticBackfillResult{}, err
 	}
 	if options.DrainIndexJobs {
-		publish, err := s.catalog.PublishNextSemanticIndexJob(ctx, sourceKeys, profile, time.Now().UTC())
+		publish, err := s.catalog.PublishNextSemanticIndexJob(ctx, corpusSourceKeys, profile, time.Now().UTC())
 		if err != nil {
 			return SemanticBackfillResult{}, err
 		}
@@ -1491,13 +1522,14 @@ func (s *Service) BackfillSemanticModelCandidateWithOptions(ctx context.Context,
 			result.CompletedAt = publish.CompletedAt
 		}
 	}
-	status, err := s.semanticModelBackfillStatusForSourceKeys(ctx, sourceKeys, candidate)
+	snapshot, err := s.semanticModelBackfillSnapshotForSourceKeys(ctx, corpusSourceKeys, candidate)
 	if err != nil {
 		return SemanticBackfillResult{}, err
 	}
-	if status != nil {
-		result.Status = *status
-		result.IndexedVectorCount = status.IndexedVectorCount
+	if snapshot != nil {
+		result.Status = snapshot.Status
+		result.SourceStatuses = snapshot.SourceStatuses
+		result.IndexedVectorCount = snapshot.Status.IndexedVectorCount
 	}
 	if result.CompletedAt.IsZero() {
 		result.CompletedAt = time.Now().UTC()
@@ -1545,11 +1577,23 @@ func (s *Service) PublishNextSemanticIndexJob(ctx context.Context, modelStore *S
 	if !ok {
 		return SemanticIndexPublishResult{}, ErrSemanticModelPackInvalid
 	}
-	sourceKeys = s.semanticDatasourceSourceKeysFor(sourceKeys)
+	sourceKeys = s.semanticCorpusSourceKeysFor(sourceKeys)
 	if len(sourceKeys) == 0 {
 		return SemanticIndexPublishResult{}, ErrCatalogNotConfigured
 	}
-	return s.catalog.PublishNextSemanticIndexJob(ctx, sourceKeys, profile, time.Now().UTC())
+	result, err := s.catalog.PublishNextSemanticIndexJob(ctx, sourceKeys, profile, time.Now().UTC())
+	if err != nil || !result.Published {
+		return result, err
+	}
+	// Publication finalizes the full corpus before computing configured-source
+	// progress. Never persist these filtered counts into the index metadata.
+	status, err := s.canonicalSemanticBackfillStatus(ctx, candidate)
+	if err != nil {
+		return result, err
+	}
+	result.Status = status
+	result.IndexedVectorCount = status.IndexedVectorCount
+	return result, nil
 }
 
 func (s *Service) ReconcileSemanticIndexJobs(ctx context.Context, modelStore *SemanticModelPackStore, candidate SemanticModelProfileStatus, sourceKeys []string, allowPartial bool) (int, error) {
@@ -1563,11 +1607,11 @@ func (s *Service) ReconcileSemanticIndexJobs(ctx context.Context, modelStore *Se
 	if !ok {
 		return 0, ErrSemanticModelPackInvalid
 	}
-	sourceKeys = s.semanticDatasourceSourceKeysFor(sourceKeys)
+	sourceKeys = s.semanticCorpusSourceKeysFor(sourceKeys)
 	if len(sourceKeys) == 0 {
 		return 0, ErrCatalogNotConfigured
 	}
-	return s.catalog.ReconcileSemanticIndexJobs(ctx, sourceKeys, profile, allowPartial, time.Now().UTC())
+	return s.catalog.ReconcileSemanticIndexJobs(ctx, sourceKeys, profile, allowPartial, time.Now().UTC(), s.semanticDatasourceSourceKeysFor(nil)...)
 }
 
 func (s *Service) SemanticModelIndexPublishNeeded(ctx context.Context, modelStore *SemanticModelPackStore, candidate SemanticModelProfileStatus, sourceKeys []string, allowPartial bool) (bool, int, error) {
@@ -1581,11 +1625,11 @@ func (s *Service) SemanticModelIndexPublishNeeded(ctx context.Context, modelStor
 	if !ok {
 		return false, 0, ErrSemanticModelPackInvalid
 	}
-	sourceKeys = s.semanticDatasourceSourceKeysFor(sourceKeys)
+	sourceKeys = s.semanticCorpusSourceKeysFor(sourceKeys)
 	if len(sourceKeys) == 0 {
 		return false, 0, ErrCatalogNotConfigured
 	}
-	return s.catalog.SemanticIndexPublishNeeded(ctx, sourceKeys, profile, allowPartial)
+	return s.catalog.SemanticIndexPublishNeeded(ctx, sourceKeys, profile, allowPartial, s.semanticDatasourceSourceKeysFor(nil)...)
 }
 
 // SemanticModelIndexPublishNeededFromSnapshot preserves the normal per-source
@@ -1605,7 +1649,7 @@ func (s *Service) SemanticModelIndexPublishNeededFromSnapshot(ctx context.Contex
 	if !ok {
 		return false, 0, ErrSemanticModelPackInvalid
 	}
-	allowedSourceKeys := s.semanticDatasourceSourceKeysFor(nil)
+	allowedSourceKeys := s.semanticCorpusSourceKeysFor(nil)
 	allowed := make(map[string]struct{}, len(allowedSourceKeys))
 	for _, sourceKey := range allowedSourceKeys {
 		allowed[sourceKey] = struct{}{}
@@ -1700,6 +1744,18 @@ func (s *Service) semanticDatasourceSourceKeysFor(requested []string) []string {
 	}
 	sort.Strings(sourceKeys)
 	return sourceKeys
+}
+
+// semanticCorpusSourceKeysFor always routes semantic lifecycle operations to
+// the canonical corpus after validating the requested datasource allowlist.
+// Backfill carries that allowlist separately as canonical membership scope, so
+// a Local repair cannot embed unrelated canonical assets.
+func (s *Service) semanticCorpusSourceKeysFor(requested []string) []string {
+	sourceKeys := s.semanticDatasourceSourceKeysFor(requested)
+	if len(sourceKeys) > 0 {
+		return []string{canonicalSemanticCorpusSourceKey}
+	}
+	return nil
 }
 
 func (s *Service) semanticBackfillSourceOrder(ctx context.Context, candidate SemanticModelProfileStatus, sourceKeys []string) []string {

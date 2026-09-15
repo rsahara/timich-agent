@@ -153,6 +153,17 @@ func (s *CatalogStore) semanticBinaryIndexMatchesBackfillStatus(ctx context.Cont
 	if err := ctx.Err(); err != nil {
 		return false
 	}
+	// The immutable corpus may retain vectors for removed sources. Compare its
+	// header against durable corpus membership, not configured-source coverage.
+	if sourceKey == canonicalSemanticCorpusSourceKey {
+		indexed, err := s.canonicalSemanticIndexedVectorCount(ctx, SemanticModelProfileStatus{
+			ModelID: profile.ModelID(), VectorSpaceID: profile.VectorSpaceID(),
+		}, nil)
+		if err != nil {
+			return false
+		}
+		status.IndexedVectorCount = indexed
+	}
 	semantic := semanticStatusFromBackfillStatus(status, profile)
 	manifest, err := readSemanticBinaryActiveManifest(s.semanticBinaryActiveManifestPath(sourceKey, profile))
 	if err != nil {

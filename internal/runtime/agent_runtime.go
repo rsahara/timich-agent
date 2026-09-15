@@ -207,9 +207,9 @@ type LocalMediaRootAcceptanceResponse struct {
 // to the asynchronous local thumbnail queue.
 type LocalDatasourceThumbnailRequeueResponse = catalog.LocalThumbnailRequeueResult
 
-// LocalDatasourceMetadataRequeueResponse reports failed metadata moved back
-// to the asynchronous local metadata queue.
-type LocalDatasourceMetadataRequeueResponse = catalog.LocalMetadataRequeueResult
+// LocalDatasourceMetadataRequeueResponse reports metadata repair work moved
+// back to the asynchronous local metadata queue.
+type LocalDatasourceMetadataRequeueResponse = catalog.LocalMetadataRepairResult
 
 // LocalDatasourceEmbeddingRepairResponse reports an explicit local embedding repair kick.
 type LocalDatasourceEmbeddingRepairResponse = catalog.SemanticBackfillResult
@@ -457,6 +457,7 @@ func NewAgentRuntime(build BuildInfo, cfg config.ResolvedConfig, state store.Loa
 		return nil, err
 	}
 	catalogService, err := catalog.NewServiceWithOptions(cfg.Datasources, catalog.ServiceOptions{
+		Timezone:                  cfg.Timezone,
 		DataDir:                   cfg.DataDir,
 		LocalRoots:                cfg.LocalMediaRoots,
 		SemanticModels:            semanticModels,
@@ -1309,7 +1310,7 @@ func (a *AgentRuntime) RequeueFailedLocalDatasourceMetadata(ctx context.Context)
 	if catalogService == nil {
 		return LocalDatasourceMetadataRequeueResponse{}, catalog.ErrNoDatasourceConfigured
 	}
-	result, err := catalogService.RequeueFailedLocalMetadata(ctx)
+	result, err := catalogService.RepairLocalMetadata(ctx)
 	if err == nil {
 		a.schedulerWorkStateMarkDirty()
 		a.wakeBackgroundWorkerScheduler()

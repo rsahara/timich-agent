@@ -41,6 +41,11 @@ jq -e '
   (.artifacts["linux-amd64"].url | startswith("https://github.com/rsahara/timich-agent/releases/download/v0.4.0/")) and
   (.updateGuide.dockerCompose | join(" ") | test("compose.local-media.yaml")) and
   (.updateGuide.dockerCompose | join(" ") | test("exact same -f file list")) and
+  (.updateGuide.dockerCompose | join(" ") | test("V5 migration instructions")) and
+  (.updateGuide.manualBinary | join(" ") | test("V5 migration instructions")) and
+  (.updateGuide.dockerCompose | join(" ") | test("prerelease V4 catalog")) and
+  (.updateGuide.manualBinary | join(" ") | test("Older schemas are unsupported")) and
+  ([.updateGuide.dockerCompose[], .updateGuide.manualBinary[]] | join(" ") | test("V3") | not) and
   (.updateGuide.manualBinary | join(" ") | test("complete new archive")) and
   (.updateGuide.manualBinary | join(" ") | test("both helpers")) and
   (.updateGuide.manualBinary | join(" ") | test("default relative .local")) and

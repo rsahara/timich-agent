@@ -305,7 +305,14 @@ paths:
   /v1/datasources/local/metadata/repair:
     post:
       operationId: repairLocalDatasourceMetadata
-      summary: Requeue local datasource metadata work.
+      summary: Requeue failed local metadata, backfill missing video durations, and check unprocessed embedded capture dates.
+      description: |
+        Queues work for the normal background scheduler. Capture-date refresh preserves
+        asset IDs, thumbnails, original files, and semantic vectors. Successful date
+        checks (including files without an embedded date) are remembered by extractor
+        version and Agent timezone. Repeated requests skip completed or pending checks.
+        Returns queued, failedQueued, videoDurationQueued, videoDurationSkipped,
+        captureDateQueued, and captureDateSkipped counts. Queued categories are disjoint.
       security:
         - AdminBearerAuth: []
       responses:

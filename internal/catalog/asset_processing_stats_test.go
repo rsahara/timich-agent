@@ -80,6 +80,7 @@ func TestRefreshAssetProcessingStatsReusesSemanticCountsForShortInterval(t *test
 
 	insertAssetProcessingStatsTestAsset(t, service, "asset-semantic-a", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ready")
 	insertAssetProcessingStatsTestRendition(t, service, "asset-semantic-a")
+	prepareAssetProcessingStatsCanonicalInputs(t, service)
 	insertAssetProcessingStatsTestVector(t, service, "asset-semantic-a", profile, true)
 
 	first, err := service.RefreshAssetProcessingStats(ctx, &profile, 0)
@@ -92,6 +93,7 @@ func TestRefreshAssetProcessingStatsReusesSemanticCountsForShortInterval(t *test
 
 	insertAssetProcessingStatsTestAsset(t, service, "asset-semantic-b", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ready")
 	insertAssetProcessingStatsTestRendition(t, service, "asset-semantic-b")
+	prepareAssetProcessingStatsCanonicalInputs(t, service)
 	insertAssetProcessingStatsTestVector(t, service, "asset-semantic-b", profile, true)
 
 	reused, err := service.RefreshAssetProcessingStats(ctx, &profile, 0)
@@ -127,6 +129,146 @@ func TestRefreshAssetProcessingStatsReusesSemanticCountsForShortInterval(t *test
 	assertAssetProcessingScopedStat(t, recounted, "1111111111111111", AssetProcessingStageSearchable, AssetProcessingStatusReady, 2, 2)
 }
 
+func TestRefreshAssetProcessingStatsExcludesRemovedSemanticSources(t *testing.T) {
+	for _, removedIndexed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "removed-unprocessed", true: "removed-indexed"}[removedIndexed], func(t *testing.T) {
+			ctx := context.Background()
+			service, models, profile, sources, _ := canonicalBoundarySources(t)
+			if removedIndexed {
+				sources[1].URL = sources[0].URL
+				if err := service.ReconfigureDatasources(sources); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := service.ReconfigureDatasources(sources[:1]); err != nil {
+				t.Fatal(err)
+			}
+			result, err := service.BackfillSemanticModelCandidateWithOptions(ctx, models, profile, SemanticModelBackfillOptions{MaxAssets: 10, DrainIndexJobs: true})
+			wantStored := 1
+			if removedIndexed {
+				wantStored = 2
+			}
+			if err != nil || result.IndexedVectorCount != wantStored {
+				t.Fatalf("publish = %+v, %v, want %d indexed vectors", result, err, wantStored)
+			}
+			if err := service.ReconfigureDatasources(sources[:1]); err != nil {
+				t.Fatal(err)
+			}
+
+			snapshot, err := service.RefreshAssetProcessingStats(ctx, &profile, 0)
+			if err != nil {
+				t.Fatalf("RefreshAssetProcessingStats() error = %v", err)
+			}
+			for _, stage := range []string{AssetProcessingStageEmbeddings, AssetProcessingStageSearchIndex} {
+				assertAssetProcessingStat(t, snapshot, stage, AssetProcessingStatusReady, 1, 1)
+				assertAssetProcessingStat(t, snapshot, stage, AssetProcessingStatusPending, 0, 1)
+			}
+			assertAssetProcessingScopedStat(t, snapshot, sources[0].SourceKey, AssetProcessingStageSearchable, AssetProcessingStatusReady, 1, 1)
+			if snapshot.HasStageForScope(sources[1].SourceKey, AssetProcessingStageSearchable) {
+				t.Fatal("removed datasource remains in searchable coverage")
+			}
+			persisted, err := service.AssetProcessingStats(ctx)
+			if err != nil {
+				t.Fatalf("AssetProcessingStats() error = %v", err)
+			}
+			status := SemanticBackfillStatusFromAssetProcessingStats(persisted, profile)
+			if status == nil || status.Status != SemanticBackfillStatusReady || status.EligibleAssetCount != 1 || status.CompletedVectorCount != 1 || status.IndexedVectorCount != 1 || status.RemainingVectorCount != 0 {
+				t.Fatalf("persisted progress includes removed source: %+v", status)
+			}
+			var storedIndexed int
+			if err := service.catalog.db.QueryRowContext(ctx, `SELECT indexed_vector_count FROM semantic_state WHERE source_key = ? AND model_id = ?`, canonicalSemanticCorpusSourceKey, profile.ModelID).Scan(&storedIndexed); err != nil {
+				t.Fatal(err)
+			}
+			if storedIndexed != wantStored {
+				t.Fatalf("durable corpus count = %d, want %d", storedIndexed, wantStored)
+			}
+		})
+	}
+}
+
+func TestRefreshAssetProcessingStatsUsesCanonicalCorpusBeforeCanonicalStateExists(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	service := newAssetProcessingStatsTestService(t)
+	profile := SemanticModelProfileStatus{
+		ModelID:       "model-a",
+		VectorSpaceID: "model-a/d4",
+		EmbeddingDim:  4,
+		ProfileKind:   semanticProfileKindModelPack,
+		InputKind:     semanticInputKindImage,
+	}
+
+	insertAssetProcessingStatsTestAsset(t, service, "asset-migrated", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ready")
+	insertAssetProcessingStatsTestRendition(t, service, "asset-migrated")
+	if _, err := service.catalog.db.ExecContext(ctx, `UPDATE local_renditions
+		SET source_sha1_hex = (
+			SELECT local_asset.sha1_hex
+			FROM local_assets local_asset
+			WHERE local_asset.source_key = local_renditions.source_key
+				AND local_asset.asset_id = local_renditions.asset_id
+		)
+		WHERE source_key = ?`, "1111111111111111"); err != nil {
+		t.Fatalf("make Local rendition canonical-semantic eligible: %v", err)
+	}
+	if _, err := service.catalog.RebuildCatalogCanonicalAssets(ctx); err != nil {
+		t.Fatalf("RebuildCatalogCanonicalAssets() error = %v", err)
+	}
+
+	// An existing source-scoped vector and published state remain a search
+	// fallback until canonical publication. Neither belongs to the canonical corpus.
+	insertAssetProcessingStatsTestLegacyVector(t, service, "asset-migrated", profile, true)
+	if _, err := service.catalog.db.ExecContext(ctx, `DELETE FROM semantic_state WHERE source_key = ?`, canonicalSemanticCorpusSourceKey); err != nil {
+		t.Fatalf("remove canonical semantic state: %v", err)
+	}
+	if _, err := service.catalog.db.ExecContext(ctx, `DELETE FROM semantic_vectors WHERE source_key = ?`, canonicalSemanticCorpusSourceKey); err != nil {
+		t.Fatalf("remove canonical semantic vectors: %v", err)
+	}
+
+	snapshot, err := service.RefreshAssetProcessingStats(ctx, &profile, 0)
+	if err != nil {
+		t.Fatalf("RefreshAssetProcessingStats() error = %v", err)
+	}
+	assertAssetProcessingStat(t, snapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusPending, 1, 1)
+	assertAssetProcessingStat(t, snapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusReady, 0, 1)
+	assertAssetProcessingStat(t, snapshot, AssetProcessingStageSearchIndex, AssetProcessingStatusPending, 0, 0)
+	assertAssetProcessingStat(t, snapshot, AssetProcessingStageSearchIndex, AssetProcessingStatusReady, 0, 0)
+	assertAssetProcessingScopedStat(t, snapshot, "1111111111111111", AssetProcessingStageSearchable, AssetProcessingStatusReady, 1, 1)
+
+	now := formatCatalogTime(time.Date(2026, 7, 4, 12, 5, 0, 0, time.UTC))
+	if _, err := service.catalog.db.ExecContext(ctx, `INSERT INTO semantic_state (
+			source_key, model_id, vector_space_id, status, embedding_dim,
+			completed_vector_count, indexed_vector_count, asset_generation, indexed_generation,
+			built_at, last_error, updated_at
+		) VALUES (?, ?, ?, 'backfilling', ?, 0, 0, 0, -1, NULL, NULL, ?)`,
+		canonicalSemanticCorpusSourceKey,
+		profile.ModelID,
+		profile.VectorSpaceID,
+		profile.EmbeddingDim,
+		now,
+	); err != nil {
+		t.Fatalf("insert unpublished canonical semantic state: %v", err)
+	}
+	statsDB, err := service.catalog.openStatsWriteDB(ctx)
+	if err != nil {
+		t.Fatalf("open stats db: %v", err)
+	}
+	if _, err := statsDB.ExecContext(ctx, `UPDATE asset_processing_stats SET refreshed_at = ?`, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)); err != nil {
+		_ = statsDB.Close()
+		t.Fatalf("stale semantic stats: %v", err)
+	}
+	if err := statsDB.Close(); err != nil {
+		t.Fatalf("close stats db: %v", err)
+	}
+
+	unpublished, err := service.RefreshAssetProcessingStats(ctx, &profile, 0)
+	if err != nil {
+		t.Fatalf("RefreshAssetProcessingStats(unpublished canonical state) error = %v", err)
+	}
+	assertAssetProcessingStat(t, unpublished, AssetProcessingStageEmbeddings, AssetProcessingStatusPending, 1, 1)
+	assertAssetProcessingStat(t, unpublished, AssetProcessingStageSearchIndex, AssetProcessingStatusReady, 0, 0)
+	assertAssetProcessingScopedStat(t, unpublished, "1111111111111111", AssetProcessingStageSearchable, AssetProcessingStatusReady, 1, 1)
+}
+
 func TestRefreshAssetProcessingStatsDoesNotReuseSemanticCountsAcrossProfiles(t *testing.T) {
 	t.Parallel()
 
@@ -147,6 +289,7 @@ func TestRefreshAssetProcessingStatsDoesNotReuseSemanticCountsAcrossProfiles(t *
 
 	insertAssetProcessingStatsTestAsset(t, service, "asset-profile-switch", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ready")
 	insertAssetProcessingStatsTestRendition(t, service, "asset-profile-switch")
+	prepareAssetProcessingStatsCanonicalInputs(t, service)
 	insertAssetProcessingStatsTestFailedVector(t, service, "asset-profile-switch", oldProfile)
 
 	oldSnapshot, err := service.RefreshAssetProcessingStats(ctx, &oldProfile, 0)
@@ -210,23 +353,9 @@ func TestRefreshAssetProcessingStatsKeepsFailedEmbeddingsOutOfPending(t *testing
 		insertAssetProcessingStatsTestAsset(t, service, asset.id, asset.sha1, "ready")
 		insertAssetProcessingStatsTestRendition(t, service, asset.id)
 	}
+	prepareAssetProcessingStatsCanonicalInputs(t, service)
 	insertAssetProcessingStatsTestVector(t, service, "asset-ready", profile, false)
-	now := formatCatalogTime(time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC))
-	insertSemanticVectorForTest(t,
-		service.catalog,
-		ctx,
-		"1111111111111111",
-		"asset-failed",
-		profile.ModelID,
-		profile.VectorSpaceID,
-		profile.EmbeddingDim,
-		[]float32{0, 1, 0, 0},
-		"test",
-		"failed",
-		"embedding failed",
-		now,
-		nil,
-	)
+	insertAssetProcessingStatsTestFailedVector(t, service, "asset-failed", profile)
 
 	snapshot, err := service.RefreshAssetProcessingStats(ctx, &profile, 0)
 	if err != nil {
@@ -267,15 +396,84 @@ func TestRefreshAssetProcessingStatsScopesFailedEmbeddingsToCurrentEligibleCorpu
 		insertAssetProcessingStatsTestAsset(t, service, asset.id, asset.sha1, "ready")
 		insertAssetProcessingStatsTestRendition(t, service, asset.id)
 	}
-	insertAssetProcessingStatsTestVector(t, service, "asset-ready", profile, false)
-	insertAssetProcessingStatsTestFailedVector(t, service, "asset-failed", profile)
-	insertAssetProcessingStatsTestFailedVector(t, service, "asset-old-model-failed", oldProfile)
-	insertAssetProcessingStatsTestFailedVector(t, service, "asset-out-of-scope-failed", profile)
 	if _, err := service.catalog.db.ExecContext(ctx, `UPDATE catalog_assets
 		SET visibility_status = 'missing'
 		WHERE source_key = ? AND upstream_asset_id = ?`,
 		"1111111111111111", "asset-out-of-scope-failed"); err != nil {
 		t.Fatalf("mark failed asset out of scope: %v", err)
+	}
+	if _, err := service.catalog.db.ExecContext(ctx, `UPDATE local_renditions
+		SET source_sha1_hex = (
+			SELECT local_asset.sha1_hex
+			FROM local_assets local_asset
+			WHERE local_asset.source_key = local_renditions.source_key
+				AND local_asset.asset_id = local_renditions.asset_id
+		)
+		WHERE source_key = ?`, "1111111111111111"); err != nil {
+		t.Fatalf("make Local renditions canonical-semantic eligible: %v", err)
+	}
+	if _, err := service.catalog.RebuildCatalogCanonicalAssets(ctx); err != nil {
+		t.Fatalf("RebuildCatalogCanonicalAssets() error = %v", err)
+	}
+	canonicalAssetID := func(assetID string) string {
+		t.Helper()
+		var canonicalAssetID string
+		if err := service.catalog.db.QueryRowContext(ctx, `SELECT canonical_asset_id
+			FROM catalog_assets WHERE source_key = ? AND upstream_asset_id = ?`,
+			"1111111111111111", assetID).Scan(&canonicalAssetID); err != nil {
+			t.Fatalf("read canonical asset ID for %q: %v", assetID, err)
+		}
+		return canonicalAssetID
+	}
+	now := formatCatalogTime(time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC))
+	insertCanonicalSemanticVectorForTest(
+		t,
+		service.catalog,
+		ctx,
+		canonicalAssetID("asset-ready"),
+		"1111111111111111",
+		"asset-ready",
+		profile.ModelID,
+		profile.VectorSpaceID,
+		profile.EmbeddingDim,
+		[]float32{1, 0, 0, 0},
+		"local_preview",
+		now,
+	)
+	insertFailedVector := func(assetID string, failedProfile SemanticModelProfileStatus) {
+		t.Helper()
+		insertSemanticVectorForTest(
+			t,
+			service.catalog,
+			ctx,
+			canonicalSemanticCorpusSourceKey,
+			canonicalAssetID(assetID),
+			failedProfile.ModelID,
+			failedProfile.VectorSpaceID,
+			failedProfile.EmbeddingDim,
+			[]float32{0, 1, 0, 0},
+			"local_preview",
+			"failed",
+			"embedding failed",
+			now,
+			nil,
+		)
+	}
+	insertFailedVector("asset-failed", profile)
+	insertFailedVector("asset-old-model-failed", oldProfile)
+	insertFailedVector("asset-out-of-scope-failed", profile)
+	if _, err := service.catalog.db.ExecContext(ctx, `INSERT INTO semantic_state (
+			source_key, model_id, vector_space_id, status, embedding_dim,
+			completed_vector_count, indexed_vector_count, asset_generation, indexed_generation,
+			built_at, last_error, updated_at
+		) VALUES (?, ?, ?, 'backfilling', ?, 1, 0, 0, -1, NULL, NULL, ?)`,
+		canonicalSemanticCorpusSourceKey,
+		profile.ModelID,
+		profile.VectorSpaceID,
+		profile.EmbeddingDim,
+		now,
+	); err != nil {
+		t.Fatalf("insert canonical semantic state: %v", err)
 	}
 
 	snapshot, err := service.RefreshAssetProcessingStats(ctx, &profile, 0)
@@ -285,6 +483,8 @@ func TestRefreshAssetProcessingStatsScopesFailedEmbeddingsToCurrentEligibleCorpu
 	assertAssetProcessingStat(t, snapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusReady, 1, 4)
 	assertAssetProcessingStat(t, snapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusPending, 2, 4)
 	assertAssetProcessingStat(t, snapshot, AssetProcessingStageEmbeddings, AssetProcessingStatusFailed, 1, 4)
+	// Issues includes the missing source asset plus the active current-profile canonical failure.
+	assertAssetProcessingScopedStat(t, snapshot, "1111111111111111", AssetProcessingStageIssues, AssetProcessingStatusReady, 2, 5)
 
 	status, err := service.SemanticModelBackfillStatus(ctx, profile)
 	if err != nil {
@@ -445,7 +645,41 @@ func insertAssetProcessingStatsTestRendition(t *testing.T, service *Service, ass
 	}
 }
 
-func insertAssetProcessingStatsTestVector(t *testing.T, service *Service, assetID string, profile SemanticModelProfileStatus, indexed bool) {
+func prepareAssetProcessingStatsCanonicalInputs(t *testing.T, service *Service) {
+	t.Helper()
+
+	ctx := context.Background()
+	if _, err := service.catalog.db.ExecContext(ctx, `UPDATE local_renditions
+		SET source_sha1_hex = (
+			SELECT local_asset.sha1_hex
+			FROM local_assets local_asset
+			WHERE local_asset.source_key = local_renditions.source_key
+				AND local_asset.asset_id = local_renditions.asset_id
+		)
+		WHERE source_key = ?`, "1111111111111111"); err != nil {
+		t.Fatalf("make Local renditions canonical-semantic eligible: %v", err)
+	}
+	if _, err := service.catalog.RebuildCatalogCanonicalAssets(ctx); err != nil {
+		t.Fatalf("RebuildCatalogCanonicalAssets() error = %v", err)
+	}
+	if _, err := service.catalog.db.ExecContext(ctx, `UPDATE canonical_semantic_vector_inputs SET refresh_required = 0`); err != nil {
+		t.Fatalf("keep unchanged canonical test inputs current: %v", err)
+	}
+}
+
+func assetProcessingStatsTestCanonicalAssetID(t *testing.T, service *Service, assetID string) string {
+	t.Helper()
+
+	var canonicalAssetID string
+	if err := service.catalog.db.QueryRowContext(context.Background(), `SELECT canonical_asset_id
+		FROM catalog_assets WHERE source_key = ? AND upstream_asset_id = ?`,
+		"1111111111111111", assetID).Scan(&canonicalAssetID); err != nil {
+		t.Fatalf("read canonical asset ID for %q: %v", assetID, err)
+	}
+	return canonicalAssetID
+}
+
+func insertAssetProcessingStatsTestLegacyVector(t *testing.T, service *Service, assetID string, profile SemanticModelProfileStatus, indexed bool) {
 	t.Helper()
 
 	now := formatCatalogTime(time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC))
@@ -501,6 +735,84 @@ func insertAssetProcessingStatsTestVector(t *testing.T, service *Service, assetI
 	}
 }
 
+func insertAssetProcessingStatsTestVector(t *testing.T, service *Service, assetID string, profile SemanticModelProfileStatus, indexed bool) {
+	t.Helper()
+
+	ctx := context.Background()
+	now := formatCatalogTime(time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC))
+	canonicalAssetID := assetProcessingStatsTestCanonicalAssetID(t, service, assetID)
+	insertCanonicalSemanticVectorForTest(
+		t,
+		service.catalog,
+		ctx,
+		canonicalAssetID,
+		"1111111111111111",
+		assetID,
+		profile.ModelID,
+		profile.VectorSpaceID,
+		profile.EmbeddingDim,
+		[]float32{1, 0, 0, 0},
+		"local_preview",
+		now,
+	)
+	if !indexed {
+		return
+	}
+	if _, err := service.catalog.db.ExecContext(ctx, `INSERT INTO semantic_index_membership_state (
+			source_key, model_id, vector_space_id, asset_generation,
+			binary_sha256, binary_size_bytes, node_count, built_at
+		) VALUES (?, ?, ?, 0, ?, 1, 1, ?)
+		ON CONFLICT(source_key, model_id, vector_space_id, asset_generation) DO UPDATE SET
+			node_count = node_count + 1,
+			built_at = excluded.built_at`,
+		canonicalSemanticCorpusSourceKey,
+		profile.ModelID,
+		profile.VectorSpaceID,
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		now,
+	); err != nil {
+		t.Fatalf("insert canonical semantic membership state: %v", err)
+	}
+	if _, err := service.catalog.db.ExecContext(ctx, `INSERT INTO semantic_index_membership (
+			source_key, model_id, vector_space_id, asset_generation, upstream_asset_id, ordinal
+		) VALUES (?, ?, ?, 0, ?, (
+			SELECT COUNT(*) FROM semantic_index_membership
+			WHERE source_key = ? AND model_id = ? AND vector_space_id = ? AND asset_generation = 0
+		))`,
+		canonicalSemanticCorpusSourceKey,
+		profile.ModelID,
+		profile.VectorSpaceID,
+		canonicalAssetID,
+		canonicalSemanticCorpusSourceKey,
+		profile.ModelID,
+		profile.VectorSpaceID,
+	); err != nil {
+		t.Fatalf("insert canonical semantic membership: %v", err)
+	}
+	if _, err := service.catalog.db.ExecContext(ctx, `INSERT INTO semantic_state (
+			source_key, model_id, vector_space_id, status, embedding_dim,
+			completed_vector_count, indexed_vector_count, asset_generation, indexed_generation,
+			built_at, last_error, updated_at
+		) VALUES (?, ?, ?, 'ready', ?, 1, 1, 0, 0, ?, NULL, ?)
+		ON CONFLICT(source_key, model_id) DO UPDATE SET
+			status = 'ready',
+			completed_vector_count = completed_vector_count + 1,
+			indexed_vector_count = indexed_vector_count + 1,
+			asset_generation = 0,
+			indexed_generation = 0,
+			built_at = excluded.built_at,
+			updated_at = excluded.updated_at`,
+		canonicalSemanticCorpusSourceKey,
+		profile.ModelID,
+		profile.VectorSpaceID,
+		profile.EmbeddingDim,
+		now,
+		now,
+	); err != nil {
+		t.Fatalf("mark canonical semantic snapshot published: %v", err)
+	}
+}
+
 func insertAssetProcessingStatsTestFailedVector(t *testing.T, service *Service, assetID string, profile SemanticModelProfileStatus) {
 	t.Helper()
 
@@ -508,8 +820,8 @@ func insertAssetProcessingStatsTestFailedVector(t *testing.T, service *Service, 
 	insertSemanticVectorForTest(t,
 		service.catalog,
 		context.Background(),
-		"1111111111111111",
-		assetID,
+		canonicalSemanticCorpusSourceKey,
+		assetProcessingStatsTestCanonicalAssetID(t, service, assetID),
 		profile.ModelID,
 		profile.VectorSpaceID,
 		profile.EmbeddingDim,

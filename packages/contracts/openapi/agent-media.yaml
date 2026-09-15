@@ -458,6 +458,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /v1/session/validate:
+    get:
+      operationId: validateAgentSession
+      summary: Validate an existing app access token without rotating session credentials.
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: The device-scoped access token is valid.
+        "401":
+          description: App session bearer token is missing or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/session/refresh:
     post:
       operationId: refreshAgentSession

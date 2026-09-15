@@ -4775,8 +4775,15 @@ func TestLocalMetadataAndThumbnailSystemErrorsUseIndependentRetries(t *testing.T
 		true,
 		semanticState,
 		true,
+	); ok {
+		t.Fatalf("semantic assignment before metadata retry completes = %+v, want none", assignment)
+	}
+	semanticState.MetadataQueued = 0
+	if assignment, ok := runtime.nextBackgroundWorkerAssignment(
+		context.Background(), 1, false,
+		semanticIndexingSchedule{Workers: 1, BatchSize: 1}, true, semanticState, true,
 	); !ok || assignment.phase != "embeddings" {
-		t.Fatalf("healthy semantic assignment during local retries = %+v, %t, want embeddings", assignment, ok)
+		t.Fatalf("semantic assignment after metadata drains during thumbnail retry = %+v, %t, want embeddings", assignment, ok)
 	}
 	runtime.schedulerWorkStateMu.Lock()
 	runtime.schedulerWorkState = schedulerWorkState{
@@ -5678,6 +5685,122 @@ func TestDatasourceIndexingStatusReadsDoNotScheduleExactRefresh(t *testing.T) {
 	}
 }
 
+func TestDatasourceIndexingStatusRestoresMissingCoverageFromCachedStats(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "NAS Photos",
+		Kind:      config.DatasourceKindLocalFiles,
+		RootKey:   "nas-photos",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{
+			Key:  "nas-photos",
+			Path: t.TempDir(),
+		}}
+	})
+	catalogService := runtime.catalogService()
+	if catalogService == nil {
+		t.Fatal("catalogService() = nil")
+	}
+	stats, err := catalogService.RefreshAssetProcessingStats(context.Background(), nil, 0)
+	if err != nil {
+		t.Fatalf("RefreshAssetProcessingStats() error = %v", err)
+	}
+	if stats.Empty() || !stats.HasStageForScope("1111111111111111", catalog.AssetProcessingStageFoundMedias) {
+		t.Fatalf("processing stats = %+v, want cached datasource coverage", stats)
+	}
+
+	snapshotAt := stats.RefreshedAt.Add(time.Minute)
+	response := runtime.emptyDatasourceIndexingResponse()
+	if len(response.Datasources) != 1 {
+		t.Fatalf("empty datasource response = %+v, want one datasource", response.Datasources)
+	}
+	response.Datasources[0].Status = "ready"
+	response.Datasources[0].Coverage = nil
+	if !runtime.rememberDatasourceIndexingSnapshotAt(catalogService, response, snapshotAt) {
+		t.Fatal("rememberDatasourceIndexingSnapshotAt() = false")
+	}
+	runtime.datasourceTaskMu.Lock()
+	runtime.datasourceSnapshot = nil
+	runtime.datasourceSnapshotAt = time.Time{}
+	runtime.datasourceSnapshotHash = ""
+	runtime.datasourceTaskMu.Unlock()
+
+	status, err := runtime.DatasourceIndexingStatus(context.Background())
+	if err != nil {
+		t.Fatalf("DatasourceIndexingStatus() error = %v", err)
+	}
+	if status.StatusSnapshotAt == nil || !status.StatusSnapshotAt.Equal(snapshotAt) {
+		t.Fatalf("status snapshot time = %v, want task snapshot time %v", status.StatusSnapshotAt, snapshotAt)
+	}
+	if len(status.Datasources) != 1 || status.Datasources[0].Coverage == nil {
+		t.Fatalf("status datasources = %+v, want restored cached coverage", status.Datasources)
+	}
+	coverage := status.Datasources[0].Coverage
+	for name, expectation := range map[string]struct {
+		metric DatasourceCoverageMetric
+		status string
+	}{
+		"found":      {metric: coverage.FoundMedias, status: catalog.AssetProcessingStatusReady},
+		"browsable":  {metric: coverage.BrowsableMedias, status: catalog.AssetProcessingStatusReady},
+		"searchable": {metric: coverage.SearchableMedias, status: catalog.AssetProcessingStatusUnavailable},
+		"issues":     {metric: coverage.Issues, status: catalog.AssetProcessingStatusReady},
+	} {
+		if expectation.metric.Status != expectation.status || expectation.metric.UpdatedAt == nil || !expectation.metric.UpdatedAt.Equal(stats.RefreshedAt) {
+			t.Fatalf("%s coverage = %+v, want cached %s metric at %v", name, expectation.metric, expectation.status, stats.RefreshedAt)
+		}
+	}
+
+	runtime.datasourceTaskMu.Lock()
+	cachedHasCoverage := runtime.datasourceSnapshot != nil &&
+		len(runtime.datasourceSnapshot.Datasources) == 1 &&
+		runtime.datasourceSnapshot.Datasources[0].Coverage != nil
+	busy := runtime.datasourceSnapshotBusy
+	started := runtime.datasourceSnapshotStarted
+	finished := runtime.datasourceSnapshotFinished
+	runtime.datasourceTaskMu.Unlock()
+	if !cachedHasCoverage {
+		t.Fatal("in-memory snapshot is missing repaired coverage for later reads and transitions")
+	}
+	if busy || !started.IsZero() || !finished.IsZero() {
+		t.Fatalf("coverage repair changed exact refresh state: busy=%t started=%v finished=%v", busy, started, finished)
+	}
+}
+
+func TestMissingDatasourceCoverageRepairPreservesExplicitSnapshotCoverage(t *testing.T) {
+	t.Parallel()
+
+	refreshedAt := time.Date(2026, 9, 5, 9, 0, 0, 0, time.UTC)
+	datasources := []DatasourceIndexingStatus{{
+		SourceKey:       "1111111111111111",
+		IndexingEnabled: true,
+		Coverage: &DatasourceCoverage{
+			FoundMedias: DatasourceCoverageMetric{
+				Status: catalog.AssetProcessingStatusReady,
+				Count:  42,
+			},
+		},
+	}}
+	got, restored := applyMissingDatasourceCoverageStats(datasources, catalog.AssetProcessingStatsSnapshot{
+		RefreshedAt: refreshedAt,
+		Stats: []catalog.AssetProcessingStat{{
+			ScopeKey:    "1111111111111111",
+			Stage:       catalog.AssetProcessingStageFoundMedias,
+			Status:      catalog.AssetProcessingStatusReady,
+			Count:       7,
+			TotalCount:  7,
+			RefreshedAt: refreshedAt,
+		}},
+	})
+	if restored {
+		t.Fatal("applyMissingDatasourceCoverageStats() restored = true, want explicit snapshot coverage preserved")
+	}
+	if len(got) != 1 || got[0].Coverage == nil || got[0].Coverage.FoundMedias.Count != 42 {
+		t.Fatalf("datasources = %+v, want explicit snapshot coverage count 42", got)
+	}
+}
+
 func TestDatasourceIndexingStatusReturnsIndependentDatasourceSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -5720,6 +5843,71 @@ func TestDatasourceIndexingStatusReturnsIndependentDatasourceSnapshot(t *testing
 	}
 	if len(current.Datasources) != 1 || current.Datasources[0].Status != "ready" || current.Datasources[0].ActiveAssets != 1 {
 		t.Fatalf("current datasources = %+v, want completed mirror snapshot", current.Datasources)
+	}
+}
+
+func TestRemoteDatasourceSyncSnapshotPreservesHeavyTaskBacklog(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey:   "1111111111111111",
+		Name:        "Home Immich",
+		Kind:        config.DatasourceKindImmichIndexed,
+		URL:         "http://immich.local:2283",
+		AccessToken: "immich-api-key",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.WorkerRuntime.HeavyTaskWorkers = runtimeTestIntPtr(0)
+	})
+	runtime.rememberDatasourceIndexingSnapshot(nil, DatasourceIndexingResponse{
+		Tasks: []DatasourceTaskStatus{
+			{Phase: "phase0", Label: "Media discovery", Status: "idle"},
+			{Phase: "metadata", Label: "Metadata", QueuedTasks: 248814, TotalTasks: 300000, Status: "queued"},
+			{Phase: "thumbnails", Label: "Thumbnails", QueuedTasks: 43073, TotalTasks: 102304, Status: "queued"},
+			{Phase: "embeddings", Label: "Embeddings", QueuedTasks: 182513, TotalTasks: 232190, Status: "queued"},
+			{Phase: "search_index", Label: "Search index", QueuedTasks: 5280, TotalTasks: 49677, Status: "queued"},
+		},
+		Datasources: []DatasourceIndexingStatus{{
+			SourceKey:       "1111111111111111",
+			Name:            "Home Immich",
+			IngestionKind:   datasourceIngestionRemoteAPI,
+			IndexingEnabled: true,
+			Status:          "idle",
+		}},
+	})
+
+	completedAt := time.Date(2026, 9, 5, 12, 5, 13, 0, time.UTC)
+	runtime.rememberRemoteDatasourceSyncSnapshot(nil, "1111111111111111", catalog.MirrorSyncResult{
+		Mode:        catalog.MirrorSyncModeIncremental,
+		Status:      "completed",
+		CompletedAt: completedAt,
+		Mirror: catalog.MirrorStatus{
+			Enabled:               true,
+			Status:                "ready",
+			ActiveCount:           300000,
+			LastIncrementalSyncAt: &completedAt,
+		},
+	})
+
+	snapshot, ok := runtime.datasourceIndexingSnapshot(context.Background(), nil)
+	if !ok {
+		t.Fatal("datasourceIndexingSnapshot() ok = false, want true")
+	}
+	byPhase := map[string]DatasourceTaskStatus{}
+	for _, task := range snapshot.Tasks {
+		byPhase[task.Phase] = task
+	}
+	for phase, want := range map[string]int{
+		"metadata":     248814,
+		"thumbnails":   43073,
+		"embeddings":   182513,
+		"search_index": 5280,
+	} {
+		if got := byPhase[phase]; got.QueuedTasks != want || got.Status != "paused" {
+			t.Fatalf("%s task = %+v, want preserved queue %d in paused state", phase, got, want)
+		}
+	}
+	if got := byPhase["phase0"]; got.LastCompletedAt == nil || !got.LastCompletedAt.Equal(completedAt) {
+		t.Fatalf("media discovery task = %+v, want mirror completion %v", got, completedAt)
 	}
 }
 
@@ -5786,6 +5974,33 @@ func TestDatasourceIndexingReconciliationWaitsForDrainedSchedulerWork(t *testing
 	runtime.schedulerWorkStateMu.Unlock()
 	if !runtime.datasourceIndexingReconciliationReady() {
 		t.Fatal("datasourceIndexingReconciliationReady() = false after background work drained")
+	}
+}
+
+func TestDatasourceIndexingReconciliationAllowsQueuedWorkWhilePaused(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "NAS Photos",
+		Kind:      config.DatasourceKindLocalFiles,
+		RootKey:   "nas-photos",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{Key: "nas-photos", Path: t.TempDir()}}
+		cfg.WorkerRuntime.HeavyTaskWorkers = runtimeTestIntPtr(0)
+	})
+	schedule, semanticScheduled := runtime.semanticIndexingSchedule()
+	runtime.schedulerWorkStateMu.Lock()
+	runtime.schedulerWorkState = schedulerWorkState{
+		ConfigHash:      runtime.schedulerWorkStateConfigHash(semanticSingleWorkerSchedule(schedule), semanticScheduled),
+		UpdatedAt:       time.Now().UTC(),
+		MetadataQueued:  248814,
+		ThumbnailQueued: 43073,
+	}
+	runtime.schedulerWorkStateMu.Unlock()
+
+	if !runtime.datasourceIndexingReconciliationReady() {
+		t.Fatal("datasourceIndexingReconciliationReady() = false with paused workers, want queued read model recount allowed")
 	}
 }
 
@@ -6369,6 +6584,36 @@ func TestDatasourceTaskStatusesKeepFailureUnitsOutOfProgressTotals(t *testing.T)
 	}
 }
 
+func TestDatasourceSemanticTaskCountsFromAssetStatsDoNotRetainLegacyIndexFailures(t *testing.T) {
+	t.Parallel()
+
+	stats := catalog.AssetProcessingStatsSnapshot{
+		RefreshedAt: time.Now().UTC(),
+		Stats: []catalog.AssetProcessingStat{
+			{Stage: catalog.AssetProcessingStageEmbeddings, Status: catalog.AssetProcessingStatusPending, Count: 1, TotalCount: 1},
+			{Stage: catalog.AssetProcessingStageEmbeddings, Status: catalog.AssetProcessingStatusReady, Count: 0, TotalCount: 1},
+			{Stage: catalog.AssetProcessingStageSearchIndex, Status: catalog.AssetProcessingStatusPending, Count: 0, TotalCount: 0},
+			{Stage: catalog.AssetProcessingStageSearchIndex, Status: catalog.AssetProcessingStatusReady, Count: 0, TotalCount: 0},
+			{Stage: catalog.AssetProcessingStageSearchIndex, Status: catalog.AssetProcessingStatusFailed, Count: 0, TotalCount: 0},
+		},
+	}
+	legacy := datasourceSemanticTaskCountSummary{
+		known:           true,
+		eligible:        2,
+		completed:       2,
+		indexed:         2,
+		failedIndexJobs: 1,
+	}
+
+	summary, ok := datasourceSemanticTaskCountsFromAssetStats(stats, legacy)
+	if !ok {
+		t.Fatal("datasourceSemanticTaskCountsFromAssetStats() ok = false, want canonical stats")
+	}
+	if summary.eligible != 1 || summary.completed != 0 || summary.indexed != 0 || summary.unindexed != 0 || summary.failedIndexJobs != 0 {
+		t.Fatalf("semantic summary = %+v, want canonical progress 1/0/0 without retained legacy failures", summary)
+	}
+}
+
 func TestNormalizeDatasourceIndexingSnapshotPrefersSearchIndexWait(t *testing.T) {
 	t.Parallel()
 
@@ -6738,6 +6983,120 @@ func TestDatasourceTaskStatsSnapshotUpdatesTasksWithoutLiveStatus(t *testing.T) 
 	}
 }
 
+func TestLegacyDatasourceTaskReadModelRestoresBacklogFromCachedStats(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "NAS Photos",
+		Kind:      config.DatasourceKindLocalFiles,
+		RootKey:   "nas-photos",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{Key: "nas-photos", Path: t.TempDir()}}
+		cfg.WorkerRuntime.HeavyTaskWorkers = runtimeTestIntPtr(0)
+	})
+	refreshedAt := time.Date(2026, 9, 5, 11, 0, 0, 0, time.UTC)
+	legacy := DatasourceIndexingResponse{
+		Tasks: []DatasourceTaskStatus{
+			{Phase: "metadata", Label: "Metadata", Status: "idle"},
+			{Phase: "thumbnails", Label: "Thumbnails", Status: "idle"},
+		},
+		Datasources: []DatasourceIndexingStatus{{
+			SourceKey:       "1111111111111111",
+			Name:            "NAS Photos",
+			IngestionKind:   datasourceIngestionFilesystem,
+			IndexingEnabled: true,
+			Status:          "ready",
+		}},
+	}
+	restored := runtime.applyDatasourceTaskStats(context.Background(), legacy, catalog.AssetProcessingStatsSnapshot{
+		RefreshedAt: refreshedAt,
+		Stats: []catalog.AssetProcessingStat{
+			{Stage: catalog.AssetProcessingStageMetadata, Status: catalog.AssetProcessingStatusPending, Count: 248814, TotalCount: 300001},
+			{Stage: catalog.AssetProcessingStageMetadata, Status: catalog.AssetProcessingStatusRunning, Count: 1, TotalCount: 300001},
+			{Stage: catalog.AssetProcessingStageMetadata, Status: catalog.AssetProcessingStatusReady, Count: 51186, TotalCount: 300001},
+			{Stage: catalog.AssetProcessingStageThumbnails, Status: catalog.AssetProcessingStatusPending, Count: 43073, TotalCount: 102306},
+			{Stage: catalog.AssetProcessingStageThumbnails, Status: catalog.AssetProcessingStatusRunning, Count: 2, TotalCount: 102306},
+			{Stage: catalog.AssetProcessingStageThumbnails, Status: catalog.AssetProcessingStatusReady, Count: 59231, TotalCount: 102306},
+		},
+	})
+
+	byPhase := map[string]DatasourceTaskStatus{}
+	for _, task := range restored.Tasks {
+		byPhase[task.Phase] = task
+	}
+	if got := byPhase["metadata"]; got.ActiveTasks != 0 || got.QueuedTasks != 248815 || got.CompletedTasks != 51186 || got.Status != "paused" {
+		t.Fatalf("metadata task = %+v, want cached paused backlog restored", got)
+	}
+	if got := byPhase["thumbnails"]; got.ActiveTasks != 0 || got.QueuedTasks != 43075 || got.CompletedTasks != 59231 || got.Status != "paused" {
+		t.Fatalf("thumbnail task = %+v, want cached paused backlog restored", got)
+	}
+}
+
+func TestCachedDatasourceTaskStatsUseOnlyCurrentProcessActivity(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, nil, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.WorkerRuntime.HeavyTaskWorkers = runtimeTestIntPtr(0)
+	})
+	runtime.setDatasourceTaskActive("metadata", 1)
+	t.Cleanup(func() { runtime.setDatasourceTaskActive("metadata", 0) })
+	response := runtime.applyDatasourceTaskStats(context.Background(), DatasourceIndexingResponse{
+		Datasources: []DatasourceIndexingStatus{{
+			SourceKey:       "1111111111111111",
+			Name:            "NAS Photos",
+			IngestionKind:   datasourceIngestionFilesystem,
+			IndexingEnabled: true,
+			Status:          "ready",
+		}},
+	}, catalog.AssetProcessingStatsSnapshot{
+		RefreshedAt: time.Date(2026, 9, 5, 11, 0, 0, 0, time.UTC),
+		Stats: []catalog.AssetProcessingStat{
+			{Stage: catalog.AssetProcessingStageMetadata, Status: catalog.AssetProcessingStatusPending, Count: 2, TotalCount: 6},
+			{Stage: catalog.AssetProcessingStageMetadata, Status: catalog.AssetProcessingStatusRunning, Count: 4, TotalCount: 6},
+		},
+	})
+
+	byPhase := map[string]DatasourceTaskStatus{}
+	for _, task := range response.Tasks {
+		byPhase[task.Phase] = task
+	}
+	if got := byPhase["metadata"]; got.ActiveTasks != 1 || got.QueuedTasks != 5 || got.TotalTasks != 6 || got.Status != "running" {
+		t.Fatalf("metadata task = %+v, want one current worker and five pending items", got)
+	}
+}
+
+func TestDatasourceIndexingSnapshotPersistsCurrentVersion(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "NAS Photos",
+		Kind:      config.DatasourceKindLocalFiles,
+		RootKey:   "nas-photos",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{Key: "nas-photos", Path: t.TempDir()}}
+	})
+	catalogService := runtime.catalogService()
+	if catalogService == nil {
+		t.Fatal("catalogService() = nil")
+	}
+	if !runtime.rememberDatasourceIndexingSnapshot(catalogService, runtime.emptyDatasourceIndexingResponse()) {
+		t.Fatal("rememberDatasourceIndexingSnapshot() = false")
+	}
+	stored, ok, err := catalogService.AdminStatusSnapshot(context.Background(), datasourceIndexingStatusSnapshotKey)
+	if err != nil || !ok {
+		t.Fatalf("AdminStatusSnapshot() = ok:%v err:%v, want persisted snapshot", ok, err)
+	}
+	var payload datasourceIndexingSnapshotPayload
+	if err := json.Unmarshal(stored.Payload, &payload); err != nil {
+		t.Fatalf("json.Unmarshal(snapshot) error = %v", err)
+	}
+	if payload.Version != datasourceIndexingSnapshotVersion {
+		t.Fatalf("snapshot version = %d, want %d", payload.Version, datasourceIndexingSnapshotVersion)
+	}
+}
+
 func TestDatasourceTaskStatsSnapshotRejectsDifferentSemanticProfile(t *testing.T) {
 	t.Parallel()
 
@@ -7015,6 +7374,18 @@ func TestSemanticProgressUpdatesDatasourceIndexingSnapshot(t *testing.T) {
 	runtime := newTestAgentRuntimeWithAdminToken(t, BuildInfo{}, nil, "test-admin-token")
 	runtime.rememberDatasourceIndexingSnapshot(nil, DatasourceIndexingResponse{
 		Tasks: []DatasourceTaskStatus{{
+			Phase:       "metadata",
+			Label:       "Metadata",
+			QueuedTasks: 248814,
+			TotalTasks:  300000,
+			Status:      "queued",
+		}, {
+			Phase:       "thumbnails",
+			Label:       "Thumbnails",
+			QueuedTasks: 43073,
+			TotalTasks:  102304,
+			Status:      "queued",
+		}, {
 			Phase:          "embeddings",
 			Label:          "Embeddings",
 			QueuedTasks:    80,
@@ -7069,6 +7440,12 @@ func TestSemanticProgressUpdatesDatasourceIndexingSnapshot(t *testing.T) {
 	}
 	if got := byPhase["search_index"]; got.QueuedTasks != 10 || got.CompletedTasks != 50 || got.TotalTasks != 60 || got.Status != "queued" {
 		t.Fatalf("search index task = %+v, want updated semantic progress", got)
+	}
+	if got := byPhase["metadata"]; got.QueuedTasks != 248814 || got.TotalTasks != 300000 {
+		t.Fatalf("metadata task = %+v, want unrelated backlog preserved", got)
+	}
+	if got := byPhase["thumbnails"]; got.QueuedTasks != 43073 || got.TotalTasks != 102304 {
+		t.Fatalf("thumbnail task = %+v, want unrelated backlog preserved", got)
 	}
 	if len(snapshot.Datasources) != 1 ||
 		snapshot.Datasources[0].EmbeddingCompleted != 60 ||
@@ -7862,7 +8239,8 @@ func TestDatasourceTaskStatusesIgnoreStaleLocalRunningCounts(t *testing.T) {
 	if got := byPhase["phase0"]; got.ActiveTasks != 0 || got.Status != "idle" {
 		t.Fatalf("phase0 task = %+v, want stale DB running scan ignored", got)
 	}
-	if got := byPhase["metadata"]; got.ActiveTasks != 0 || got.Status != "queued" || got.QueuedTasks != 4 {
+	if got := byPhase["metadata"]; got.ActiveTasks != 0 || got.Status != "queued" || got.QueuedTasks != 4 ||
+		!strings.Contains(got.Note, "videos with missing duration") {
 		t.Fatalf("metadata task = %+v, want queued work without stale DB running job", got)
 	}
 	if got := byPhase["thumbnails"]; got.ActiveTasks != 0 || got.Status != "queued" || got.QueuedTasks != 5 {
@@ -7986,6 +8364,70 @@ func TestDatasourceDiscoveryTaskSnapshotRecordsQuickAndReconciliationCompletion(
 	if phase0.LastQuickScanAt == nil || !phase0.LastQuickScanAt.Equal(quickCompletedAt) ||
 		phase0.LastReconciliationAt == nil || !phase0.LastReconciliationAt.Equal(reconciliationCompletedAt) {
 		t.Fatalf("media discovery scan mode timestamps = %+v, want quick=%v reconciliation=%v", phase0, quickCompletedAt, reconciliationCompletedAt)
+	}
+}
+
+func TestDatasourceDiscoveryTaskSnapshotPreservesHeavyTaskBacklog(t *testing.T) {
+	t.Parallel()
+
+	runtime := newTestAgentRuntimeWithConfig(t, BuildInfo{}, []config.DatasourceConfig{{
+		SourceKey: "1111111111111111",
+		Name:      "NAS Photos",
+		Kind:      config.DatasourceKindLocalFiles,
+		RootKey:   "nas-photos",
+	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
+		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{Key: "nas-photos", Path: t.TempDir()}}
+		cfg.WorkerRuntime.HeavyTaskWorkers = runtimeTestIntPtr(0)
+	})
+	runtime.rememberDatasourceIndexingSnapshot(nil, DatasourceIndexingResponse{
+		Tasks: []DatasourceTaskStatus{
+			{Phase: "phase0", Label: "Media discovery", Status: "idle"},
+			{Phase: "metadata", Label: "Metadata", QueuedTasks: 248814, SettlingTasks: 7, TotalTasks: 300000, Status: "queued"},
+			{Phase: "thumbnails", Label: "Thumbnails", QueuedTasks: 43073, TotalTasks: 102304, Status: "queued"},
+			{Phase: "embeddings", Label: "Embeddings", QueuedTasks: 182513, TotalTasks: 232190, Status: "queued"},
+			{Phase: "search_index", Label: "Search index", QueuedTasks: 5280, TotalTasks: 49677, Status: "queued"},
+		},
+		Datasources: []DatasourceIndexingStatus{{
+			SourceKey:       "1111111111111111",
+			Name:            "NAS Photos",
+			IngestionKind:   datasourceIngestionFilesystem,
+			IndexingEnabled: true,
+			Status:          "ready",
+		}},
+	})
+
+	completedAt := time.Date(2026, 9, 5, 11, 50, 16, 0, time.UTC)
+	runtime.rememberDatasourceDiscoveryTaskSnapshot(nil, false, &completedAt, catalog.LocalPhase0ScanResult{
+		SourceKey:      "1111111111111111",
+		ScanMode:       datasourceLocalScanModeQuick,
+		Status:         "completed",
+		QueuedMetadata: 3,
+		CompletedAt:    completedAt,
+	})
+
+	snapshot, ok := runtime.datasourceIndexingSnapshot(context.Background(), nil)
+	if !ok {
+		t.Fatal("datasourceIndexingSnapshot() ok = false, want true")
+	}
+	byPhase := map[string]DatasourceTaskStatus{}
+	for _, task := range snapshot.Tasks {
+		byPhase[task.Phase] = task
+	}
+	for phase, want := range map[string]int{
+		"metadata":     248814,
+		"thumbnails":   43073,
+		"embeddings":   182513,
+		"search_index": 5280,
+	} {
+		if got := byPhase[phase]; got.QueuedTasks != want || got.Status != "paused" {
+			t.Fatalf("%s task = %+v, want preserved queue %d in paused state", phase, got, want)
+		}
+	}
+	if got := byPhase["metadata"]; got.SettlingTasks != 10 {
+		t.Fatalf("metadata task = %+v, want existing settling 7 plus newly queued 3", got)
+	}
+	if got := byPhase["phase0"]; got.LastQuickScanAt == nil || !got.LastQuickScanAt.Equal(completedAt) {
+		t.Fatalf("media discovery task = %+v, want quick discovery completion %v", got, completedAt)
 	}
 }
 
@@ -8608,6 +9050,10 @@ func TestSemanticIndexingPrefersRuntimeReadyInstalledCandidate(t *testing.T) {
 		t.Fatal("runScheduledSemanticIndexPublish() published = false, want candidate index publish")
 	}
 
+	// Admin reads a cached snapshot; run the background reconciliation explicitly.
+	if _, err := runtime.refreshDatasourceIndexingSnapshot(ctx, runtime.catalogService()); err != nil {
+		t.Fatalf("refreshDatasourceIndexingSnapshot() error = %v", err)
+	}
 	indexing, err := runtime.DatasourceIndexingStatus(ctx)
 	if err != nil {
 		t.Fatalf("DatasourceIndexingStatus() error = %v", err)
@@ -8883,7 +9329,7 @@ func TestSemanticIndexingZeroQueuesReadyVectorsAndAllowsReadyUninstallAfterPubli
 	}
 }
 
-func TestSemanticIndexingIndexesLocalDatasourceImages(t *testing.T) {
+func TestSemanticIndexingIndexesLocalImagesAndVideoPosters(t *testing.T) {
 	ctx := context.Background()
 	semanticHelperPath := writeRuntimeCandidateSelectionHelper(t)
 	rootPath := t.TempDir()
@@ -8936,12 +9382,12 @@ func TestSemanticIndexingIndexesLocalDatasourceImages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunSemanticIndexing() error = %v", err)
 	}
-	if result.ProcessedVectorCount != 1 ||
-		result.Status.EligibleAssetCount != 1 ||
-		result.Status.CompletedVectorCount != 1 ||
+	if result.ProcessedVectorCount != 2 ||
+		result.Status.EligibleAssetCount != 2 ||
+		result.Status.CompletedVectorCount != 2 ||
 		result.Status.IndexedVectorCount != 0 ||
 		result.Status.Status != catalog.SemanticBackfillStatusIndexing {
-		t.Fatalf("local semantic indexing result = %#v, want one completed image vector awaiting index publish", result)
+		t.Fatalf("local semantic indexing result = %#v, want image and video-poster vectors awaiting index publish", result)
 	}
 	if published := runtime.runScheduledSemanticIndexPublish(ctx, semanticIndexingSchedule{Workers: 1}); !published {
 		t.Fatal("runScheduledSemanticIndexPublish() published = false, want local image index")
@@ -8960,8 +9406,15 @@ func TestSemanticIndexingIndexesLocalDatasourceImages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchAssets(semantic local) error = %v", err)
 	}
-	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].Filename != "local-family.jpg" {
-		t.Fatalf("semantic local page = %#v, want local image result only", page)
+	if page.Total != 2 || len(page.Items) != 2 {
+		t.Fatalf("semantic local page = %#v, want image and video-poster results", page)
+	}
+	wantMedia := map[string]string{"local-family.jpg": "image", "local-clip.mov": "video"}
+	for _, item := range page.Items {
+		if wantType, ok := wantMedia[item.Filename]; !ok || item.Type != wantType {
+			t.Fatalf("semantic local result = %+v, want each image/video identity once", item)
+		}
+		delete(wantMedia, item.Filename)
 	}
 }
 
@@ -9291,7 +9744,7 @@ func installStoredRuntimeSemanticPackForTest(t *testing.T, runtime *AgentRuntime
 
 func assetProcessingSemanticVariantForRuntimeTest(modelID string, vectorSpaceID string) string {
 	identity, _ := json.Marshal([2]string{modelID, vectorSpaceID})
-	return "semantic-profile-v1:" + string(identity)
+	return "semantic-profile-v2-local-input:" + string(identity)
 }
 
 func semanticRuntimePackArtifactForRuntimeTest(t *testing.T) []byte {

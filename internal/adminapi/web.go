@@ -1319,6 +1319,7 @@ const dashboardHTML = `<!doctype html>
         return 'paused';
       }
       if (task?.waitingReason === 'search_index') return 'synchronizing';
+      if (['media_discovery', 'local_metadata'].includes(task?.waitingReason)) return 'waiting';
       if (rawStatus === 'running') return 'running';
       if (task?.waitingReason === 'worker') return 'queued';
       if (task?.waitingReason === 'queued_target') {
@@ -1400,6 +1401,8 @@ const dashboardHTML = `<!doctype html>
       if (progress) {
         parts.push('done: ' + progress);
       }
+      const ingestionWait = {media_discovery: 'media discovery', local_metadata: 'Local metadata'}[task?.waitingReason];
+      if (ingestionWait) parts.push('waiting for ' + ingestionWait);
       if (task?.waitingReason === 'queued_target') {
         const target = Number(task?.waitingQueuedTarget || 0);
         parts.push(target > 0 ? 'waiting ' + formatCount(target) + ' queued items' : 'waiting queued items');
@@ -1480,9 +1483,8 @@ const dashboardHTML = `<!doctype html>
         return '<button type="button" data-datasource-task-action="media-discovery"' + disabled + '>Run reconciliation now</button>' + failureLink;
       }
       if (phase === 'metadata') {
-        const failed = Number(task.failedTasks || 0);
-        const disabled = options.hasLocalDatasource && failed > 0 && !datasourceTaskActionPendingForPhase(phase) ? '' : ' disabled';
-        return '<button type="button" data-datasource-task-action="requeue-metadata"' + disabled + '>Requeue failed</button>' + failureLink;
+        const disabled = options.hasLocalDatasource && !datasourceTaskActionPendingForPhase(phase) ? '' : ' disabled';
+        return '<button type="button" data-datasource-task-action="requeue-metadata"' + disabled + '>Repair metadata</button>' + failureLink;
       }
       if (phase === 'thumbnails') {
         const failed = Number(task.failedTasks || 0);
@@ -1687,7 +1689,7 @@ const dashboardHTML = `<!doctype html>
     const datasourceTaskNotes = {
       phase0: 'Quick discovery finds likely filesystem changes with low NAS load. Reconciliation inspects every supported path once daily at 04:00 in the Agent timezone and repairs additions, changes, and removals.',
       content_verification: 'At the configured daily time, re-hashes the least recently verified media with an idle heavy-task worker. If no worker is idle, that day is skipped. The default duration is 30 minutes; a duration of 0 disables this task.',
-      metadata: 'Registers media information in the media database. Recently added or changed files remain settling before metadata processing (2 minutes by default). Requeue failed moves failed metadata jobs back to the queue at repair priority. Processing starts after settling when a worker is available, and jobs that fail again return to failed.',
+      metadata: 'Registers media information in the media database. Recently added or changed files remain settling before metadata processing (2 minutes by default). Metadata repair moves failed jobs and videos with missing duration back to the queue at repair priority. It also checks embedded capture dates for existing media that has not been checked yet, preserving existing thumbnails and search data. Processing starts after settling when a worker is available, and jobs that fail again return to failed.',
       thumbnails: 'Generates thumbnails so media can be previewed quickly. Requeue failed moves failed thumbnails back to the queue at repair priority. Processing starts when a worker is available, and items that fail again return to failed.',
       embeddings: 'Analyzes media features for visual search. Failed media remains browsable but is excluded from semantic search. Automatic retry becomes eligible after 30 minutes; first-attempt work within the same datasource stays ahead of retries. Download failure details to inspect the asset and error, or request an immediate retry after repairing the source media.',
       search_index: 'Updates the search index so media can be searched. Publishing can take several hours for a large library. An existing published index remains searchable while publishing runs. Failed publish jobs are retried automatically on the next eligible run.'
@@ -3101,7 +3103,10 @@ const dashboardHTML = `<!doctype html>
           await api('/v1/datasources/local/thumbnails/repair', { method: 'POST' });
           await loadDatasourceIndexingStatus({ preserveOnError: true, forceRefresh: true });
         } else if (action === 'requeue-metadata') {
-          await api('/v1/datasources/local/metadata/repair', { method: 'POST' });
+          const result = await api('/v1/datasources/local/metadata/repair', { method: 'POST' });
+          const skipped = Number(result?.captureDateSkipped || 0);
+          datasourceIndexingMessage.textContent = 'Queued ' + formatCount(result?.queued || 0) + ' metadata item(s), including ' + formatCount(result?.captureDateQueued || 0) + ' capture-date checks.' + (skipped > 0 ? ' Capture-date checks unavailable for ' + formatCount(skipped) + ' item(s); update the media helper and check video runtime availability.' : '');
+          datasourceIndexingMessage.className = skipped > 0 ? 'status-failed' : 'status-ok';
           await loadDatasourceIndexingStatus({ preserveOnError: true, forceRefresh: true });
         } else if (action === 'retry-embeddings') {
           const result = await api('/v1/datasources/embeddings/retry-failed', { method: 'POST' });

@@ -24,6 +24,7 @@ const (
 	datasourceExpensiveStatusTimeout      = 6 * time.Second
 	localDatasourceEmbeddingStatusTimeout = 5 * time.Second
 	datasourceIndexingStatusSnapshotKey   = "datasource_indexing"
+	datasourceIndexingSnapshotVersion     = 2
 	datasourceIndexingSnapshotTimeout     = 2 * time.Minute
 	datasourceIndexingSnapshotSaveTimeout = 500 * time.Millisecond
 	datasourceIndexingSnapshotStaleAfter  = datasourceIndexingSnapshotTimeout + 5*time.Second
@@ -33,7 +34,7 @@ const (
 	assetProcessingStatsRefreshTimeout    = 90 * time.Second
 	datasourceTaskNoteMediaDiscovery      = "Quick discovery finds ordinary additions, removals, and moves. Reconciliation inspects every supported file daily at 04:00 in the Agent timezone; Run reconciliation now starts it manually."
 	datasourceTaskNoteContentVerification = "At the configured daily time, uses an idle heavy-task worker to compare saved content hashes. If no worker is idle, that day's run is skipped. The default duration is 30 minutes; set contentVerificationDuration to 0 to disable it."
-	datasourceTaskNoteMetadata            = "Registers media information in the media database. Recently added or changed files remain settling before metadata processing (2 minutes by default). Requeue failed moves failed metadata jobs back to the queue at repair priority. Processing starts after settling when a worker is available, and jobs that fail again return to failed."
+	datasourceTaskNoteMetadata            = "Registers media information in the media database. Recently added or changed files remain settling before metadata processing (2 minutes by default). Metadata repair moves failed jobs and videos with missing duration back to the queue at repair priority. Processing starts after settling when a worker is available, and jobs that fail again return to failed."
 	datasourceTaskNoteThumbnails          = "Generates thumbnails so media can be previewed quickly. Requeue failed moves failed thumbnails back to the queue at repair priority. Processing starts when a worker is available, and items that fail again return to failed."
 	datasourceTaskNoteEmbeddings          = "Analyzes media features for visual search. Failed media remains browsable but is excluded from semantic search. Automatic retry becomes eligible after 30 minutes; first-attempt work within the same datasource stays ahead of retries. Download failure details to inspect the asset and error, or request an immediate retry after repairing the source media."
 	datasourceTaskNoteSearchIndex         = "Updates the search index so media can be searched. Publishing can take several hours for a large library. An existing published index remains searchable while publishing runs. Failed publish jobs are retried automatically on the next eligible run."
@@ -213,6 +214,7 @@ type DatasourceIndexingRunResult struct {
 // DatasourceIndexingStatus returns the Admin UI read model for datasource work.
 // It never waits for or starts expensive live catalog aggregation. If no
 // snapshot exists yet, it returns a lightweight config/active-worker view.
+// Missing coverage is restored from the compatible cached stats read model.
 func (a *AgentRuntime) DatasourceIndexingStatus(ctx context.Context) (DatasourceIndexingResponse, error) {
 	catalogService := a.catalogService()
 	if snapshot, ok := a.datasourceIndexingSnapshot(ctx, catalogService); ok {
@@ -220,8 +222,7 @@ func (a *AgentRuntime) DatasourceIndexingStatus(ctx context.Context) (Datasource
 	}
 	response := a.emptyDatasourceIndexingResponse()
 	if stats := a.cachedAssetProcessingStatsForAdmin(ctx, catalogService); !datasourceStatusesArePassthroughOnly(response.Datasources) && !stats.Empty() {
-		response.Datasources = applyAggregateProcessingStatsToDatasourceStatus(response.Datasources, stats)
-		response.Tasks = a.datasourceTaskStatuses(ctx, response.Datasources, stats)
+		response = a.applyDatasourceTaskStats(ctx, response, stats)
 		response.StatusSnapshotAt = timePtr(stats.RefreshedAt)
 		response.StatusSnapshotUsed = true
 	}
@@ -230,7 +231,8 @@ func (a *AgentRuntime) DatasourceIndexingStatus(ctx context.Context) (Datasource
 
 // StartDatasourceIndexingStatusRefresh starts a low-priority repair loop for
 // the Admin read model. Admin requests never activate this work; reconciliation
-// runs only after background queues drain and yields to foreground catalog use.
+// runs after background queues drain or while heavy workers are paused, and it
+// always yields to foreground catalog use.
 func (a *AgentRuntime) StartDatasourceIndexingStatusRefresh() {
 	if a == nil {
 		return
@@ -535,6 +537,12 @@ func (a *AgentRuntime) datasourceIndexingReconciliationReady() bool {
 	if len(summaries) == 0 || datasourceSummariesArePassthroughOnly(summaries) {
 		return false
 	}
+	// Paused heavy workers cannot drain their queues. An exact read-model
+	// recount is still safe after the activity checks above and remains
+	// cancelable when foreground Gallery or search work arrives.
+	if a.effectiveHeavyTaskWorkers() <= 0 {
+		return true
+	}
 	schedule, semanticScheduled := a.semanticIndexingSchedule()
 	state, ok := a.cachedSchedulerWorkStateForDisplay(semanticSingleWorkerSchedule(schedule), semanticScheduled)
 	if !ok {
@@ -591,11 +599,24 @@ func (a *AgentRuntime) datasourceIndexingSnapshot(ctx context.Context, catalogSe
 			a.datasourceTaskMu.Unlock()
 			return DatasourceIndexingResponse{}, false
 		}
-		snapshot := *a.datasourceSnapshot
+		cachedSnapshot := a.datasourceSnapshot
+		snapshot := *cachedSnapshot
 		snapshotAt := a.datasourceSnapshotAt
 		a.datasourceTaskMu.Unlock()
 		snapshot.StatusSnapshotAt = timePtr(snapshotAt)
 		snapshot.StatusSnapshotUsed = true
+		snapshot.Datasources = append([]DatasourceIndexingStatus(nil), snapshot.Datasources...)
+		if repaired, ok := a.restoreCachedDatasourceCoverage(ctx, catalogService, snapshot); ok {
+			snapshot = repaired
+			if cloned, clonedOK := cloneDatasourceIndexingResponse(snapshot); clonedOK {
+				cloned.StatusSnapshotUsed = false
+				a.datasourceTaskMu.Lock()
+				if !a.datasourceSnapshotInvalid && a.datasourceSnapshot == cachedSnapshot {
+					a.datasourceSnapshot = &cloned
+				}
+				a.datasourceTaskMu.Unlock()
+			}
+		}
 		snapshot = a.normalizeDatasourceIndexingSnapshot(snapshot)
 		return snapshot, true
 	}
@@ -611,7 +632,7 @@ func (a *AgentRuntime) datasourceIndexingSnapshot(ctx context.Context, catalogSe
 		return DatasourceIndexingResponse{}, false
 	}
 	var payload datasourceIndexingSnapshotPayload
-	if err := json.Unmarshal(stored.Payload, &payload); err != nil || payload.Version == 0 {
+	if err := json.Unmarshal(stored.Payload, &payload); err != nil || payload.Version == 0 || payload.Version > datasourceIndexingSnapshotVersion {
 		_ = catalogService.DeleteAdminStatusSnapshot(loadCtx, datasourceIndexingStatusSnapshotKey)
 		return DatasourceIndexingResponse{}, false
 	}
@@ -621,10 +642,16 @@ func (a *AgentRuntime) datasourceIndexingSnapshot(ctx context.Context, catalogSe
 	}
 	snapshot := a.normalizePersistedDatasourceIndexingSnapshot(payload.Response)
 	snapshot.snapshotConfigHash = payload.ConfigHash
+	if payload.Version < datasourceIndexingSnapshotVersion {
+		snapshot = a.restoreLegacyDatasourceTaskReadModel(ctx, catalogService, snapshot)
+	}
 	if !stored.UpdatedAt.IsZero() {
 		snapshot.StatusSnapshotAt = timePtr(stored.UpdatedAt)
 	}
 	snapshot.StatusSnapshotUsed = true
+	if repaired, repairedOK := a.restoreCachedDatasourceCoverage(ctx, catalogService, snapshot); repairedOK {
+		snapshot = repaired
+	}
 	a.datasourceTaskMu.Lock()
 	if a.datasourceSnapshotInvalid {
 		a.datasourceTaskMu.Unlock()
@@ -641,6 +668,156 @@ func (a *AgentRuntime) datasourceIndexingSnapshot(ctx context.Context, catalogSe
 	a.datasourceTaskMu.Unlock()
 	snapshot = a.normalizeDatasourceIndexingSnapshot(snapshot)
 	return snapshot, true
+}
+
+func (a *AgentRuntime) restoreCachedDatasourceCoverage(ctx context.Context, catalogService *catalog.Service, response DatasourceIndexingResponse) (DatasourceIndexingResponse, bool) {
+	if datasourceStatusesArePassthroughOnly(response.Datasources) || !datasourceCoverageStatsMissing(response.Datasources) {
+		return response, false
+	}
+	stats := a.cachedAssetProcessingStatsForAdmin(ctx, catalogService)
+	if stats.Empty() {
+		return response, false
+	}
+	var restored bool
+	response.Datasources, restored = applyMissingDatasourceCoverageStats(response.Datasources, stats)
+	return response, restored
+}
+
+// restoreLegacyDatasourceTaskReadModel repairs version 1 snapshots whose
+// transition writers could replace unrelated task rows with zero-value live
+// datasource fields. The cached absolute stats are intentionally used here:
+// loading Admin status must not start a catalog-wide recount.
+func (a *AgentRuntime) restoreLegacyDatasourceTaskReadModel(ctx context.Context, catalogService *catalog.Service, response DatasourceIndexingResponse) DatasourceIndexingResponse {
+	stats := a.cachedAssetProcessingStatsForAdmin(ctx, catalogService)
+	if stats.Empty() || datasourceStatusesArePassthroughOnly(response.Datasources) {
+		return response
+	}
+	return a.applyDatasourceTaskStats(ctx, response, stats)
+}
+
+func (a *AgentRuntime) applyDatasourceTaskStats(ctx context.Context, response DatasourceIndexingResponse, stats catalog.AssetProcessingStatsSnapshot) DatasourceIndexingResponse {
+	if stats.Empty() || datasourceStatusesArePassthroughOnly(response.Datasources) {
+		return response
+	}
+	stats = normalizeAssetProcessingStatsActivity(stats, a.datasourceTaskActiveSnapshot())
+	response.Datasources = applyAggregateProcessingStatsToDatasourceStatus(response.Datasources, stats)
+	response.Tasks = a.datasourceTaskStatuses(ctx, response.Datasources, stats)
+	return response
+}
+
+// normalizeAssetProcessingStatsActivity treats durable processing totals as a
+// backlog snapshot, not as proof that a worker from the process which wrote it
+// is still running. Current process activity remains authoritative; any excess
+// cached running work returns to pending, matching startup job recovery.
+func normalizeAssetProcessingStatsActivity(stats catalog.AssetProcessingStatsSnapshot, activeByPhase map[string]int) catalog.AssetProcessingStatsSnapshot {
+	if stats.Empty() {
+		return stats
+	}
+	normalized := stats
+	normalized.Stats = append([]catalog.AssetProcessingStat(nil), stats.Stats...)
+	for _, stage := range []string{catalog.AssetProcessingStageMetadata, catalog.AssetProcessingStageThumbnails} {
+		normalizeAssetProcessingStageActivity(&normalized, stage, max(activeByPhase[stage], 0))
+	}
+	return normalized
+}
+
+func normalizeAssetProcessingStageActivity(stats *catalog.AssetProcessingStatsSnapshot, stage string, currentActive int) {
+	if stats == nil {
+		return
+	}
+	pendingIndex := -1
+	runningIndex := -1
+	working := 0
+	for index := range stats.Stats {
+		stat := stats.Stats[index]
+		if stat.ScopeKey != catalog.AssetProcessingScopeAll || stat.Stage != stage {
+			continue
+		}
+		switch stat.Status {
+		case catalog.AssetProcessingStatusPending:
+			working += max(stat.Count, 0)
+			if pendingIndex < 0 {
+				pendingIndex = index
+			} else {
+				stats.Stats[index].Count = 0
+			}
+		case catalog.AssetProcessingStatusRunning:
+			working += max(stat.Count, 0)
+			if runningIndex < 0 {
+				runningIndex = index
+			} else {
+				stats.Stats[index].Count = 0
+			}
+		}
+	}
+	if pendingIndex < 0 && runningIndex < 0 {
+		return
+	}
+	active := min(max(currentActive, 0), working)
+	if pendingIndex < 0 {
+		pending := stats.Stats[runningIndex]
+		pending.Status = catalog.AssetProcessingStatusPending
+		pending.Count = 0
+		stats.Stats = append(stats.Stats, pending)
+		pendingIndex = len(stats.Stats) - 1
+	}
+	if runningIndex < 0 {
+		running := stats.Stats[pendingIndex]
+		running.Status = catalog.AssetProcessingStatusRunning
+		running.Count = 0
+		stats.Stats = append(stats.Stats, running)
+		runningIndex = len(stats.Stats) - 1
+	}
+	stats.Stats[pendingIndex].Count = working - active
+	stats.Stats[runningIndex].Count = active
+}
+
+func (a *AgentRuntime) ensureDatasourceTaskReadModel(ctx context.Context, catalogService *catalog.Service, response DatasourceIndexingResponse) DatasourceIndexingResponse {
+	if len(response.Tasks) > 0 || datasourceStatusesArePassthroughOnly(response.Datasources) {
+		return response
+	}
+	stats := a.cachedAssetProcessingStatsForAdmin(ctx, catalogService)
+	if !stats.Empty() {
+		return a.applyDatasourceTaskStats(ctx, response, stats)
+	}
+	response.Tasks = a.datasourceTaskStatuses(ctx, response.Datasources)
+	return response
+}
+
+// replaceDatasourceTaskPhases applies an event-scoped task update without
+// discarding counts owned by other task phases.
+func replaceDatasourceTaskPhases(current []DatasourceTaskStatus, updated []DatasourceTaskStatus, phases ...string) []DatasourceTaskStatus {
+	if len(phases) == 0 {
+		return current
+	}
+	targets := make(map[string]bool, len(phases))
+	for _, phase := range phases {
+		targets[phase] = true
+	}
+	updates := make(map[string]DatasourceTaskStatus, len(phases))
+	for _, task := range updated {
+		if targets[task.Phase] {
+			updates[task.Phase] = task
+		}
+	}
+	replaced := make(map[string]bool, len(phases))
+	for index := range current {
+		update, ok := updates[current[index].Phase]
+		if !ok {
+			continue
+		}
+		current[index] = update
+		replaced[update.Phase] = true
+	}
+	for _, phase := range phases {
+		if replaced[phase] {
+			continue
+		}
+		if update, ok := updates[phase]; ok {
+			current = append(current, update)
+		}
+	}
+	return current
 }
 
 func (a *AgentRuntime) normalizeDatasourceIndexingSnapshot(response DatasourceIndexingResponse) DatasourceIndexingResponse {
@@ -749,7 +926,7 @@ func (a *AgentRuntime) rememberDatasourceIndexingSnapshotAt(catalogService *cata
 	persistedSnapshot.StatusSnapshotAt = nil
 	persistedSnapshot.StatusSnapshotUsed = false
 	payload, err := json.Marshal(datasourceIndexingSnapshotPayload{
-		Version:    1,
+		Version:    datasourceIndexingSnapshotVersion,
 		ConfigHash: expectedConfigHash,
 		Response:   persistedSnapshot,
 	})
@@ -818,8 +995,7 @@ func (a *AgentRuntime) rememberDatasourceTaskStatsSnapshot(ctx context.Context, 
 		a.rememberDatasourceIndexingSnapshotAt(catalogService, response, stats.RefreshedAt)
 		return
 	}
-	response.Datasources = applyAggregateProcessingStatsToDatasourceStatus(response.Datasources, stats)
-	response.Tasks = a.datasourceTaskStatuses(ctx, response.Datasources, stats)
+	response = a.applyDatasourceTaskStats(ctx, response, stats)
 	a.rememberDatasourceIndexingSnapshotAt(catalogService, response, stats.RefreshedAt)
 }
 
@@ -956,7 +1132,7 @@ func (a *AgentRuntime) datasourceIndexingConfigHash() string {
 	a.mu.RUnlock()
 
 	parts := make([]string, 0, len(datasources)+len(roots)+2)
-	parts = append(parts, "snapshot_schema\x00semantic-profile-v1")
+	parts = append(parts, "snapshot_schema\x00semantic-profile-v2-local-input")
 	semanticProfile := a.datasourceIndexingSemanticProfile()
 	semanticModelID := ""
 	semanticVectorSpaceID := ""
@@ -1083,6 +1259,34 @@ func applyDatasourceCoverageStats(datasources []DatasourceIndexingStatus, stats 
 		datasources[index].Coverage = coverage
 	}
 	return datasources
+}
+
+func datasourceCoverageStatsMissing(datasources []DatasourceIndexingStatus) bool {
+	for _, datasource := range datasources {
+		if datasource.IndexingEnabled && datasource.Coverage == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func applyMissingDatasourceCoverageStats(datasources []DatasourceIndexingStatus, stats catalog.AssetProcessingStatsSnapshot) ([]DatasourceIndexingStatus, bool) {
+	if stats.Empty() {
+		return datasources, false
+	}
+	restored := false
+	for index := range datasources {
+		if !datasources[index].IndexingEnabled || datasources[index].Coverage != nil {
+			continue
+		}
+		coverage := datasourceCoverageFromStats(stats, datasources[index].SourceKey)
+		if coverage == nil {
+			continue
+		}
+		datasources[index].Coverage = coverage
+		restored = true
+	}
+	return datasources, restored
 }
 
 func datasourceCoverageFromStats(stats catalog.AssetProcessingStatsSnapshot, sourceKey string) *DatasourceCoverage {
@@ -1286,10 +1490,10 @@ func (a *AgentRuntime) rememberDatasourceDiscoveryTaskSnapshot(catalogService *c
 	}
 	response.StatusSnapshotUsed = false
 	response.StatusSnapshotAt = nil
-	if len(response.Tasks) == 0 {
-		response.Tasks = a.datasourceTaskStatuses(context.Background(), response.Datasources)
-	}
+	response = a.ensureDatasourceTaskReadModel(context.Background(), catalogService, response)
+	queuedMetadata := 0
 	for _, result := range scanResults {
+		queuedMetadata += max(result.QueuedMetadata, 0)
 		for index := range response.Datasources {
 			if response.Datasources[index].SourceKey != strings.TrimSpace(result.SourceKey) {
 				continue
@@ -1299,7 +1503,29 @@ func (a *AgentRuntime) rememberDatasourceDiscoveryTaskSnapshot(catalogService *c
 		}
 	}
 	if len(scanResults) > 0 {
-		response.Tasks = a.datasourceTaskStatuses(context.Background(), response.Datasources)
+		response.Tasks = replaceDatasourceTaskPhases(
+			response.Tasks,
+			a.datasourceTaskStatuses(context.Background(), response.Datasources),
+			"phase0",
+		)
+	}
+	if queuedMetadata > 0 {
+		metadataFound := false
+		for index := range response.Tasks {
+			if response.Tasks[index].Phase != "metadata" {
+				continue
+			}
+			metadataFound = true
+			response.Tasks[index].SettlingTasks += queuedMetadata
+			response.Tasks[index].Status = datasourceTaskStatus(response.Tasks[index])
+			break
+		}
+		if !metadataFound {
+			metadataTask, _ := datasourceTaskTemplate("metadata")
+			metadataTask.SettlingTasks = queuedMetadata
+			metadataTask.Status = datasourceTaskStatus(metadataTask)
+			response.Tasks = append(response.Tasks, metadataTask)
+		}
 	}
 	lastQuickScanAt := localPhase0ScanModeCompletedAt(scanResults, datasourceLocalScanModeQuick)
 	lastReconciliationAt := localPhase0ScanModeCompletedAt(scanResults, datasourceLocalScanModeReconciliation)
@@ -1394,9 +1620,7 @@ func (a *AgentRuntime) rememberDatasourceTaskActivitySnapshot(catalogService *ca
 	}
 	response.StatusSnapshotUsed = false
 	response.StatusSnapshotAt = nil
-	if len(response.Tasks) == 0 {
-		response.Tasks = a.datasourceTaskStatuses(context.Background(), response.Datasources)
-	}
+	response = a.ensureDatasourceTaskReadModel(context.Background(), catalogService, response)
 	found := false
 	for index := range response.Tasks {
 		if response.Tasks[index].Phase != phase {
@@ -1474,10 +1698,16 @@ func (a *AgentRuntime) rememberSemanticIndexingProgressSnapshot(catalogService *
 			break
 		}
 	}
-	if len(response.Tasks) == 0 || changedDatasource {
-		response.Tasks = a.datasourceTaskStatuses(context.Background(), response.Datasources)
+	response = a.ensureDatasourceTaskReadModel(context.Background(), catalogService, response)
+	if changedDatasource {
+		response.Tasks = replaceDatasourceTaskPhases(
+			response.Tasks,
+			a.datasourceTaskStatuses(context.Background(), response.Datasources),
+			"embeddings",
+			"search_index",
+		)
 	}
-	if len(sourceStatuses) == 0 && !semanticBackfillStatusEmpty(aggregate) {
+	if !changedDatasource && !semanticBackfillStatusEmpty(aggregate) {
 		response.Tasks = applySemanticAggregateToDatasourceTasks(response.Tasks, aggregate, a.effectiveHeavyTaskWorkers())
 	}
 	a.rememberDatasourceIndexingSnapshot(catalogService, response)
@@ -2003,6 +2233,7 @@ func datasourceTaskUsesHeavyWorker(phase string) bool {
 }
 
 func normalizeDatasourceTaskDependencies(tasks []DatasourceTaskStatus) []DatasourceTaskStatus {
+	applySemanticIngestionWaitToDatasourceTasks(tasks)
 	embeddingIndex := -1
 	searchIndex := -1
 	for index, task := range tasks {
@@ -2089,7 +2320,7 @@ func datasourceSemanticTaskCountsFromAssetStats(stats catalog.AssetProcessingSta
 	if stats.HasStage(catalog.AssetProcessingStageSearchIndex) {
 		summary.indexed = stats.Ready(catalog.AssetProcessingStageSearchIndex)
 		summary.unindexed = stats.Pending(catalog.AssetProcessingStageSearchIndex)
-		summary.failedIndexJobs = max(summary.failedIndexJobs, stats.Failed(catalog.AssetProcessingStageSearchIndex))
+		summary.failedIndexJobs = stats.Failed(catalog.AssetProcessingStageSearchIndex)
 		searchTotal := stats.Total(catalog.AssetProcessingStageSearchIndex)
 		if summary.completed < searchTotal {
 			summary.completed = searchTotal
@@ -2446,7 +2677,12 @@ func (a *AgentRuntime) rememberRemoteDatasourceSyncSnapshot(catalogService *cata
 	}
 	response.StatusSnapshotUsed = false
 	response.StatusSnapshotAt = nil
-	response.Tasks = a.datasourceTaskStatuses(context.Background(), response.Datasources)
+	response = a.ensureDatasourceTaskReadModel(context.Background(), catalogService, response)
+	response.Tasks = replaceDatasourceTaskPhases(
+		response.Tasks,
+		a.datasourceTaskStatuses(context.Background(), response.Datasources),
+		"phase0",
+	)
 	a.rememberDatasourceTaskReadModel(catalogService, response)
 }
 

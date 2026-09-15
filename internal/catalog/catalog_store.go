@@ -23,8 +23,9 @@ const (
 	catalogAdminDBName                 = "catalog-admin.db"
 	catalogReadConns                   = 4
 	catalogBackgroundReadConns         = 1
-	catalogSchemaVersion               = 3
+	catalogSchemaVersion               = 5
 	catalogGallerySourceCanonicalIndex = "idx_catalog_assets_gallery_source_canonical"
+	catalogLocalRootAssetStatusIndex   = "idx_local_asset_locations_root_asset_status"
 	// "TMCH" identifies the final Timich catalog format. Earlier unreleased
 	// development databases reused user_version=1 without this marker.
 	catalogApplicationID = 0x544d4348
@@ -40,6 +41,7 @@ const (
 var (
 	ErrCatalogNotConfigured       = errors.New("catalog is not configured")
 	ErrCatalogSchemaResetRequired = errors.New("catalog database reset is required")
+	ErrCatalogMigrationRequired   = errors.New("catalog database manual migration is required")
 )
 
 // ImmichMirrorAsset is one normalized Immich metadata row stored in the Agent
@@ -192,6 +194,10 @@ func LoadOrCreateCatalogStore(dataDir string) (*CatalogStore, error) {
 		return nil, err
 	}
 	if err := store.ensureCatalogQueryIndexes(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := store.ensureLocalCaptureMetadataSchema(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -456,7 +462,6 @@ func (s *CatalogStore) Path() string {
 func (s *CatalogStore) ensureCatalogSchema() error {
 	preludeStatements := []string{
 		`PRAGMA foreign_keys = ON`,
-		`PRAGMA journal_mode = WAL`,
 		`PRAGMA busy_timeout = 5000`,
 	}
 	for _, statement := range preludeStatements {
@@ -472,7 +477,18 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 	if err := s.db.QueryRow(`PRAGMA application_id`).Scan(&applicationID); err != nil {
 		return fmt.Errorf("read catalog application id: %w", err)
 	}
+	if version == 4 && applicationID == catalogApplicationID {
+		return fmt.Errorf("%w: found V4; stop Timich Agent, preserve the state and run pre-release-migrate-catalog-v4-v5 before starting this V5 Agent; do not delete the catalog", ErrCatalogMigrationRequired)
+	}
+	if (version == catalogSchemaVersion && applicationID == catalogApplicationID) || (version == 0 && applicationID == 0) {
+		if _, err := s.db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+			return fmt.Errorf("prepare catalog WAL: %w", err)
+		}
+	}
 	if version == catalogSchemaVersion && applicationID == catalogApplicationID {
+		if err := validateGalleryStorageSchema(context.Background(), s.db, true); err != nil {
+			return fmt.Errorf("validate V5 Gallery storage: %w", err)
+		}
 		assetColumns, err := s.tableColumns("catalog_assets")
 		if err != nil {
 			return fmt.Errorf("inspect catalog external identity schema: %w", err)
@@ -540,6 +556,18 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 		}
 		if externalIdentityStateCount != 1 {
 			return fmt.Errorf("%w: catalog schema is missing required external identity state; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, s.root)
+		}
+		canonicalSemanticColumns, err := s.tableColumns("canonical_semantic_vector_inputs")
+		if err != nil {
+			return fmt.Errorf("inspect canonical semantic input schema: %w", err)
+		}
+		for _, column := range []string{
+			"representative_source_key", "representative_upstream_asset_id", "embedding_input",
+			"input_fingerprint", "rendition_sha256", "preprocessing_version", "refresh_required",
+		} {
+			if !canonicalSemanticColumns[column] {
+				return fmt.Errorf("%w: catalog schema is missing canonical semantic input field %q; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, column, s.root)
+			}
 		}
 		requiredIndexPrefixes := map[string][]string{
 			"idx_catalog_assets_external_checksum":           {"source_key", "upstream_checksum_algorithm", "content_sha1_hex"},
@@ -736,6 +764,8 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 			WHERE status != 'missing'`,
 		`CREATE INDEX IF NOT EXISTS idx_local_asset_locations_asset_status
 			ON local_asset_locations(source_key, asset_id, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_local_asset_locations_root_asset_status
+			ON local_asset_locations(source_key, root_key, asset_id, status)`,
 		`CREATE INDEX IF NOT EXISTS idx_local_asset_locations_scan
 			ON local_asset_locations(source_key, root_key, status, relative_path)`,
 		`CREATE INDEX IF NOT EXISTS idx_local_asset_locations_source_status
@@ -912,6 +942,21 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 			ON semantic_vectors(source_key, model_id, vector_space_id, status, upstream_asset_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_semantic_vectors_payload_batch
 			ON semantic_vectors(payload_batch_id)`,
+		`CREATE TABLE IF NOT EXISTS canonical_semantic_vector_inputs (
+			canonical_asset_id TEXT NOT NULL,
+			model_id TEXT NOT NULL,
+			representative_source_key TEXT NOT NULL,
+			representative_upstream_asset_id TEXT NOT NULL,
+			embedding_input TEXT NOT NULL,
+			input_fingerprint TEXT NOT NULL,
+			rendition_sha256 TEXT NOT NULL,
+			preprocessing_version TEXT NOT NULL,
+			refresh_required INTEGER NOT NULL DEFAULT 1,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY(canonical_asset_id, model_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_canonical_semantic_vector_inputs_refresh
+			ON canonical_semantic_vector_inputs(model_id, refresh_required, canonical_asset_id)`,
 		`CREATE TABLE IF NOT EXISTS semantic_state (
 			source_key TEXT NOT NULL,
 			model_id TEXT NOT NULL,
@@ -954,6 +999,10 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 		)`,
 	}
 	statements = append(statements, catalogSearchProjectionSchemaStatements()...)
+	// Publish the required physical layout in the same transaction as V5.
+	// A stop before later derived-index setup must not leave a V5 marker with
+	// no Gallery table for the next startup to validate.
+	statements = append(statements, galleryProjectionTableSQL)
 	return createCatalogSchema(context.Background(), s.db, statements)
 }
 
@@ -1007,6 +1056,11 @@ func (s *CatalogStore) ensureCatalogQueryIndexes(ctx context.Context) error {
 			name: "idx_catalog_gallery_timeline_media_captured",
 			sql: `CREATE INDEX IF NOT EXISTS idx_catalog_gallery_timeline_media_captured
 				ON catalog_gallery_timeline(generation, media_type, captured_at DESC, canonical_asset_id)`,
+		},
+		{
+			name: catalogLocalRootAssetStatusIndex,
+			sql: `CREATE INDEX IF NOT EXISTS idx_local_asset_locations_root_asset_status
+				ON local_asset_locations(source_key, root_key, asset_id, status)`,
 		},
 	}
 	for _, statement := range statements {
@@ -1064,6 +1118,8 @@ func catalogSearchProjectionSchemaStatements() []string {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_catalog_assets_metadata_favorite
 			ON catalog_assets(source_key, visibility_status, is_favorite, captured_at DESC, upstream_asset_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_catalog_canonical_metadata_favorite
+			ON catalog_canonical_assets(visibility_status, is_favorite, captured_at DESC, canonical_asset_id)`,
 		`CREATE VIRTUAL TABLE IF NOT EXISTS catalog_assets_metadata_fts USING fts5(
 			filename,
 			place_label,
@@ -1089,6 +1145,31 @@ func catalogSearchProjectionSchemaStatements() []string {
 				INSERT INTO catalog_assets_metadata_fts(rowid, filename, place_label, description)
 				VALUES (new.rowid, new.filename, new.place_label, new.description);
 			END`,
+		`CREATE VIRTUAL TABLE IF NOT EXISTS catalog_canonical_metadata_fts USING fts5(
+			filename,
+			place_label,
+			description,
+			content = 'catalog_canonical_assets',
+			content_rowid = 'rowid',
+			tokenize = 'trigram'
+		)`,
+		`CREATE TRIGGER IF NOT EXISTS catalog_canonical_metadata_fts_insert
+			AFTER INSERT ON catalog_canonical_assets BEGIN
+				INSERT INTO catalog_canonical_metadata_fts(rowid, filename, place_label, description)
+				VALUES (new.rowid, new.filename, new.place_label, new.description);
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS catalog_canonical_metadata_fts_delete
+			AFTER DELETE ON catalog_canonical_assets BEGIN
+				INSERT INTO catalog_canonical_metadata_fts(catalog_canonical_metadata_fts, rowid, filename, place_label, description)
+				VALUES ('delete', old.rowid, old.filename, old.place_label, old.description);
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS catalog_canonical_metadata_fts_update
+			AFTER UPDATE OF filename, place_label, description ON catalog_canonical_assets BEGIN
+				INSERT INTO catalog_canonical_metadata_fts(catalog_canonical_metadata_fts, rowid, filename, place_label, description)
+				VALUES ('delete', old.rowid, old.filename, old.place_label, old.description);
+				INSERT INTO catalog_canonical_metadata_fts(rowid, filename, place_label, description)
+				VALUES (new.rowid, new.filename, new.place_label, new.description);
+			END`,
 	}
 }
 
@@ -1111,7 +1192,7 @@ func (s *CatalogStore) validateCatalogSearchProjectionSchema(ctx context.Context
 	}
 	var ftsCount int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master
-		WHERE type = 'table' AND name = 'catalog_assets_metadata_fts'`).Scan(&ftsCount); err != nil {
+		WHERE type = 'table' AND name IN ('catalog_assets_metadata_fts', 'catalog_canonical_metadata_fts')`).Scan(&ftsCount); err != nil {
 		return fmt.Errorf("inspect catalog metadata search table: %w", err)
 	}
 	var triggerCount int
@@ -1119,7 +1200,10 @@ func (s *CatalogStore) validateCatalogSearchProjectionSchema(ctx context.Context
 		WHERE type = 'trigger' AND name IN (
 			'catalog_assets_metadata_fts_insert',
 			'catalog_assets_metadata_fts_delete',
-			'catalog_assets_metadata_fts_update'
+			'catalog_assets_metadata_fts_update',
+			'catalog_canonical_metadata_fts_insert',
+			'catalog_canonical_metadata_fts_delete',
+			'catalog_canonical_metadata_fts_update'
 		)`).Scan(&triggerCount); err != nil {
 		return fmt.Errorf("inspect catalog metadata search triggers: %w", err)
 	}
@@ -1127,7 +1211,13 @@ func (s *CatalogStore) validateCatalogSearchProjectionSchema(ctx context.Context
 	if err != nil {
 		return err
 	}
-	if ftsCount != 1 || triggerCount != 3 || !hasStringPrefix(favoriteIndex, []string{"source_key", "visibility_status", "is_favorite", "captured_at", "upstream_asset_id"}) {
+	canonicalFavoriteIndex, err := s.indexColumns("idx_catalog_canonical_metadata_favorite")
+	if err != nil {
+		return err
+	}
+	if ftsCount != 2 || triggerCount != 6 ||
+		!hasStringPrefix(favoriteIndex, []string{"source_key", "visibility_status", "is_favorite", "captured_at", "upstream_asset_id"}) ||
+		!hasStringPrefix(canonicalFavoriteIndex, []string{"visibility_status", "is_favorite", "captured_at", "canonical_asset_id"}) {
 		return fmt.Errorf("%w: catalog schema is missing the current metadata search projection; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, s.root)
 	}
 	return nil
@@ -1241,6 +1331,83 @@ func createSemanticIndexGenerationTriggers(ctx context.Context, executor catalog
 				AND NOT EXISTS (SELECT 1 FROM semantic_generation_suppression WHERE source_key = NEW.source_key);
 		END`,
 	}
+	canonicalSourceKey := canonicalSemanticCorpusSourceKey
+	canonicalRefreshTriggers := []string{
+		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS canonical_semantic_catalog_asset_insert_refresh
+		AFTER INSERT ON catalog_assets
+		WHEN NEW.canonical_asset_id IS NOT NULL
+		BEGIN
+			UPDATE canonical_semantic_vector_inputs
+			SET refresh_required = 1, updated_at = NEW.updated_at
+			WHERE canonical_asset_id = NEW.canonical_asset_id;
+			UPDATE semantic_state SET asset_generation = asset_generation + 1
+			WHERE source_key = %q
+				AND NOT EXISTS (SELECT 1 FROM semantic_generation_suppression WHERE source_key = %q);
+		END`, canonicalSourceKey, canonicalSourceKey),
+		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS canonical_semantic_catalog_asset_delete_refresh
+		AFTER DELETE ON catalog_assets
+		WHEN OLD.canonical_asset_id IS NOT NULL
+		BEGIN
+			UPDATE canonical_semantic_vector_inputs
+			SET refresh_required = 1, updated_at = OLD.updated_at
+			WHERE canonical_asset_id = OLD.canonical_asset_id;
+			UPDATE semantic_state SET asset_generation = asset_generation + 1
+			WHERE source_key = %q
+				AND NOT EXISTS (SELECT 1 FROM semantic_generation_suppression WHERE source_key = %q);
+		END`, canonicalSourceKey, canonicalSourceKey),
+		fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS canonical_semantic_catalog_asset_update_refresh
+		AFTER UPDATE OF datasource_kind, media_type, captured_at, visibility_status, content_sha1_hex,
+			content_size_bytes, canonical_content_sha1_hex, canonical_content_size_bytes, canonical_asset_id ON catalog_assets
+		WHEN OLD.canonical_asset_id IS NOT NEW.canonical_asset_id
+			OR OLD.datasource_kind IS NOT NEW.datasource_kind
+			OR OLD.media_type IS NOT NEW.media_type
+			OR OLD.captured_at IS NOT NEW.captured_at
+			OR OLD.visibility_status IS NOT NEW.visibility_status
+			OR OLD.content_sha1_hex IS NOT NEW.content_sha1_hex
+			OR OLD.content_size_bytes IS NOT NEW.content_size_bytes
+			OR OLD.canonical_content_sha1_hex IS NOT NEW.canonical_content_sha1_hex
+			OR OLD.canonical_content_size_bytes IS NOT NEW.canonical_content_size_bytes
+		BEGIN
+			UPDATE canonical_semantic_vector_inputs
+			SET refresh_required = 1, updated_at = NEW.updated_at
+			WHERE canonical_asset_id IN (OLD.canonical_asset_id, NEW.canonical_asset_id);
+			UPDATE semantic_state SET asset_generation = asset_generation + 1
+			WHERE source_key = %q
+				AND NOT EXISTS (SELECT 1 FROM semantic_generation_suppression WHERE source_key = %q);
+		END`, canonicalSourceKey, canonicalSourceKey),
+		`CREATE TRIGGER IF NOT EXISTS canonical_semantic_rendition_insert_refresh
+		AFTER INSERT ON local_renditions
+		BEGIN
+			UPDATE canonical_semantic_vector_inputs
+			SET refresh_required = 1, updated_at = NEW.generated_at
+			WHERE canonical_asset_id IN (
+				SELECT canonical_asset_id FROM catalog_assets
+				WHERE source_key = NEW.source_key AND upstream_asset_id = NEW.asset_id
+			);
+		END`,
+		`CREATE TRIGGER IF NOT EXISTS canonical_semantic_rendition_delete_refresh
+		AFTER DELETE ON local_renditions
+		BEGIN
+			UPDATE canonical_semantic_vector_inputs
+			SET refresh_required = 1, updated_at = OLD.generated_at
+			WHERE canonical_asset_id IN (
+				SELECT canonical_asset_id FROM catalog_assets
+				WHERE source_key = OLD.source_key AND upstream_asset_id = OLD.asset_id
+			);
+		END`,
+		`CREATE TRIGGER IF NOT EXISTS canonical_semantic_rendition_update_refresh
+		AFTER UPDATE OF kind, status, relative_path, source_sha1_hex, content_sha256 ON local_renditions
+		BEGIN
+			UPDATE canonical_semantic_vector_inputs
+			SET refresh_required = 1, updated_at = NEW.generated_at
+			WHERE canonical_asset_id IN (
+				SELECT canonical_asset_id FROM catalog_assets
+				WHERE (source_key = OLD.source_key AND upstream_asset_id = OLD.asset_id)
+					OR (source_key = NEW.source_key AND upstream_asset_id = NEW.asset_id)
+			);
+		END`,
+	}
+	triggers = append(triggers, canonicalRefreshTriggers...)
 	for _, statement := range triggers {
 		if _, err := executor.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("create semantic index generation trigger: %w", err)
@@ -1354,6 +1521,10 @@ func (s *CatalogStore) ReplaceFull(
 	if _, err = tx.ExecContext(ctx, `INSERT INTO semantic_generation_suppression(source_key)
 		VALUES (?) ON CONFLICT(source_key) DO NOTHING`, sourceKey); err != nil {
 		return MirrorSyncResult{}, fmt.Errorf("suppress per-row semantic generation: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO semantic_generation_suppression(source_key)
+		VALUES (?) ON CONFLICT(source_key) DO NOTHING`, canonicalSemanticCorpusSourceKey); err != nil {
+		return MirrorSyncResult{}, fmt.Errorf("suppress per-row canonical semantic generation: %w", err)
 	}
 	if _, err = tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.immich_full_stage`); err != nil {
 		return MirrorSyncResult{}, fmt.Errorf("reset immich full-sync stage: %w", err)
@@ -1559,8 +1730,18 @@ func (s *CatalogStore) ReplaceFull(
 			return MirrorSyncResult{}, fmt.Errorf("advance full-sync semantic generation: %w", err)
 		}
 	}
+	if len(changedAssetIDs) > 0 {
+		if _, err = tx.ExecContext(ctx, `UPDATE semantic_state
+			SET asset_generation = asset_generation + 1
+			WHERE source_key = ?`, canonicalSemanticCorpusSourceKey); err != nil {
+			return MirrorSyncResult{}, fmt.Errorf("advance full-sync canonical semantic generation: %w", err)
+		}
+	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM semantic_generation_suppression WHERE source_key = ?`, sourceKey); err != nil {
 		return MirrorSyncResult{}, fmt.Errorf("restore semantic generation triggers: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM semantic_generation_suppression WHERE source_key = ?`, canonicalSemanticCorpusSourceKey); err != nil {
+		return MirrorSyncResult{}, fmt.Errorf("restore canonical semantic generation triggers: %w", err)
 	}
 	if _, err = tx.ExecContext(ctx, `DROP TABLE temp.immich_full_stage`); err != nil {
 		return MirrorSyncResult{}, fmt.Errorf("drop immich full-sync stage: %w", err)

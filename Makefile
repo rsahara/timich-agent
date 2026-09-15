@@ -230,6 +230,7 @@ build-media-helper:
 	fi
 	@cp "$(MEDIA_HELPER_TARGET_DIR)/release/timich-media-helper" "$(MEDIA_HELPER_BINARY)"
 	@chmod +x "$(MEDIA_HELPER_BINARY)"
+	@cp media-helper/THIRD_PARTY_NOTICES.md "$(BUILD_DIR)/timich-media-helper-NOTICES.txt"
 
 test-media-helper:
 	@command -v "$(CARGO)" >/dev/null 2>&1 || { echo "cargo not found; install Rust to test timich-media-helper" >&2; exit 127; }
@@ -596,12 +597,15 @@ dist:
 		"# configure the datasource, and run Remote Browsing checks." \
 		"\`\`\`" \
 		"" \
-		"One-time pre-release V2 catalog migration:" \
+		"Offline pre-release catalog migration (V4 to V5):" \
 		"" \
-		"Skip this section unless this installation is explicitly known to use the" \
-		"unreleased catalog schema V2. Normal startup never migrates it. The command" \
-		"below is part of this exact versioned timich-agent binary and refuses any" \
-		"schema other than V2 or the already-current V3." \
+		"This build uses catalog schema V5. Fresh installs skip migration. V4 requires" \
+		"manual migration; normal startup does not upgrade or reset its data. Stop all" \
+		"writers and automatic restarts, back up the complete state/configuration and" \
+		"external semantic payloads, and retain the previous bundle/image first." \
+		"The command creates a separate V5 file and refuses existing output paths." \
+		"It does not switch the live database. Allow space on the data volume for a" \
+		"full DB copy, temporary Gallery tables, journal and separate backups." \
 		"" \
 		"For Docker Compose, stop the old Agent, extract this complete new bundle," \
 		"build without starting, then migrate the mounted state:" \
@@ -614,28 +618,35 @@ dist:
 		'docker compose "$${compose_args[@]}" build timich-agent' \
 		'docker compose "$${compose_args[@]}" run --rm --no-deps \' \
 		'  --entrypoint /usr/local/bin/timich-agent timich-agent \' \
-		'  pre-release-migrate-catalog-v2-v3 \' \
-		'  --data-dir /var/lib/timich-agent/state \' \
-		'  --backup /var/lib/timich-agent/backups/catalog-v2-before-v3.db \' \
+		'  pre-release-migrate-catalog-v4-v5 \' \
+		'  --source /var/lib/timich-agent/state/catalog-state-v1/catalog.db \' \
+		'  --output /var/lib/timich-agent/state/catalog-state-v1/catalog-v5.db \' \
 		'  --confirm-agent-stopped' \
-		'docker compose "$${compose_args[@]}" up -d' \
-		'docker compose "$${compose_args[@]}" logs -f' \
 		"\`\`\`" \
 		"" \
-		"For a stopped native service, use the exact configured data directory:" \
+		"For a stopped native service, use the exact configured catalog path:" \
 		"" \
 		"\`\`\`sh" \
-		"state_root=/var/lib/timich-agent" \
-		'install -d -m 0700 "$$state_root/backups"' \
-		'./timich-agent pre-release-migrate-catalog-v2-v3 \' \
-		'  --data-dir "$$state_root/state" \' \
-		'  --backup "$$state_root/backups/catalog-v2-before-v3.db" \' \
+		'./timich-agent pre-release-migrate-catalog-v4-v5 \' \
+		'  --source /var/lib/timich-agent/state/catalog-state-v1/catalog.db \' \
+		'  --output /var/lib/timich-agent/state/catalog-state-v1/catalog-v5.db \' \
 		'  --confirm-agent-stopped' \
 		"\`\`\`" \
 		"" \
-		"Success reports the exact Agent version and commit, fromVersion 2, toVersion 3," \
-		"and preserved asset/semantic counts. Keep the exclusive backup and previous" \
-		"bundle until Gallery browsing and semantic search are verified." \
+		"Success reports version/commit, fromVersion 4, toVersion 5, galleryRows and" \
+		"outputPath. The output is standalone and needs no WAL/SHM. Keep writers" \
+		"stopped, verify the output and retain the old DB backup before manually" \
+		"installing it at the configured catalog path. Checkpoint/close the old DB" \
+		"before switching; never apply old WAL/SHM files to the new file. Only then" \
+		"start the new Agent. Verify Gallery, Tasks, fallback and semantic search" \
+		"before restoring background work. Admin state and external payloads stay" \
+		"in place; no rediscovery, rehash, embedding regeneration or VACUUM is needed." \
+		"" \
+		"V4-to-V5 is the only offline catalog migration in this build. Older" \
+		"prerelease schemas are unsupported; retain their backups, do not treat" \
+		"them as V4. Normal startup accepts only V5 or a fresh database." \
+		"Rollback before new writes uses the matching old DB and bundle; after new" \
+		"writes, preserve the current state before making a rollback decision." \
 		"" \
 		"Compose updates must use the exact same -f file list for down, up, and logs." \
 		"Local datasource installations must include compose.local-media.yaml in every" \
@@ -723,6 +734,7 @@ update-manifest:
 				'    "dockerCompose": [' \
 				'      "Keep the existing .env, .local directory, and copied Compose overrides such as compose.immich-network.yaml and compose.local-media.yaml.",' \
 				'      "Download and extract the complete new Timich Agent bundle; do not copy individual executables between bundle versions.",' \
+				'      "For a prerelease V4 catalog, keep all writers stopped and follow the bundled V5 migration instructions, including backups and the manual database switch, before starting this Agent. Older schemas are unsupported.",' \
 				'      "Run docker compose down, up, and logs with the exact same -f file list used at first run, including compose.local-media.yaml for every Local datasource installation.",' \
 				'      "Open the Admin UI again and confirm the new version is running."' \
 				'    ],' \
@@ -730,6 +742,7 @@ update-manifest:
 				'      "Stop the supervised timich-agent process.",' \
 				'      "If the current install uses the default relative .local directory, copy its complete contents to a stable private directory outside bundle versions and configure absolute -config and -data-dir paths before switching.",' \
 				'      "Extract the complete new archive into a new versioned directory; timich-agent, both helpers, semantic runtime, and platform media runtimes are one release set.",' \
+				'      "For a prerelease V4 catalog, keep all writers stopped and follow the bundled V5 migration instructions, including backups and the manual database switch, before starting this Agent. Older schemas are unsupported.",' \
 				'      "Keep the original .local copy until the new service is verified, and never run old and new service processes against the shared state simultaneously.",' \
 				'      "Atomically repoint the supervisor working directory or current symlink to the new bundle, start it, and verify Agent, helper, and runtime health before removing the previous bundle."' \
 				'    ]' \

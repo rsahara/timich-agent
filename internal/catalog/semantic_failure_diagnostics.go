@@ -106,6 +106,45 @@ func (s *Service) RequestSemanticEmbeddingFailureRetry(ctx context.Context, prof
 	return s.catalog.requestSemanticEmbeddingFailureRetry(ctx, profile, sourceKeys, requestedAt.UTC())
 }
 
+// Keep durable vector/retry identity separate from the source identity shown to
+// the operator. Legacy failures remain visible until their canonical vector is
+// written. Both diagnostics and retries use exactly the same target selection.
+func semanticEmbeddingFailuresSQL(profile SemanticModelProfileStatus, sourceKeys []string) (string, []any) {
+	inputsCTE, args := canonicalSemanticInputs(sourceKeys)
+	where, whereArgs := semanticCatalogEligibilityWhere("", profile.InputKind, "a")
+	args = append(args, whereArgs...)
+	for _, key := range sourceKeys {
+		args = append(args, key)
+	}
+	args = append(args, canonicalSemanticCorpusSourceKey, strings.TrimSpace(profile.ModelID), canonicalSemanticCorpusSourceKey,
+		strings.TrimSpace(profile.ModelID), strings.TrimSpace(profile.VectorSpaceID), profile.EmbeddingDim)
+	query := inputsCTE + `, failure_assets AS (
+		SELECT a.source_key AS storage_source_key, a.upstream_asset_id AS storage_asset_id,
+			a.source_key, a.upstream_asset_id AS asset_id, a.datasource_kind, a.filename, a.media_type, a.captured_at
+		FROM catalog_assets a
+		` + where + ` AND a.source_key IN (` + strings.TrimSuffix(strings.Repeat("?,", len(sourceKeys)), ",") + `)
+			AND NOT EXISTS (
+				SELECT 1 FROM semantic_vectors canonical
+				WHERE canonical.source_key = ? AND canonical.upstream_asset_id = a.canonical_asset_id AND canonical.model_id = ?
+			)
+		UNION ALL
+		SELECT ?, input.canonical_asset_id, a.source_key, a.upstream_asset_id,
+			a.datasource_kind, a.filename, a.media_type, a.captured_at
+		FROM resolved_inputs input
+		JOIN catalog_assets a ON a.source_key = input.embedding_source_key AND a.upstream_asset_id = input.embedding_upstream_asset_id
+		WHERE input.embedding_source_key <> ''
+	)
+	SELECT f.source_key, f.datasource_kind, f.asset_id, f.filename, f.media_type, f.captured_at,
+		v.model_id, v.vector_space_id, v.status, COALESCE(v.last_error, '') AS last_error, v.generated_at,
+		COALESCE(r.requested_at, '') AS requested_at, v.source_key AS storage_source_key, v.upstream_asset_id AS storage_asset_id
+	FROM failure_assets f
+	JOIN semantic_vectors v ON v.source_key = f.storage_source_key AND v.upstream_asset_id = f.storage_asset_id
+	LEFT JOIN semantic_vector_retry_requests r
+		ON r.source_key = v.source_key AND r.upstream_asset_id = v.upstream_asset_id AND r.model_id = v.model_id
+	WHERE v.model_id = ? AND v.vector_space_id = ? AND v.embedding_dim = ? AND v.status = 'failed'`
+	return query, args
+}
+
 func (s *CatalogStore) openSemanticEmbeddingFailureDiagnostics(ctx context.Context, profile SemanticModelProfileStatus, sourceKeys []string, now time.Time) (*SemanticEmbeddingFailureDiagnostics, error) {
 	if s == nil || s.db == nil {
 		return nil, ErrCatalogNotConfigured
@@ -113,41 +152,10 @@ func (s *CatalogStore) openSemanticEmbeddingFailureDiagnostics(ctx context.Conte
 	if strings.TrimSpace(profile.ModelID) == "" || strings.TrimSpace(profile.VectorSpaceID) == "" || profile.EmbeddingDim <= 0 || len(sourceKeys) == 0 {
 		return nil, ErrSemanticModelPackInvalid
 	}
-	where, whereArgs := semanticCatalogEligibilityWhere("", profile.InputKind, "a")
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(sourceKeys)), ",")
-	args := append([]any{}, whereArgs...)
-	for _, sourceKey := range sourceKeys {
-		args = append(args, sourceKey)
-	}
-	args = append(args, strings.TrimSpace(profile.ModelID), strings.TrimSpace(profile.VectorSpaceID), profile.EmbeddingDim)
-	rows, err := s.queryDB().QueryContext(ctx, `SELECT
-			v.source_key,
-			a.datasource_kind,
-			v.upstream_asset_id,
-			a.filename,
-			a.media_type,
-			a.captured_at,
-			v.model_id,
-			v.vector_space_id,
-			v.status,
-			COALESCE(v.last_error, ''),
-			v.generated_at,
-			COALESCE(r.requested_at, '')
-		FROM semantic_vectors v
-		JOIN catalog_assets a
-			ON a.source_key = v.source_key
-			AND a.upstream_asset_id = v.upstream_asset_id
-		LEFT JOIN semantic_vector_retry_requests r
-			ON r.source_key = v.source_key
-			AND r.upstream_asset_id = v.upstream_asset_id
-			AND r.model_id = v.model_id
-		`+where+`
-			AND v.source_key IN (`+placeholders+`)
-			AND v.model_id = ?
-			AND v.vector_space_id = ?
-			AND v.embedding_dim = ?
-			AND v.status = 'failed'
-		ORDER BY v.generated_at DESC, v.source_key, v.upstream_asset_id`, args...)
+	query, args := semanticEmbeddingFailuresSQL(profile, sourceKeys)
+	rows, err := s.queryDB().QueryContext(ctx, `SELECT source_key, datasource_kind, asset_id, filename, media_type, captured_at,
+		model_id, vector_space_id, status, last_error, generated_at, requested_at
+		FROM (`+query+`) ORDER BY generated_at DESC, source_key, asset_id`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query semantic embedding failure diagnostics: %w", err)
 	}
@@ -214,27 +222,12 @@ func (s *CatalogStore) requestSemanticEmbeddingFailureRetry(ctx context.Context,
 	if strings.TrimSpace(profile.ModelID) == "" || strings.TrimSpace(profile.VectorSpaceID) == "" || profile.EmbeddingDim <= 0 || len(sourceKeys) == 0 {
 		return SemanticEmbeddingFailureRetryResult{}, ErrSemanticModelPackInvalid
 	}
-	where, whereArgs := semanticCatalogEligibilityWhere("", profile.InputKind, "a")
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(sourceKeys)), ",")
-	args := append([]any{formatCatalogTime(requestedAt.UTC())}, whereArgs...)
-	for _, sourceKey := range sourceKeys {
-		args = append(args, sourceKey)
-	}
-	args = append(args, strings.TrimSpace(profile.ModelID), strings.TrimSpace(profile.VectorSpaceID), profile.EmbeddingDim)
+	query, queryArgs := semanticEmbeddingFailuresSQL(profile, sourceKeys)
+	args := append([]any{formatCatalogTime(requestedAt.UTC())}, queryArgs...)
 	result, err := s.db.ExecContext(ctx, `INSERT INTO semantic_vector_retry_requests (
 			source_key, upstream_asset_id, model_id, requested_at
 		)
-		SELECT v.source_key, v.upstream_asset_id, v.model_id, ?
-		FROM semantic_vectors v
-		JOIN catalog_assets a
-			ON a.source_key = v.source_key
-			AND a.upstream_asset_id = v.upstream_asset_id
-		`+where+`
-			AND v.source_key IN (`+placeholders+`)
-			AND v.model_id = ?
-			AND v.vector_space_id = ?
-			AND v.embedding_dim = ?
-			AND v.status = 'failed'
+		SELECT storage_source_key, storage_asset_id, model_id, ? FROM (`+query+`) WHERE 1 = 1
 		ON CONFLICT(source_key, upstream_asset_id, model_id) DO UPDATE SET
 			requested_at = excluded.requested_at`, args...)
 	if err != nil {

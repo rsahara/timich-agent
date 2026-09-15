@@ -53,6 +53,8 @@ func TestLocalFilesystemCatalogSchemaCreatesCoreTables(t *testing.T) {
 		"semantic_index_membership_state",
 		"semantic_index_membership",
 		"catalog_assets_metadata_fts",
+		"catalog_canonical_metadata_fts",
+		"canonical_semantic_vector_inputs",
 	} {
 		var count int
 		if err := store.db.QueryRowContext(ctx,
@@ -156,6 +158,13 @@ func TestLocalFilesystemCatalogSchemaCreatesCoreTables(t *testing.T) {
 	}
 	if !hasStringPrefix(contentVerificationIndex, []string{"source_key", "status", "content_verification_attempted_at", "id"}) {
 		t.Fatalf("content verification index = %#v, want durable attempt ordering", contentVerificationIndex)
+	}
+	rootAssetStatusIndex, err := store.indexColumns(catalogLocalRootAssetStatusIndex)
+	if err != nil {
+		t.Fatalf("inspect Local root asset status index: %v", err)
+	}
+	if !reflect.DeepEqual(rootAssetStatusIndex, []string{"source_key", "root_key", "asset_id", "status"}) {
+		t.Fatalf("Local root asset status index = %#v, want root-scoped asset lookup coverage", rootAssetStatusIndex)
 	}
 	gallerySourceIndex, err := store.indexColumns(catalogGallerySourceCanonicalIndex)
 	if err != nil {
@@ -271,6 +280,40 @@ func TestCatalogStoreRestoresGallerySourceIndexForExistingCurrentSchema(t *testi
 	}
 }
 
+func TestCatalogStoreRestoresLocalRootAssetStatusIndexForExistingCurrentSchema(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	store, err := LoadOrCreateCatalogStore(dataDir)
+	if err != nil {
+		t.Fatalf("LoadOrCreateCatalogStore() error = %v", err)
+	}
+	if _, err := store.db.Exec(`DROP INDEX ` + catalogLocalRootAssetStatusIndex); err != nil {
+		_ = store.Close()
+		t.Fatalf("drop Local root asset status index: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store without Local root asset status index: %v", err)
+	}
+
+	reopened, err := LoadOrCreateCatalogStore(dataDir)
+	if err != nil {
+		t.Fatalf("reopen existing current-schema store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
+	columns, err := reopened.indexColumns(catalogLocalRootAssetStatusIndex)
+	if err != nil {
+		t.Fatalf("inspect restored Local root asset status index: %v", err)
+	}
+	if !reflect.DeepEqual(columns, []string{"source_key", "root_key", "asset_id", "status"}) {
+		t.Fatalf("restored Local root asset status index = %#v", columns)
+	}
+}
+
 func TestCatalogUsesFreshStateRootInsteadOfDevelopmentState(t *testing.T) {
 	t.Parallel()
 
@@ -380,6 +423,14 @@ func TestCatalogSearchProjectionSchemaCreationRollsBackPartialFailure(t *testing
 		filename TEXT NOT NULL,
 		place_label TEXT,
 		description TEXT
+	)`, `CREATE TABLE catalog_canonical_assets (
+		canonical_asset_id TEXT NOT NULL,
+		visibility_status TEXT NOT NULL,
+		is_favorite INTEGER NOT NULL,
+		captured_at TEXT NOT NULL,
+		filename TEXT NOT NULL,
+		place_label TEXT,
+		description TEXT
 	)`}
 	statements = append(statements, catalogSearchProjectionSchemaStatements()...)
 	statements = append(statements, `THIS IS NOT VALID SQL`)
@@ -393,6 +444,10 @@ func TestCatalogSearchProjectionSchemaCreationRollsBackPartialFailure(t *testing
 		"catalog_assets_metadata_fts_insert",
 		"catalog_assets_metadata_fts_delete",
 		"catalog_assets_metadata_fts_update",
+		"catalog_canonical_metadata_fts",
+		"catalog_canonical_metadata_fts_insert",
+		"catalog_canonical_metadata_fts_delete",
+		"catalog_canonical_metadata_fts_update",
 	} {
 		var count int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = ?`, name).Scan(&count); err != nil {
@@ -608,8 +663,8 @@ func TestCatalogStoreRejectsPreviousSchemaVersion(t *testing.T) {
 
 	if _, err := LoadOrCreateCatalogStore(dataDir); !errors.Is(err, ErrCatalogSchemaResetRequired) {
 		t.Fatalf("LoadOrCreateCatalogStore() error = %v, want ErrCatalogSchemaResetRequired", err)
-	} else if !strings.Contains(err.Error(), "found schema version 1") || !strings.Contains(err.Error(), "want version 3") {
-		t.Fatalf("reset-required error = %q, want explicit V1 to V3 rebuild guidance", err)
+	} else if !strings.Contains(err.Error(), "found schema version 1") || !strings.Contains(err.Error(), fmt.Sprintf("want version %d", catalogSchemaVersion)) {
+		t.Fatalf("reset-required error = %q, want explicit V1 to current schema rebuild guidance", err)
 	}
 }
 
@@ -642,7 +697,7 @@ func TestCatalogStoreRejectsV1WithoutApplicationID(t *testing.T) {
 	}
 }
 
-func TestCatalogStoreRejectsV3WithoutRootWorkGeneration(t *testing.T) {
+func TestCatalogStoreRejectsCurrentSchemaWithoutRootWorkGeneration(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
@@ -652,7 +707,7 @@ func TestCatalogStoreRejectsV3WithoutRootWorkGeneration(t *testing.T) {
 	}
 	db, err := sql.Open("sqlite", filepath.Join(dbDir, catalogDatabaseName))
 	if err != nil {
-		t.Fatalf("open V3 db without root work generation: %v", err)
+		t.Fatalf("open current db without root work generation: %v", err)
 	}
 	if _, err := db.Exec(`CREATE TABLE local_scan_root_state (
 		source_key TEXT NOT NULL,
@@ -687,16 +742,20 @@ func TestCatalogStoreRejectsV3WithoutRootWorkGeneration(t *testing.T) {
 		_ = db.Close()
 		t.Fatalf("create current gallery generation state: %v", err)
 	}
+	if _, err := db.Exec(galleryProjectionTableSQL); err != nil {
+		_ = db.Close()
+		t.Fatalf("create current Gallery storage: %v", err)
+	}
 	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, catalogSchemaVersion)); err != nil {
 		_ = db.Close()
-		t.Fatalf("seed V3 schema version: %v", err)
+		t.Fatalf("seed current schema version: %v", err)
 	}
 	if _, err := db.Exec(fmt.Sprintf(`PRAGMA application_id = %d`, catalogApplicationID)); err != nil {
 		_ = db.Close()
 		t.Fatalf("seed catalog application ID: %v", err)
 	}
 	if err := db.Close(); err != nil {
-		t.Fatalf("close V3 db without root work generation: %v", err)
+		t.Fatalf("close current db without root work generation: %v", err)
 	}
 
 	if _, err := LoadOrCreateCatalogStore(dataDir); !errors.Is(err, ErrCatalogSchemaResetRequired) {
