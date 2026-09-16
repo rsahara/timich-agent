@@ -84,7 +84,7 @@ func (s *Service) searchCatalogSemanticAssets(ctx context.Context, normalized no
 	directStatusSeen := false
 	directStatusAllReady := true
 	directStatusStarted := time.Now()
-	sourceKeys := s.semanticDatasourceSourceKeys()
+	sourceKeys := s.semanticSearchCorpusSourceKeys(ctx, profile)
 	semantic = baseCatalogSemanticStatus(profile)
 	directStatusSeen = false
 	directStatusAllReady = true
@@ -468,7 +468,7 @@ func (s *Service) catalogSemanticStatusForProfile(ctx context.Context, profile s
 	if profile == nil {
 		return status
 	}
-	sourceKeys := s.semanticDatasourceSourceKeys()
+	sourceKeys := s.semanticSearchCorpusSourceKeys(ctx, profile)
 	if len(sourceKeys) == 0 {
 		return normalizeCatalogSemanticStatus(status, profile)
 	}
@@ -499,6 +499,13 @@ func (s *Service) catalogSemanticStatusForProfile(ctx context.Context, profile s
 		status.Status = "backfilling"
 	}
 	return normalizeCatalogSemanticStatus(status, profile)
+}
+
+func (s *Service) semanticSearchCorpusSourceKeys(ctx context.Context, profile semanticEmbeddingProfile) []string {
+	if s != nil && s.catalog != nil && s.catalog.canonicalSemanticCorpusExists(ctx, profile) {
+		return []string{canonicalSemanticCorpusSourceKey}
+	}
+	return s.semanticDatasourceSourceKeys()
 }
 
 func baseCatalogSemanticStatus(profile semanticEmbeddingProfile) CatalogSemanticStatus {
@@ -538,6 +545,9 @@ func (s *Service) catalogSemanticMetadataMatchKeys(ctx context.Context, normaliz
 	query := strings.TrimSpace(normalized.Request.Collection.Query.Text)
 	if query == "" || len(scored) == 0 {
 		return nil, nil
+	}
+	if scored[0].Asset.SourceKey == canonicalSemanticCorpusSourceKey {
+		return s.catalogSemanticCanonicalMetadataMatchKeys(ctx, normalized, query, scored)
 	}
 	keys := map[string]struct{}{}
 	const chunkSize = 200
@@ -580,6 +590,52 @@ func (s *Service) catalogSemanticMetadataMatchKeys(ctx context.Context, normaliz
 		}
 		if err := rows.Close(); err != nil {
 			return nil, fmt.Errorf("close catalog semantic metadata matches: %w", err)
+		}
+	}
+	return keys, nil
+}
+
+func (s *Service) catalogSemanticCanonicalMetadataMatchKeys(ctx context.Context, normalized normalizedAssetSearch, query string, scored []semanticScoredAsset) (map[string]struct{}, error) {
+	keys := map[string]struct{}{}
+	const chunkSize = 200
+	for start := 0; start < len(scored); start += chunkSize {
+		end := min(start+chunkSize, len(scored))
+		var builder strings.Builder
+		builder.WriteString(`WITH candidates(canonical_asset_id) AS (VALUES `)
+		args := make([]any, 0, end-start+8)
+		for index, candidate := range scored[start:end] {
+			if index > 0 {
+				builder.WriteString(",")
+			}
+			builder.WriteString("(?)")
+			args = append(args, candidate.Asset.ID)
+		}
+		where, whereArgs := catalogSemanticMetadataWhere(normalized, query, "c")
+		args = append(args, whereArgs...)
+		builder.WriteString(`)
+			SELECT c.canonical_asset_id
+			FROM candidates candidate
+			JOIN catalog_canonical_assets c
+				ON c.canonical_asset_id = candidate.canonical_asset_id `)
+		builder.WriteString(where)
+		rows, err := s.catalog.queryDB().QueryContext(ctx, builder.String(), args...)
+		if err != nil {
+			return nil, fmt.Errorf("query canonical semantic candidate metadata matches: %w", err)
+		}
+		for rows.Next() {
+			var canonicalAssetID string
+			if err := rows.Scan(&canonicalAssetID); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("scan canonical semantic metadata match: %w", err)
+			}
+			keys[semanticCatalogAssetKey(canonicalSemanticCorpusSourceKey, canonicalAssetID)] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("iterate canonical semantic metadata matches: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close canonical semantic metadata matches: %w", err)
 		}
 	}
 	return keys, nil
@@ -643,6 +699,9 @@ func (s *Service) catalogSemanticMetadataCandidateRefs(
 	query string,
 	header semanticBinaryIndexHeader,
 ) ([]catalogSemanticMetadataCandidateRef, error) {
+	if header.SourceKey == canonicalSemanticCorpusSourceKey {
+		return s.catalogSemanticCanonicalMetadataCandidateRefs(ctx, normalized, query, header)
+	}
 	if len([]rune(query)) < 3 {
 		return s.catalogSemanticShortMetadataCandidateRefs(ctx, normalized, query, header)
 	}
@@ -712,6 +771,79 @@ func (s *Service) catalogSemanticMetadataCandidateRefs(
 	return scanCatalogSemanticMetadataCandidateRefs(rows)
 }
 
+func (s *Service) catalogSemanticCanonicalMetadataCandidateRefs(
+	ctx context.Context,
+	normalized normalizedAssetSearch,
+	query string,
+	header semanticBinaryIndexHeader,
+) ([]catalogSemanticMetadataCandidateRef, error) {
+	if len([]rune(query)) < 3 {
+		return s.catalogSemanticCanonicalShortMetadataCandidateRefs(ctx, normalized, query, header)
+	}
+	textWhere, textFilterArgs := catalogSemanticMetadataFilterWhere(normalized, "c")
+	favoriteWhere, favoriteFilterArgs := catalogSemanticMetadataFilterWhere(normalized, "fav")
+	args := append([]any{}, textFilterArgs...)
+	args = append(args,
+		catalogSemanticFTSQuery(query),
+		header.SourceKey,
+		header.ModelID,
+		header.VectorSpaceID,
+		header.AssetGeneration,
+		semanticSearchVisitBudget,
+	)
+	args = append(args, favoriteFilterArgs...)
+	args = append(args,
+		header.SourceKey,
+		header.ModelID,
+		header.VectorSpaceID,
+		header.AssetGeneration,
+		boolToSQLiteInt(semanticFavoriteQuery(query)),
+		semanticSearchVisitBudget,
+		semanticSearchVisitBudget,
+	)
+	rows, err := s.catalog.queryDB().QueryContext(ctx, `WITH
+		text_rows(asset_id, ordinal) AS (
+			SELECT c.canonical_asset_id, tm.ordinal
+			FROM catalog_canonical_metadata_fts
+			JOIN catalog_canonical_assets c ON c.rowid = catalog_canonical_metadata_fts.rowid
+			JOIN semantic_index_membership tm
+				ON tm.upstream_asset_id = c.canonical_asset_id
+			`+textWhere+`
+				AND catalog_canonical_metadata_fts MATCH ?
+				AND tm.source_key = ?
+				AND tm.model_id = ?
+				AND tm.vector_space_id = ?
+				AND tm.asset_generation = ?
+			LIMIT ?
+		),
+		favorite_rows(asset_id, ordinal) AS (
+			SELECT fav.canonical_asset_id, fm.ordinal
+			FROM catalog_canonical_assets fav INDEXED BY idx_catalog_canonical_metadata_favorite
+			JOIN semantic_index_membership fm
+				ON fm.upstream_asset_id = fav.canonical_asset_id
+			`+favoriteWhere+`
+				AND fm.source_key = ?
+				AND fm.model_id = ?
+				AND fm.vector_space_id = ?
+				AND fm.asset_generation = ?
+				AND fav.is_favorite = 1
+				AND ? = 1
+			LIMIT ?
+		),
+		metadata_rows(asset_id, ordinal) AS (
+			SELECT asset_id, ordinal FROM text_rows
+			UNION
+			SELECT asset_id, ordinal FROM favorite_rows
+		)
+		SELECT asset_id, ordinal
+		FROM metadata_rows
+		LIMIT ?`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query canonical semantic metadata candidates: %w", err)
+	}
+	return scanCatalogSemanticMetadataCandidateRefs(rows)
+}
+
 func (s *Service) catalogSemanticShortMetadataCandidateRefs(
 	ctx context.Context,
 	normalized normalizedAssetSearch,
@@ -740,6 +872,37 @@ func (s *Service) catalogSemanticShortMetadataCandidateRefs(
 		LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query short catalog semantic metadata candidates: %w", err)
+	}
+	return scanCatalogSemanticMetadataCandidateRefs(rows)
+}
+
+func (s *Service) catalogSemanticCanonicalShortMetadataCandidateRefs(
+	ctx context.Context,
+	normalized normalizedAssetSearch,
+	query string,
+	header semanticBinaryIndexHeader,
+) ([]catalogSemanticMetadataCandidateRef, error) {
+	where, filterArgs := catalogSemanticMetadataWhere(normalized, query, "c")
+	args := append([]any{}, filterArgs...)
+	args = append(args,
+		header.SourceKey,
+		header.ModelID,
+		header.VectorSpaceID,
+		header.AssetGeneration,
+		semanticSearchVisitBudget,
+	)
+	rows, err := s.catalog.queryDB().QueryContext(ctx, `SELECT c.canonical_asset_id, m.ordinal
+		FROM catalog_canonical_assets c
+		JOIN semantic_index_membership m
+			ON m.upstream_asset_id = c.canonical_asset_id
+		`+where+`
+			AND m.source_key = ?
+			AND m.model_id = ?
+			AND m.vector_space_id = ?
+			AND m.asset_generation = ?
+		LIMIT ?`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query short canonical semantic metadata candidates: %w", err)
 	}
 	return scanCatalogSemanticMetadataCandidateRefs(rows)
 }

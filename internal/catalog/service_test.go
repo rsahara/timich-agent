@@ -3265,26 +3265,47 @@ func TestCatalogSemanticCandidateBackfillStatusCountsActiveAssets(t *testing.T) 
 	}
 
 	nowText := formatCatalogTime(time.Now().UTC())
+	canonicalAssetID := func(assetID string) string {
+		t.Helper()
+		var canonicalAssetID string
+		if err := service.catalog.db.QueryRowContext(ctx, `SELECT canonical_asset_id
+			FROM catalog_assets WHERE source_key = ? AND upstream_asset_id = ?`, sourceKey, assetID).Scan(&canonicalAssetID); err != nil {
+			t.Fatalf("read canonical asset ID for %q: %v", assetID, err)
+		}
+		return canonicalAssetID
+	}
 	insertVector := func(assetID string, vector []float32) {
 		t.Helper()
-		insertSemanticVectorForTest(t,
+		insertCanonicalSemanticVectorForTest(t,
 			service.catalog,
 			ctx,
+			canonicalAssetID(assetID),
 			sourceKey,
 			assetID,
 			candidate.ModelID,
 			candidate.VectorSpaceID,
 			candidate.EmbeddingDim,
 			vector,
-			"test",
-			"ready",
-			nil,
+			"immich_preview",
 			nowText,
-			nil,
 		)
 	}
 	insertVector("asset-new", []float32{1, 0, 0, 0})
-	insertVector("asset-old-out-of-scope", []float32{0, 0, 1, 0})
+	insertSemanticVectorForTest(t,
+		service.catalog,
+		ctx,
+		canonicalSemanticCorpusSourceKey,
+		"canonical-old-out-of-scope",
+		candidate.ModelID,
+		candidate.VectorSpaceID,
+		candidate.EmbeddingDim,
+		[]float32{0, 0, 1, 0},
+		"immich_preview",
+		"ready",
+		nil,
+		nowText,
+		nil,
+	)
 
 	status, err = service.SemanticModelBackfillStatus(ctx, candidate)
 	if err != nil {
@@ -3309,9 +3330,24 @@ func TestCatalogSemanticCandidateBackfillStatusCountsActiveAssets(t *testing.T) 
 		completed_vector_count, indexed_vector_count, asset_generation, indexed_generation,
 		built_at, last_error, updated_at
 	) VALUES (?, ?, ?, 'ready', ?, 2, 2, 0, 0, ?, NULL, ?)`,
-		sourceKey, candidate.ModelID, candidate.VectorSpaceID, candidate.EmbeddingDim, nowText, nowText); err != nil {
+		canonicalSemanticCorpusSourceKey, candidate.ModelID, candidate.VectorSpaceID, candidate.EmbeddingDim, nowText, nowText); err != nil {
 		t.Fatalf("insert published candidate semantic state: %v", err)
 	}
+	// Configured-source coverage comes from the published generation's members,
+	// not only its global summary count.
+	if _, err := service.catalog.db.ExecContext(ctx, `INSERT INTO semantic_index_membership_state
+		(source_key, model_id, vector_space_id, asset_generation, binary_sha256, binary_size_bytes, node_count, built_at)
+		VALUES (?, ?, ?, 0, ?, 1, 2, ?)`, canonicalSemanticCorpusSourceKey, candidate.ModelID, candidate.VectorSpaceID, strings.Repeat("0", 64), nowText); err != nil {
+		t.Fatal(err)
+	}
+	for ordinal, assetID := range []string{"asset-new", "asset-beach"} {
+		if _, err := service.catalog.db.ExecContext(ctx, `INSERT INTO semantic_index_membership
+			(source_key, model_id, vector_space_id, asset_generation, upstream_asset_id, ordinal)
+			VALUES (?, ?, ?, 0, ?, ?)`, canonicalSemanticCorpusSourceKey, candidate.ModelID, candidate.VectorSpaceID, canonicalAssetID(assetID), ordinal); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	status, err = service.SemanticModelBackfillStatus(ctx, candidate)
 	if err != nil {
 		t.Fatalf("SemanticModelBackfillStatus() after hnsw error = %v", err)

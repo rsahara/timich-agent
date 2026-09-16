@@ -301,11 +301,16 @@ func (a *AgentRuntime) nextBackgroundWorkerAssignment(ctx context.Context, avail
 	metadataDeferred := a.localBackgroundWorkerRetryDeferred("metadata", now)
 	thumbnailDeferred := a.localBackgroundWorkerRetryDeferred("thumbnails", now)
 	contentVerificationDeferred := a.localBackgroundWorkerRetryDeferred("content_verification", now)
+	// Metadata ingestion establishes duplicate identities before embeddings.
+	// Even a very large semantic backlog must not compete with that work. Check
+	// active metadata assignments too: their jobs have left the queued counters.
+	// Once metadata drains, thumbnails and semantic work may run together.
+	semanticIngestionReady := a.semanticIngestionWaitReason(state) == ""
 	singleWorkerSchedule := semanticSingleWorkerSchedule(schedule)
 	if singleWorkerSchedule.Workers <= 0 {
 		singleWorkerSchedule.Workers = 1
 	}
-	if !semanticActive && !semanticPublishDeferred && state.SemanticPriorityPublishReady {
+	if semanticIngestionReady && !semanticActive && !semanticPublishDeferred && state.SemanticPriorityPublishReady {
 		return backgroundWorkerAssignment{
 			phase:   "search_index",
 			workers: 1,
@@ -321,10 +326,10 @@ func (a *AgentRuntime) nextBackgroundWorkerAssignment(ctx context.Context, avail
 	if thumbnailDeferred {
 		mixedState.ThumbnailQueued = 0
 	}
-	if assignment, ok := a.mixedBackgroundWorkerAssignment(availableWorkers, !semanticActive && semanticScheduled && !semanticEmbeddingDeferred, singleWorkerSchedule, mixedState); ok {
+	if assignment, ok := a.mixedBackgroundWorkerAssignment(availableWorkers, semanticIngestionReady && !semanticActive && semanticScheduled && !semanticEmbeddingDeferred, singleWorkerSchedule, mixedState); ok {
 		return assignment, true
 	}
-	if !semanticActive && semanticScheduled && !semanticEmbeddingDeferred && state.SemanticEmbeddingReady {
+	if semanticIngestionReady && !semanticActive && semanticScheduled && !semanticEmbeddingDeferred && state.SemanticEmbeddingReady {
 		batchSize := max(state.SemanticEmbeddingBatchSize, 0)
 		return backgroundWorkerAssignment{
 			phase:   "embeddings",
@@ -340,7 +345,7 @@ func (a *AgentRuntime) nextBackgroundWorkerAssignment(ctx context.Context, avail
 			},
 		}, true
 	}
-	if !semanticActive && !semanticPublishDeferred && state.SemanticPublishReady {
+	if semanticIngestionReady && !semanticActive && !semanticPublishDeferred && state.SemanticPublishReady {
 		return backgroundWorkerAssignment{
 			phase:   "search_index",
 			workers: 1,
@@ -524,6 +529,10 @@ func (a *AgentRuntime) launchBackgroundWorkerAssignment(ctx context.Context, ass
 	}
 	if (assignment.phase == "embeddings" || assignment.phase == "search_index") &&
 		(a.backgroundWorkerActive["embeddings"] > 0 || a.backgroundWorkerActive["search_index"] > 0) {
+		return false
+	}
+	if (assignment.phase == "embeddings" || assignment.phase == "search_index") &&
+		a.backgroundWorkerActive["metadata"] > 0 {
 		return false
 	}
 	total := 0
@@ -771,9 +780,8 @@ func (a *AgentRuntime) runScheduledSemanticIndexPublish(ctx context.Context, sch
 		a.schedulerWorkStateMarkDirty()
 		return false
 	}
-	// PublishNextSemanticIndexJob returns one datasource status. Recount the
-	// aggregate before scheduling again so another source's eligible job is not
-	// hidden by this source reaching ready.
+	// Publication returns progress for the configured canonical corpus. Refresh
+	// scheduler work after activation before making the next scheduling decision.
 	a.schedulerWorkStateMarkDirty()
 	a.setSemanticPublishRetryNotBefore(nil)
 	a.rememberSemanticIndexingProgressSnapshot(catalogService, []catalog.SemanticBackfillSource{{

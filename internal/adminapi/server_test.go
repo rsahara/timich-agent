@@ -458,10 +458,12 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 		t.Fatalf("dashboard body is missing datasource indexing API calls: %s", recorder.Body.String())
 	}
 	if !bytes.Contains(body, []byte(`data-datasource-task-action="requeue-metadata"`)) ||
-		!bytes.Contains(body, []byte("moves failed metadata jobs back to the queue")) ||
+		!bytes.Contains(body, []byte(">Repair metadata</button>")) ||
+		!bytes.Contains(body, []byte("options.hasLocalDatasource && !datasourceTaskActionPendingForPhase(phase)")) ||
+		!bytes.Contains(body, []byte("moves failed jobs and videos with missing duration back to the queue")) ||
 		!bytes.Contains(body, []byte("Processing starts after settling when a worker is available")) ||
 		!bytes.Contains(body, []byte("/v1/datasources/local/metadata/repair")) {
-		t.Fatalf("dashboard body is missing failed metadata requeue control and explanation: %s", recorder.Body.String())
+		t.Fatalf("dashboard body is missing metadata repair control and explanation: %s", recorder.Body.String())
 	}
 	if !bytes.Contains(body, []byte("Requeue failed")) ||
 		!bytes.Contains(body, []byte("moves failed thumbnails back to the queue")) ||

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -10,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rsahara/timich-agent/internal/catalog"
 	"github.com/rsahara/timich-agent/internal/config"
 )
 
@@ -65,63 +63,22 @@ func TestRunCLIVersionJSON(t *testing.T) {
 	}
 }
 
-func TestRunCLIPreReleaseCatalogMigrationRequiresOfflineConfirmation(t *testing.T) {
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	if err := runCLI([]string{
-		"pre-release-migrate-catalog-v2-v3",
-		"--data-dir", "/data",
-	}, &stdout, &stderr); err == nil {
-		t.Fatal("runCLI() error = nil, want offline confirmation")
-	}
-}
-
-func TestRunCLIPreReleaseCatalogMigrationWritesVersionedJSON(t *testing.T) {
-	originalMigrate := migratePreReleaseCatalog
-	originalVersion := version
-	originalCommit := commit
-	migratePreReleaseCatalog = func(_ context.Context, dataDir string, backupPath string) (catalog.CatalogPreReleaseMigrationResult, error) {
-		if dataDir != "/data" || backupPath != "/backup/catalog-v2.db" {
-			t.Fatalf("migration args = %q %q", dataDir, backupPath)
-		}
-		return catalog.CatalogPreReleaseMigrationResult{
-			FromVersion:                 2,
-			ToVersion:                   3,
-			BackupPath:                  backupPath,
-			CatalogAssetCount:           300000,
-			ActiveSemanticManifestCount: 1,
-			SemanticMembershipCount:     96300,
-		}, nil
-	}
-	version = "0.4.0"
-	commit = "test-migration-commit"
-	t.Cleanup(func() {
-		migratePreReleaseCatalog = originalMigrate
-		version = originalVersion
-		commit = originalCommit
-	})
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	if err := runCLI([]string{
-		"pre-release-migrate-catalog-v2-v3",
-		"--data-dir", "/data",
-		"--backup", "/backup/catalog-v2.db",
-		"--confirm-agent-stopped",
-	}, &stdout, &stderr); err != nil {
-		t.Fatalf("runCLI() error = %v stderr=%s", err, stderr.String())
-	}
-	var result struct {
-		catalog.CatalogPreReleaseMigrationResult
-		AgentVersion string `json:"agentVersion"`
-		AgentCommit  string `json:"agentCommit"`
-	}
-	if err := json.NewDecoder(bytes.NewReader(stdout.Bytes())).Decode(&result); err != nil {
-		t.Fatalf("decode migration result: %v", err)
-	}
-	if result.ToVersion != 3 || result.SemanticMembershipCount != 96300 ||
-		result.AgentVersion != "0.4.0" || result.AgentCommit != "test-migration-commit" {
-		t.Fatalf("migration result = %#v", result)
+func TestRunCLIRejectsUnsupportedCommandsBeforeLoadingConfig(t *testing.T) {
+	for _, command := range []string{"pre-release-migrate-catalog-v3-v4", "unknown-command"} {
+		t.Run(command, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), "must-not-create")
+			var stdout, stderr bytes.Buffer
+			err := runCLI([]string{command, "--data-dir", stateDir, "--confirm-agent-stopped"}, &stdout, &stderr)
+			if err == nil || !strings.Contains(err.Error(), "unexpected argument") {
+				t.Fatalf("runCLI() error = %v, want command rejection before configuration or startup", err)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("unsupported command wrote stdout: %s", stdout.String())
+			}
+			if _, err := os.Stat(stateDir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unsupported command created state: %v", err)
+			}
+		})
 	}
 }
 

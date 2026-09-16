@@ -181,7 +181,14 @@ First-run setup in the Admin UI:
    `immich_default` network, use `http://immich_server:2283`.
 3. Indexed modes only: run media discovery, then install and activate a model
    from Semantic Models. Background vector indexing continues through
-   Datasource Tasks. Immich Passthrough uses Immich's existing search index and
+   Datasource Tasks. Embeddings and search-index updates wait for discovery and
+   pending Local metadata to finish, so browsing preparation takes priority.
+   After metadata finishes, thumbnails and embeddings can progress together.
+   When a photo or video exists in both Local and Immich, embedding waits for
+   the Local preview instead of processing both copies in sequence. An existing
+   published search index stays available while waiting. A failed Local preview
+   delays that item's new embedding, not other ready items.
+   Immich Passthrough uses Immich's existing search index and
    does not require these local indexing steps. If Embeddings reports failed
    items, download the failure details from that task row before repairing or
    replacing the source media. Failed items remain browsable but are excluded
@@ -318,12 +325,13 @@ The media helper uses backend tools such as bundle-local
 `media-runtime/libvips/bin/vips` and `media-runtime/ffmpeg/bin/ffmpeg` when
 present. If the bundle does not include them, install host `vips`/`ffmpeg`
 executables and set `TIMICH_AGENT_VIPS_PATH` or `TIMICH_AGENT_FFMPEG_PATH` only
-when they are not on `PATH`. HEIC/HEIF thumbnail generation needs libvips with
-HEIF support. Without libvips, local image thumbnails remain pending or failed
-until the helper can use an image backend. Without ffmpeg, local videos remain
-registered but poster thumbnails are skipped until the helper can use an ffmpeg
-backend. The Admin UI and `/status` response run a short ffmpeg preflight
-against a generated JPEG fixture and show the detected version, common video
+when they are not on `PATH`. When `TIMICH_AGENT_FFMPEG_PATH` is set, the helper
+also discovers `ffprobe` in the same directory. HEIC/HEIF thumbnail generation
+needs libvips with HEIF support. Without libvips, local image thumbnails remain
+pending or failed until the helper can use an image backend. Without ffmpeg,
+local videos remain registered but poster thumbnails are skipped until the
+helper can use an ffmpeg backend. The Admin UI and `/status` response run a
+short ffmpeg preflight against a generated JPEG fixture and show the detected version, common video
 decoders, poster-smoke status, and last error when the helper is present but not
 usable.
 
@@ -348,19 +356,32 @@ published with that release. Semantic-enabled prereleases include a
 model pack and platform runtime pack from that registry when semantic search is
 enabled.
 
-### One-Time Pre-Release V2 Catalog Migration
+### Pre-Release Catalog Migration
 
-This step applies only to a development or prerelease installation explicitly
-known to have catalog schema V2. Fresh installations and released schemas must
-skip it. Normal Agent startup intentionally does not migrate V2. The maintenance
-command is part of the same versioned `timich-agent` binary as the new service,
-requires an explicit stopped-Agent confirmation, refuses schemas other than V2
-or the already-current V3, and creates the requested backup with exclusive
-creation before changing the database.
+This build uses unreleased catalog schema V5. Fresh installations need no
+migration. A V4 catalog requires an explicit offline migration: normal startup
+refuses it without resetting or automatically upgrading its data. Do not delete
+the catalog to resolve this error.
 
-For the release-bundle Docker Compose path, stop and remove the old Agent, put
-the new bundle files in place, build the new image without starting it, and run
-the migration against the existing state volume:
+The versioned `timich-agent pre-release-migrate-catalog-v4-v5` command reads an
+existing V4 database and creates a **separate V5 output file**. It never switches
+the running database or overwrites an existing output. V5 clusters Mixed/Local
+Gallery rows by capture time and canonical ID, retaining a narrow position-seek
+index; source selection, API ordering,
+thumbnails, embeddings and published semantic indexes are retained. The command
+copies committed SQLite WAL contents, verifies every Gallery field (including
+NULLs), rebuilds day counts, and runs integrity and foreign-key checks. A file
+whose version or Gallery layout is unexpected is refused.
+
+Before a cutover, stop the Agent and all other database writers, including
+automatic restarts. Retain a consistent backup of the complete state and
+configuration, including Admin state and external semantic payloads, plus the
+previous bundle/image. Allow space for a complete database copy, temporary
+Gallery tables and a rollback journal in addition to the backups. Use a private
+directory on the data volume, not a small RAM-backed temporary filesystem.
+
+For a Docker Compose bundle, keep the same override file list, stop the old
+Agent, and build the new image without starting the service:
 
 ```bash
 compose_args=(-f compose.yaml -f compose.immich-network.yaml)
@@ -373,35 +394,50 @@ docker compose "${compose_args[@]}" down
 docker compose "${compose_args[@]}" build timich-agent
 docker compose "${compose_args[@]}" run --rm --no-deps \
   --entrypoint /usr/local/bin/timich-agent timich-agent \
-  pre-release-migrate-catalog-v2-v3 \
-  --data-dir /var/lib/timich-agent/state \
-  --backup /var/lib/timich-agent/backups/catalog-v2-before-v3.db \
+  pre-release-migrate-catalog-v4-v5 \
+  --source /var/lib/timich-agent/state/catalog-state-v1/catalog.db \
+  --output /var/lib/timich-agent/state/catalog-state-v1/catalog-v5.db \
   --confirm-agent-stopped
 ```
 
-The successful JSON result identifies the exact Agent version and commit and
-reports `fromVersion: 2`, `toVersion: 3`, the preserved asset count, active
-semantic manifest count, and reconstructed membership count. Keep the backup
-and the previous bundle until Gallery browsing and semantic search have both
-been verified. Then start the new Agent with the same Compose file list:
+For a stopped native service, use the exact catalog location under the
+configured data directory:
 
 ```bash
-docker compose "${compose_args[@]}" up -d
-docker compose "${compose_args[@]}" logs -f
-```
-
-For a stopped native service, run the same command from the new versioned
-bundle before starting it, using the exact data directory configured in the
-supervisor:
-
-```bash
-state_root=/var/lib/timich-agent
-install -d -m 0700 "$state_root/backups"
-./timich-agent pre-release-migrate-catalog-v2-v3 \
-  --data-dir "$state_root/state" \
-  --backup "$state_root/backups/catalog-v2-before-v3.db" \
+./timich-agent pre-release-migrate-catalog-v4-v5 \
+  --source /var/lib/timich-agent/state/catalog-state-v1/catalog.db \
+  --output /var/lib/timich-agent/state/catalog-state-v1/catalog-v5.db \
   --confirm-agent-stopped
 ```
+
+Success reports `fromVersion: 4`, `toVersion: 5`, `galleryRows`, `outputPath`,
+and the exact Agent version/commit. The output is a standalone database with no
+required WAL/SHM sidecars. While writers remain stopped, validate representative
+pages and retain the V4 backup before manually installing the output at the
+configured catalog path. Checkpoint and close all old database connections
+before switching; never apply old `-wal`/`-shm` files to the new database. Do not
+start the new Agent before this manual switch. Then verify Gallery, Tasks,
+source fallback and semantic search before restoring background work.
+
+The tool does not migrate Admin state or relocate external payloads; keep them
+in place. It does not run discovery, rehash media, regenerate embeddings or
+`VACUUM` the entire database. Unused pages remain available for reuse, so the
+migrated file need not immediately shrink. Cancellation observed before
+publication, or validation failure, does not publish an output. After a forced process kill, a private
+`.timich-gallery-v5-*` staging directory may remain beside the requested output;
+inspect that exact directory before removing it. A reported publication/sync
+error may leave the output present: preserve and inspect it rather than retrying
+over it. Roll back before new writes by restoring the matching old database and
+bundle; after new writes, a rollback needs a separate data-preservation decision.
+
+V4-to-V5 is the only offline catalog migration in this build. Older prerelease
+schemas are not supported; keep their backups rather than treating them as V4.
+Normal startup accepts only V5 or a fresh database and never runs migration.
+Current-format recovery remains enabled: if membership for a valid published
+semantic index is missing, V5 startup restores that derived mapping from the
+index file without regenerating embeddings.
+
+### Regular Updates After Migration
 
 For Docker Compose installs, use the same compose file list you used before.
 For the common Immich Docker path, build that list once and include the Local
@@ -486,12 +522,15 @@ Search, Devices, and System tabs. It currently covers:
   are overlaid on the last durable values, and running state is not restored
   from persisted snapshots after an agent restart. Until completion totals are
   available, the Tasks view omits `done` instead of presenting an unknown count
-  as zero. An infrequent repair recount runs only after background queues drain
-  and is canceled when Gallery or search activity arrives. Indexed-only Agents
-  without local or semantic background work can repair the snapshot without a
-  scheduler cache. Successful scheduled Immich syncs update the same snapshot
-  immediately instead of waiting for that recount, and block repair admission
-  while their ingestion work is active.
+  as zero. Quick discovery, mirror sync, and semantic progress updates preserve
+  the counts owned by unrelated task phases. An infrequent repair recount runs
+  after background queues drain, or while heavyweight workers are explicitly
+  paused because their queues cannot drain, and is canceled when Gallery or
+  search activity arrives. Indexed-only Agents without local or semantic
+  background work can repair the snapshot without a scheduler cache. Successful
+  scheduled Immich syncs update the same snapshot immediately instead of waiting
+  for that recount, and block repair admission while their ingestion work is
+  active.
 - manual reconciliation, plus failed metadata and thumbnail requeue for
   local filesystem datasources. Media discovery is single-flight; the UI disables
   the action while a run is active. Requeue actions move failed work back to the
@@ -516,7 +555,23 @@ Search, Devices, and System tabs. It currently covers:
 - remote browsing checks
 - agent restart
 
-Local filesystem maintenance uses three complementary scans:
+Local filesystem maintenance includes metadata repair and three complementary scans.
+
+Local images and videos use embedded capture dates when available, then the
+primary file's modification time, then scan time. Dates without an embedded
+timezone use the Agent `timezone` setting (the process/container timezone when
+unset). Filenames are not used to infer dates.
+
+After upgrading the Agent and media helper, use **Tasks → Metadata → Repair
+metadata** to check capture dates for existing media. This also repairs failed
+metadata and missing video durations. Date-only refresh preserves asset IDs,
+thumbnails and embeddings and avoids re-hashing unchanged files. Enable at least
+one heavyweight worker to process the queue. Successful checks are remembered,
+including files without a capture date, so repeating repair skips completed
+checks. Interrupted work resumes after restart; do not delete the catalog or
+repair thumbnails to update dates.
+
+The scans are:
 
 - **Quick discovery** runs every five minutes by default. It traverses the
   directory tree but inspects files only in new directories or directories
@@ -605,6 +660,14 @@ Admin API:
 - `GET http://AGENT_LAN_HOST:8081/v1/datasources/embeddings/failures.csv`
 - `POST http://AGENT_LAN_HOST:8081/v1/datasources/embeddings/retry-failed`
 - `POST http://AGENT_LAN_HOST:8081/v1/datasources/local/metadata/repair`
+  - Requeues failed Local metadata jobs and active Local videos whose duration
+    is still missing. The JSON response separates `failedQueued`,
+    `videoDurationQueued`, and `videoDurationSkipped`; workers process queued
+    items asynchronously. The queued categories are disjoint, so a failed job
+    for a missing-duration video is counted only as duration work. Skipped
+    videos indicate unavailable inspection capability; their failed jobs remain
+    failed instead of entering a guaranteed retry loop, without blocking repair
+    of unrelated failed metadata.
 - `POST http://AGENT_LAN_HOST:8081/v1/datasources/local/thumbnails/repair`
 - `POST http://AGENT_LAN_HOST:8081/v1/datasources/local/embeddings/repair`
 - `GET http://AGENT_LAN_HOST:8081/v1/workers`
@@ -651,6 +714,7 @@ Media API:
 - `POST http://AGENT_LAN_HOST:8082/v1/nearby-links/{linkID}/cancel`
 - `POST http://AGENT_LAN_HOST:8082/v1/nearby-links/{linkID}/poll`
 - `POST http://AGENT_LAN_HOST:8082/v1/pairing/redeem`
+- `GET http://AGENT_LAN_HOST:8082/v1/session/validate`
 - `POST http://AGENT_LAN_HOST:8082/v1/session/refresh`
 - `POST http://AGENT_LAN_HOST:8082/v1/assets/search`
 - `GET http://AGENT_LAN_HOST:8082/v1/assets/search/capabilities`

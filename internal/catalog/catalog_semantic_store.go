@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -42,6 +43,13 @@ const (
 type semanticAsset struct {
 	SourceKey                string
 	ID                       string
+	EmbeddingSourceKey       string
+	EmbeddingUpstreamAssetID string
+	EmbeddingInput           string
+	EmbeddingContentSHA1     string
+	EmbeddingContentSize     int64
+	InputFingerprint         string
+	RenditionSHA256          string
 	MediaType                string
 	Filename                 string
 	CapturedAt               time.Time
@@ -62,7 +70,10 @@ type SemanticBackfillOptions struct {
 	ImageLoader SemanticImageLoader
 	MaxAssets   int
 	Workers     int
-	BeforeEmbed func(context.Context) error
+	// CanonicalSourceKeys resolves configured representatives; CanonicalEmbeddingSourceKey partitions execution by that representative.
+	CanonicalSourceKeys         []string
+	CanonicalEmbeddingSourceKey string
+	BeforeEmbed                 func(context.Context) error
 }
 
 type SemanticBackfillResult struct {
@@ -393,9 +404,12 @@ func semanticStatusFromDB(ctx context.Context, db *sql.DB, sourceKey string, pro
 	return normalizeCatalogSemanticStatus(status, profile), nil
 }
 
-func (s *CatalogStore) SemanticBackfillStatus(ctx context.Context, sourceKey string, profile SemanticModelProfileStatus) (SemanticModelBackfillStatus, error) {
+func (s *CatalogStore) SemanticBackfillStatus(ctx context.Context, sourceKey string, profile SemanticModelProfileStatus, canonicalSourceKeys ...string) (SemanticModelBackfillStatus, error) {
 	if s == nil || s.db == nil {
 		return SemanticModelBackfillStatus{}, ErrCatalogNotConfigured
+	}
+	if strings.TrimSpace(sourceKey) == canonicalSemanticCorpusSourceKey {
+		return s.canonicalSemanticBackfillStatusForScope(ctx, profile, canonicalSourceKeys)
 	}
 	started := time.Now()
 	sourceKey = strings.TrimSpace(sourceKey)
@@ -735,6 +749,9 @@ func (s *CatalogStore) BackfillSemanticVectors(ctx context.Context, sourceKey st
 	if sourceKey == "" || profile == nil {
 		return SemanticBackfillResult{}, ErrCatalogNotConfigured
 	}
+	if sourceKey == canonicalSemanticCorpusSourceKey {
+		return s.backfillCanonicalSemanticVectors(ctx, profile, startedAt, options)
+	}
 	limit := options.MaxAssets
 	if limit < 0 {
 		limit = 0
@@ -892,7 +909,15 @@ func embedSemanticBackfillAsset(ctx context.Context, profile semanticEmbeddingPr
 		if imageLoader == nil {
 			return fmt.Errorf("semantic image input loader is not configured for model %q", profile.ModelID())
 		}
-		loaded, err := imageLoader.LoadSemanticImage(ctx, asset.SourceKey, asset.ID)
+		embeddingSourceKey := asset.SourceKey
+		embeddingAssetID := asset.ID
+		if strings.TrimSpace(asset.EmbeddingSourceKey) != "" {
+			embeddingSourceKey = asset.EmbeddingSourceKey
+		}
+		if strings.TrimSpace(asset.EmbeddingUpstreamAssetID) != "" {
+			embeddingAssetID = asset.EmbeddingUpstreamAssetID
+		}
+		loaded, err := imageLoader.LoadSemanticImage(ctx, embeddingSourceKey, embeddingAssetID)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
@@ -906,6 +931,16 @@ func embedSemanticBackfillAsset(ctx context.Context, profile semanticEmbeddingPr
 			return fmt.Errorf("%w: load catalog semantic image %q: empty image", ErrSemanticAssetInput, asset.ID)
 		}
 		image = loaded
+		digest := sha256.Sum256(loaded.Bytes)
+		asset.RenditionSHA256 = hex.EncodeToString(digest[:])
+		if asset.SourceKey == canonicalSemanticCorpusSourceKey {
+			asset.InputFingerprint = canonicalSemanticInputFingerprint(
+				*asset,
+				asset.EmbeddingInput,
+				asset.EmbeddingContentSHA1,
+				asset.EmbeddingContentSize,
+			)
+		}
 	}
 	embedding, err := profile.EmbedSemanticAsset(ctx, semanticAssetEmbeddingInput{Asset: *asset, Image: image})
 	if err != nil {
@@ -933,7 +968,7 @@ func semanticBackfillWorkerCount(configured int, assetCount int) int {
 	return min(configured, assetCount)
 }
 
-func (s *CatalogStore) ReconcileSemanticIndexJobs(ctx context.Context, sourceKeys []string, profile semanticEmbeddingProfile, allowPartial bool, now time.Time) (int, error) {
+func (s *CatalogStore) ReconcileSemanticIndexJobs(ctx context.Context, sourceKeys []string, profile semanticEmbeddingProfile, allowPartial bool, now time.Time, canonicalSourceKeys ...string) (int, error) {
 	if s == nil || s.db == nil {
 		return 0, ErrCatalogNotConfigured
 	}
@@ -955,7 +990,7 @@ func (s *CatalogStore) ReconcileSemanticIndexJobs(ctx context.Context, sourceKey
 	}
 	enqueued := 0
 	for _, sourceKey := range sourceKeys {
-		status, err := s.SemanticBackfillStatus(ctx, sourceKey, profileStatus)
+		status, err := s.SemanticBackfillStatus(ctx, sourceKey, profileStatus, canonicalSourceKeys...)
 		if err != nil {
 			return enqueued, err
 		}
@@ -970,7 +1005,7 @@ func (s *CatalogStore) ReconcileSemanticIndexJobs(ctx context.Context, sourceKey
 	return enqueued, nil
 }
 
-func (s *CatalogStore) SemanticIndexPublishNeeded(ctx context.Context, sourceKeys []string, profile semanticEmbeddingProfile, allowPartial bool) (bool, int, error) {
+func (s *CatalogStore) SemanticIndexPublishNeeded(ctx context.Context, sourceKeys []string, profile semanticEmbeddingProfile, allowPartial bool, canonicalSourceKeys ...string) (bool, int, error) {
 	if s == nil || s.db == nil {
 		return false, 0, ErrCatalogNotConfigured
 	}
@@ -993,7 +1028,7 @@ func (s *CatalogStore) SemanticIndexPublishNeeded(ctx context.Context, sourceKey
 	needed := false
 	workCount := 0
 	for _, sourceKey := range sourceKeys {
-		status, err := s.SemanticBackfillStatus(ctx, sourceKey, profileStatus)
+		status, err := s.SemanticBackfillStatus(ctx, sourceKey, profileStatus, canonicalSourceKeys...)
 		if err != nil {
 			return needed, workCount, err
 		}
@@ -1802,6 +1837,16 @@ func (s *CatalogStore) upsertSemanticVectorFailures(ctx context.Context, sourceK
 		}
 		generationChanged = true
 	}
+	if sourceKey == canonicalSemanticCorpusSourceKey {
+		assets := make([]semanticAsset, 0, len(failures))
+		for _, failure := range failures {
+			assets = append(assets, failure.Asset)
+		}
+		if err := upsertCanonicalSemanticInputsInTx(ctx, tx, profile, assets, now); err != nil {
+			return err
+		}
+	}
+
 	if err := retryStatement.Close(); err != nil {
 		return fmt.Errorf("close catalog semantic vector failure retry: %w", err)
 	}

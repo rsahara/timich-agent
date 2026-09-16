@@ -107,9 +107,24 @@ func (s *CatalogStore) RebuildCatalogCanonicalAssets(ctx context.Context) (Catal
 	if err != nil {
 		return CatalogDeduplicationStatus{}, fmt.Errorf("begin catalog canonical rebuild: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO semantic_generation_suppression(source_key)
+		VALUES (?) ON CONFLICT(source_key) DO NOTHING`, canonicalSemanticCorpusSourceKey); err != nil {
+		_ = tx.Rollback()
+		return CatalogDeduplicationStatus{}, fmt.Errorf("suppress canonical semantic generation during rebuild: %w", err)
+	}
 	if err := s.rebuildCatalogCanonicalAssetsInTx(ctx, tx, nowText); err != nil {
 		_ = tx.Rollback()
 		return CatalogDeduplicationStatus{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE semantic_state
+		SET asset_generation = asset_generation + 1
+		WHERE source_key = ?`, canonicalSemanticCorpusSourceKey); err != nil {
+		_ = tx.Rollback()
+		return CatalogDeduplicationStatus{}, fmt.Errorf("advance canonical semantic generation after rebuild: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM semantic_generation_suppression WHERE source_key = ?`, canonicalSemanticCorpusSourceKey); err != nil {
+		_ = tx.Rollback()
+		return CatalogDeduplicationStatus{}, fmt.Errorf("restore canonical semantic generation after rebuild: %w", err)
 	}
 	if err := s.commitCatalogAssetChanges(ctx, tx, true); err != nil {
 		return CatalogDeduplicationStatus{}, fmt.Errorf("commit catalog canonical rebuild: %w", err)
@@ -292,6 +307,18 @@ func (s *CatalogStore) rebuildCatalogCanonicalIDInTx(ctx context.Context, tx *sq
 	})
 	primary := sources[0]
 	primaryContentSHA1Hex, primaryContentSizeBytes := catalogCanonicalContentIdentity(primary)
+	canonicalDuration := primary.Duration
+	if strings.TrimSpace(nullStringValue(canonicalDuration)) == "" {
+		for _, source := range sources {
+			if source.VisibilityStatus != "active" {
+				continue
+			}
+			if strings.TrimSpace(nullStringValue(source.Duration)) != "" {
+				canonicalDuration = source.Duration
+				break
+			}
+		}
+	}
 	firstSeen := primary.FirstSeenAtText
 	isFavorite := primary.IsFavorite
 	for _, source := range sources {
@@ -328,7 +355,7 @@ func (s *CatalogStore) rebuildCatalogCanonicalIDInTx(ctx context.Context, tx *sq
 		primary.MediaType,
 		primary.Filename,
 		primary.CapturedAtText,
-		primary.Duration,
+		nullStringToAny(canonicalDuration),
 		primary.VisibilityStatus,
 		primary.SourceKey,
 		primary.UpstreamAssetID,

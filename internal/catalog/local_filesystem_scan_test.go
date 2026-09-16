@@ -516,6 +516,80 @@ func TestRefreshLocalAssetVisibilityRepairsForeignPrimaryLocation(t *testing.T) 
 	}
 }
 
+func TestLocalVisibilityLookupUsesRootAssetStatusIndex(t *testing.T) {
+	service := newLocalPhase0TestService(t, t.TempDir())
+	const assetCount = 8000
+	ctx := context.Background()
+	nowText := formatCatalogTime(time.Date(2026, 9, 3, 4, 0, 0, 0, time.UTC))
+	if _, err := service.catalog.db.ExecContext(ctx, `WITH RECURSIVE assets(n) AS (
+			SELECT 1
+			UNION ALL
+			SELECT n + 1 FROM assets WHERE n < ?
+		)
+		INSERT INTO local_assets (
+			source_key, asset_id, sha1_hex, content_size_bytes, media_type,
+			filename, captured_at, captured_at_source, visibility_status,
+			thumbnail_status, first_seen_at, updated_at
+		)
+		SELECT ?, printf('asset-%06d', n), printf('%040x', n), n, 'image',
+			printf('asset-%06d.jpg', n), ?, 'filesystem', 'active',
+			'pending', ?, ?
+		FROM assets`, assetCount, "1111111111111111", nowText, nowText, nowText); err != nil {
+		t.Fatalf("seed Local assets: %v", err)
+	}
+	if _, err := service.catalog.db.ExecContext(ctx, `WITH RECURSIVE assets(n) AS (
+			SELECT 1
+			UNION ALL
+			SELECT n + 1 FROM assets WHERE n < ?
+		), copies(n) AS (VALUES (1), (2), (3), (4))
+		INSERT INTO local_asset_locations (
+			source_key, asset_id, root_key, relative_path, size_bytes, mtime,
+			fast_signature, sha1_hex, status, first_seen_at, last_seen_at, updated_at
+		)
+		SELECT ?, printf('asset-%06d', assets.n), ?,
+			printf('%06d/%d.jpg', assets.n, copies.n), assets.n, ?,
+			printf('sig-%06d-%d', assets.n, copies.n), printf('%040x', assets.n),
+			'active', ?, ?, ?
+		FROM assets CROSS JOIN copies`, assetCount, "1111111111111111", "nas-photos", nowText, nowText, nowText, nowText); err != nil {
+		t.Fatalf("seed Local asset locations: %v", err)
+	}
+	if _, err := service.catalog.db.ExecContext(ctx, `ANALYZE`); err != nil {
+		t.Fatalf("analyze representative Local catalog: %v", err)
+	}
+
+	plan := localScanQueryPlan(t, service.catalog.db, `SELECT asset_id
+		FROM local_assets
+		WHERE source_key = ?
+			AND EXISTS (
+				SELECT 1
+				FROM local_asset_locations
+				WHERE local_asset_locations.source_key = local_assets.source_key
+					AND local_asset_locations.root_key = ?
+					AND local_asset_locations.asset_id = local_assets.asset_id
+					AND local_asset_locations.status = 'active'
+			)`, "1111111111111111", "nas-photos")
+	want := catalogLocalRootAssetStatusIndex + " (source_key=? AND root_key=? AND asset_id=? AND status=?)"
+	if !strings.Contains(plan, want) {
+		t.Fatalf("Local visibility query plan = %s, want root-scoped asset lookup %q", plan, want)
+	}
+
+	refreshCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	tx, err := service.catalog.db.BeginTx(refreshCtx, nil)
+	if err != nil {
+		t.Fatalf("begin representative Local visibility refresh: %v", err)
+	}
+	startedAt := time.Now()
+	if _, err := refreshLocalAssetVisibilityInTx(refreshCtx, tx, "1111111111111111", "nas-photos", nowText); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("refresh representative Local visibility: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit representative Local visibility refresh: %v", err)
+	}
+	t.Logf("refreshed %d assets across %d locations in %s", assetCount, assetCount*4, time.Since(startedAt))
+}
+
 func TestLocalPrimaryLocationSelectionUsesVerificationMTimeAndPathOrder(t *testing.T) {
 	rootPath := t.TempDir()
 	for _, name := range []string{"a.jpg", "b.jpg", "c.jpg", "d.jpg"} {
@@ -1216,7 +1290,7 @@ func TestLocalMetadataRegistrationRequeuesWhenRediscoveredAfterClaim(t *testing.
 		sha1Hex,
 		"image",
 		filepath.Base(mediaPath),
-		info.ModTime().UTC(),
+		fallbackLocalCaptureMetadata(info.ModTime(), time.Now()),
 		info,
 		formatCatalogTime(time.Now().UTC()),
 		job.ID,
@@ -1336,7 +1410,7 @@ func TestLocalMetadataRegistrationRequeuesWhenExternalIdentityScopeChangesAfterC
 		sha1Hex,
 		"image",
 		filepath.Base(mediaPath),
-		info.ModTime().UTC(),
+		fallbackLocalCaptureMetadata(info.ModTime(), time.Now()),
 		info,
 		formatCatalogTime(time.Now().UTC()),
 		job.ID,

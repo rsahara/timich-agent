@@ -27,6 +27,8 @@ type localMediaHelperCapabilityStatus struct {
 	RenderVideoPoster bool
 	InspectImage      bool
 	InspectVideo      bool
+	CaptureImage      bool
+	CaptureVideo      bool
 	LastError         string
 }
 
@@ -80,6 +82,8 @@ type mediaHelperHealthResponse struct {
 		RenderVideoPoster bool `json:"renderVideoPoster"`
 		InspectImage      bool `json:"inspectImage"`
 		InspectVideo      bool `json:"inspectVideo"`
+		CaptureImage      bool `json:"captureImage"`
+		CaptureVideo      bool `json:"captureVideo"`
 	} `json:"capabilities"`
 }
 
@@ -120,6 +124,8 @@ func inspectLocalMediaHelperCapabilityWithContext(ctx context.Context, helperPat
 		RenderVideoPoster: response.Capabilities.RenderVideoPoster,
 		InspectImage:      response.Capabilities.InspectImage,
 		InspectVideo:      response.Capabilities.InspectVideo,
+		CaptureImage:      response.Capabilities.CaptureImage,
+		CaptureVideo:      response.Capabilities.CaptureVideo,
 	}
 	if !response.OK {
 		status.Status = "failed"

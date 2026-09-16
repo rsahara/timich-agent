@@ -31,6 +31,7 @@ WORKDIR /app
 COPY --from=builder /out/timich-agent /usr/local/bin/timich-agent
 COPY --from=builder /out/timich-semantic-helper /usr/local/bin/timich-semantic-helper
 COPY --from=builder /out/timich-media-helper /usr/local/bin/timich-media-helper
+COPY media-helper/THIRD_PARTY_NOTICES.md /usr/share/doc/timich-media-helper/NOTICES.txt
 COPY semantic-runtime /usr/local/bin/semantic-runtime
 COPY docker/entrypoint.sh /usr/local/bin/timich-agent-entrypoint
 

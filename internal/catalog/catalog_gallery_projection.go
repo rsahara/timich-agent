@@ -19,6 +19,14 @@ const (
 const galleryProjectionSelectColumns = `source_key, upstream_asset_id,
 	media_type, filename, captured_at, duration`
 
+// Seek through narrow keys when skipping within a dense day; fetch the bounded
+// page payload directly from the clustered primary tree afterward.
+const galleryProjectionSeekIndexSQL = `CREATE INDEX IF NOT EXISTS idx_catalog_gallery_projection_captured
+	ON catalog_gallery_projection(captured_at DESC, canonical_asset_id)`
+
+const galleryProjectionUnfilteredTotalSQL = `SELECT COALESCE(SUM(item_count), 0)
+	FROM catalog_gallery_projection_days`
+
 const galleryProjectionDayAtOffsetSQL = `WITH positioned_days AS (
 		SELECT captured_day, item_count,
 			COALESCE(SUM(item_count) OVER (
@@ -40,12 +48,49 @@ const galleryProjectionAnchorWithinDaySQL = `SELECT captured_at, canonical_asset
 	ORDER BY captured_at DESC, canonical_asset_id ASC
 	LIMIT 1 OFFSET ?`
 
-const galleryProjectionAfterAnchorSQL = `SELECT ` + galleryProjectionSelectColumns + `
+// Bound both branches before merging. A single OR predicate can scan the entire
+// preceding equal-timestamp group instead of seeking on both primary-key columns.
+const galleryProjectionAfterAnchorSQL = `WITH same_time AS (
+	SELECT canonical_asset_id, ` + galleryProjectionSelectColumns + `
 	FROM catalog_gallery_projection
-	WHERE captured_at <= ?
-		AND (captured_at < ? OR canonical_asset_id >= ?)
+	WHERE captured_at = ?1 AND canonical_asset_id >= ?2
+	ORDER BY captured_at DESC, canonical_asset_id ASC LIMIT ?3
+), older AS (
+	SELECT canonical_asset_id, ` + galleryProjectionSelectColumns + `
+	FROM catalog_gallery_projection
+	WHERE captured_at < ?1
+	ORDER BY captured_at DESC, canonical_asset_id ASC LIMIT ?3
+)
+	SELECT ` + galleryProjectionSelectColumns + ` FROM (
+		SELECT * FROM same_time UNION ALL SELECT * FROM older
+	)
 	ORDER BY captured_at DESC, canonical_asset_id ASC
-	LIMIT ?`
+	LIMIT ?3`
+
+const galleryProjectionTableSQL = `CREATE TABLE IF NOT EXISTS catalog_gallery_projection (
+	canonical_asset_id TEXT NOT NULL,
+	source_key TEXT NOT NULL,
+	upstream_asset_id TEXT NOT NULL,
+	media_type TEXT NOT NULL CHECK(media_type IN ('image', 'video')),
+	filename TEXT NOT NULL,
+	captured_at TEXT NOT NULL,
+	duration TEXT,
+	PRIMARY KEY(captured_at DESC, canonical_asset_id ASC),
+	UNIQUE(canonical_asset_id)
+) WITHOUT ROWID`
+
+// WITHOUT ROWID secondary-index lookups may visit the table before OFFSET
+// discards a row. Materialize only page keys so skipped media-filter rows stay
+// index-only; fetch payloads for at most the requested page, in the same snapshot.
+func galleryProjectionFilteredPageSQL(where string) string {
+	return `WITH page_keys AS MATERIALIZED (
+		SELECT captured_at, canonical_asset_id FROM catalog_gallery_projection ` + where + `
+		ORDER BY captured_at DESC, canonical_asset_id ASC LIMIT ? OFFSET ?
+	)
+	SELECT ` + galleryProjectionSelectColumns + ` FROM page_keys
+	JOIN catalog_gallery_projection USING(captured_at, canonical_asset_id)
+	ORDER BY captured_at DESC, canonical_asset_id ASC`
+}
 
 func normalizedGallerySourceKeys(keys []string) []string {
 	normalized := append([]string(nil), keys...)
@@ -238,17 +283,8 @@ func (s *CatalogStore) ensureGalleryProjectionSchema(ctx context.Context) error 
 			source_key TEXT NOT NULL,
 			PRIMARY KEY(role, source_key)
 		)`,
-		`CREATE TABLE IF NOT EXISTS catalog_gallery_projection (
-			canonical_asset_id TEXT PRIMARY KEY,
-			source_key TEXT NOT NULL,
-			upstream_asset_id TEXT NOT NULL,
-			media_type TEXT NOT NULL CHECK(media_type IN ('image', 'video')),
-			filename TEXT NOT NULL,
-			captured_at TEXT NOT NULL,
-			duration TEXT
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_catalog_gallery_projection_captured
-			ON catalog_gallery_projection(captured_at DESC, canonical_asset_id)`,
+		galleryProjectionTableSQL,
+		galleryProjectionSeekIndexSQL,
 		`CREATE INDEX IF NOT EXISTS idx_catalog_gallery_projection_media_captured
 			ON catalog_gallery_projection(media_type, captured_at DESC, canonical_asset_id)`,
 		`CREATE TABLE IF NOT EXISTS catalog_gallery_projection_days (
@@ -489,7 +525,13 @@ func (s *CatalogStore) searchGalleryProjection(
 	offset := request.Page.Index * request.Page.Size
 	var total int
 	if includeTotal {
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_gallery_projection `+where, args...).Scan(&total); err != nil {
+		totalQuery := `SELECT COUNT(*) FROM catalog_gallery_projection ` + where
+		totalArgs := args
+		if len(request.Collection.Filters.MediaTypes) == 0 && request.Collection.Filters.CapturedAt == nil {
+			totalQuery = galleryProjectionUnfilteredTotalSQL
+			totalArgs = nil
+		}
+		if err := tx.QueryRowContext(ctx, totalQuery, totalArgs...).Scan(&total); err != nil {
 			return AssetSearchPage{}, true, fmt.Errorf("count mixed gallery projection: %w", err)
 		}
 	}
@@ -508,7 +550,6 @@ func (s *CatalogStore) searchGalleryProjection(
 				ctx,
 				galleryProjectionAfterAnchorSQL,
 				anchorCapturedAt,
-				anchorCapturedAt,
 				anchorCanonicalAssetID,
 				queryLimit,
 			)
@@ -520,10 +561,14 @@ func (s *CatalogStore) searchGalleryProjection(
 		}
 	} else {
 		queryArgs := append(append([]any(nil), args...), queryLimit, offset)
-		rows, err = tx.QueryContext(ctx, `SELECT `+galleryProjectionSelectColumns+`
-			FROM catalog_gallery_projection `+where+`
+		query := `SELECT ` + galleryProjectionSelectColumns + `
+			FROM catalog_gallery_projection ` + where + `
 			ORDER BY captured_at DESC, canonical_asset_id ASC
-			LIMIT ? OFFSET ?`, queryArgs...)
+			LIMIT ? OFFSET ?`
+		if where != "" {
+			query = galleryProjectionFilteredPageSQL(where)
+		}
+		rows, err = tx.QueryContext(ctx, query, queryArgs...)
 	}
 	if err != nil {
 		return AssetSearchPage{}, true, fmt.Errorf("query mixed gallery projection: %w", err)

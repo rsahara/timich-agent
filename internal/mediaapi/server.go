@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rsahara/timich-agent/internal/catalog"
 	runtimestate "github.com/rsahara/timich-agent/internal/runtime"
@@ -44,6 +46,7 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 				"/v1/nearby-links/{linkId}/cancel",
 				"/v1/nearby-links/{linkId}/poll",
 				"/v1/pairing/redeem",
+				"/v1/session/validate",
 				"/v1/session/refresh",
 				"/v1/assets/{assetID}/preview",
 				"/v1/assets/{assetID}/detail_preview",
@@ -218,6 +221,16 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, sessionBundle)
+	})
+	mux.HandleFunc("/v1/session/validate", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeMethodNotAllowed(w, "Use GET to validate an app session.")
+			return
+		}
+		if _, ok := authenticateRequest(w, runtime, r); !ok {
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/v1/assets/search/capabilities", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -457,7 +470,88 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 		defer response.Body.Close()
 		copyProxyResponse(w, r.Method, response)
 	})
-	return mux
+	return withAppRequestTiming(mux)
+}
+
+type timingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *timingResponseWriter) WriteHeader(statusCode int) {
+	if w.statusCode != 0 {
+		return
+	}
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *timingResponseWriter) Write(body []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+func withAppRequestTiming(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		endpoint, ok := appTimingEndpoint(r.URL.Path)
+		if !ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		startedAt := time.Now()
+		recorder := &timingResponseWriter{ResponseWriter: w}
+		next.ServeHTTP(recorder, r)
+		statusCode := recorder.statusCode
+		if statusCode == 0 {
+			statusCode = http.StatusOK
+		}
+		log.Printf(
+			"timich-agent app request timing endpoint=%q method=%q status=%d duration_ms=%d trace_id=%q",
+			endpoint,
+			r.Method,
+			statusCode,
+			time.Since(startedAt).Milliseconds(),
+			safeTraceID(r.Header.Get("X-Timich-Trace-ID")),
+		)
+	})
+}
+
+func appTimingEndpoint(path string) (string, bool) {
+	switch path {
+	case "/v1/info":
+		return "info", true
+	case "/v1/session/refresh":
+		return "session_refresh", true
+	case "/v1/session/validate":
+		return "session_validate", true
+	case "/v1/assets/search":
+		return "asset_search", true
+	default:
+		return "", false
+	}
+}
+
+func safeTraceID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "none"
+	}
+	if len(value) > 64 {
+		return "invalid"
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '_' {
+			continue
+		}
+		return "invalid"
+	}
+	return value
 }
 
 func writeRouteNotFound(w http.ResponseWriter, message string) {

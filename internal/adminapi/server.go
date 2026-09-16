@@ -677,7 +677,7 @@ func (s *server) localDatasourceThumbnailRepair(w http.ResponseWriter, r *http.R
 }
 
 func (s *server) localDatasourceMetadataRequeue(w http.ResponseWriter, r *http.Request) {
-	if !requirePost(w, r, "Use POST to requeue failed local datasource metadata.") {
+	if !requirePost(w, r, "Use POST to repair local datasource metadata.") {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)

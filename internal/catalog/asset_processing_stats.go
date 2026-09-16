@@ -33,7 +33,7 @@ const (
 	AssetProcessingStatusUnavailable = "unavailable"
 
 	assetProcessingSemanticStatsRefreshMinAge = 30 * time.Second
-	assetProcessingSemanticVariantPrefix      = "semantic-profile-v1:"
+	assetProcessingSemanticVariantPrefix      = "semantic-profile-v2-local-input:"
 )
 
 // AssetProcessingStat is a low-cost Admin read model row. Counts are refreshed
@@ -612,6 +612,43 @@ func countDatasourceIndexedSemanticVectors(ctx context.Context, db processingSta
 	)
 }
 
+func canonicalSemanticPublishedStateExists(ctx context.Context, db processingStatsQueryer, profile SemanticModelProfileStatus) (bool, error) {
+	var exists int
+	err := db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM semantic_state
+		WHERE source_key = ? AND model_id = ? AND vector_space_id = ? AND indexed_generation >= 0
+	)`, canonicalSemanticCorpusSourceKey, strings.TrimSpace(profile.ModelID), strings.TrimSpace(profile.VectorSpaceID)).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists != 0, nil
+}
+
+func countDatasourceIndexedCanonicalSemanticVectors(ctx context.Context, db processingStatsQueryer, sourceKey string, profile SemanticModelProfileStatus) (int, error) {
+	return countProcessingRows(ctx, db, `SELECT COUNT(DISTINCT membership.upstream_asset_id)
+		FROM semantic_index_membership membership
+		JOIN semantic_state state
+			ON state.source_key = membership.source_key
+			AND state.model_id = membership.model_id
+			AND state.vector_space_id = membership.vector_space_id
+			AND state.indexed_generation = membership.asset_generation
+		JOIN catalog_assets source
+			ON source.canonical_asset_id = membership.upstream_asset_id
+		JOIN catalog_canonical_assets canonical
+			ON canonical.canonical_asset_id = membership.upstream_asset_id
+		WHERE membership.source_key = ?
+			AND membership.model_id = ?
+			AND membership.vector_space_id = ?
+			AND source.source_key = ?
+			AND source.visibility_status = 'active'
+			AND canonical.visibility_status = 'active'`,
+		canonicalSemanticCorpusSourceKey,
+		strings.TrimSpace(profile.ModelID),
+		strings.TrimSpace(profile.VectorSpaceID),
+		strings.TrimSpace(sourceKey),
+	)
+}
+
 func (s *Service) countDatasourceIssues(ctx context.Context, db processingStatsQueryer, datasource processingStatsDatasource, profile *SemanticModelProfileStatus) (int, error) {
 	sourceKey := strings.TrimSpace(datasource.SourceKey)
 	total, err := countProcessingRows(ctx, db, `SELECT COUNT(*)
@@ -654,12 +691,25 @@ func (s *Service) countDatasourceIssues(ctx context.Context, db processingStatsQ
 		total += failedThumbnails
 	}
 	if profile != nil && strings.TrimSpace(profile.ModelID) != "" && strings.TrimSpace(profile.VectorSpaceID) != "" {
-		failedVectors, err := countProcessingRows(ctx, db, `SELECT COUNT(*)
-			FROM semantic_vectors
-			WHERE source_key = ?
-				AND model_id = ?
-				AND vector_space_id = ?
-				AND status = 'failed'`, sourceKey, strings.TrimSpace(profile.ModelID), strings.TrimSpace(profile.VectorSpaceID))
+		modelID := strings.TrimSpace(profile.ModelID)
+		vectorSpaceID := strings.TrimSpace(profile.VectorSpaceID)
+		failedVectors, err := countProcessingRows(ctx, db, `SELECT COUNT(DISTINCT vector.upstream_asset_id)
+			FROM semantic_vectors vector
+			JOIN catalog_assets source
+				ON source.canonical_asset_id = vector.upstream_asset_id
+			WHERE vector.source_key = ?
+				AND vector.model_id = ?
+				AND vector.vector_space_id = ?
+				AND vector.embedding_dim = ?
+				AND vector.status = 'failed'
+				AND source.source_key = ?
+				AND source.visibility_status = 'active'`,
+			canonicalSemanticCorpusSourceKey,
+			modelID,
+			vectorSpaceID,
+			profile.EmbeddingDim,
+			sourceKey,
+		)
 		if err != nil {
 			return 0, err
 		}
@@ -669,7 +719,7 @@ func (s *Service) countDatasourceIssues(ctx context.Context, db processingStatsQ
 			WHERE source_key = ?
 				AND model_id = ?
 				AND vector_space_id = ?
-				AND status = 'failed'`, sourceKey, strings.TrimSpace(profile.ModelID), strings.TrimSpace(profile.VectorSpaceID))
+				AND status = 'failed'`, canonicalSemanticCorpusSourceKey, modelID, vectorSpaceID)
 		if err != nil {
 			return 0, err
 		}
@@ -728,39 +778,41 @@ func (s *Service) semanticProcessingCounts(ctx context.Context, db processingSta
 	if modelID == "" || vectorSpaceID == "" {
 		return nil, nil, nil
 	}
+	status, err := s.catalog.SemanticBackfillStatus(ctx, canonicalSemanticCorpusSourceKey, profile, sourceKeys...)
+	if err != nil {
+		return nil, nil, err
+	}
+	total := &semanticProcessingCounts{
+		EligibleCount:        status.EligibleAssetCount,
+		CompletedVectorCount: status.CompletedVectorCount,
+		IndexedVectorCount:   status.IndexedVectorCount,
+		FailedVectorCount:    status.FailedVectorCount,
+		FailedIndexJobCount:  status.FailedIndexJobCount,
+	}
 
-	total := semanticProcessingCounts{}
+	// Datasource searchable coverage follows the index that can currently
+	// answer queries. An existing source index remains available until the
+	// first canonical generation is published, including after a V4-to-V5 copy.
+	// Aggregate task progress above covers only configured datasources within
+	// the canonical corpus being built.
+	canonicalCorpus, err := canonicalSemanticPublishedStateExists(ctx, db, profile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("detect published canonical semantic state: %w", err)
+	}
+	if canonicalCorpus {
+		bySource := make(map[string]semanticProcessingCounts, len(sourceKeys))
+		for _, sourceKey := range sourceKeys {
+			indexed, err := countDatasourceIndexedCanonicalSemanticVectors(ctx, db, sourceKey, profile)
+			if err != nil {
+				return nil, nil, fmt.Errorf("count datasource canonical searchable media: %w", err)
+			}
+			bySource[sourceKey] = semanticProcessingCounts{IndexedVectorCount: indexed}
+		}
+		return bySource, total, nil
+	}
+
 	bySource := make(map[string]semanticProcessingCounts, len(sourceKeys))
 	for _, sourceKey := range sourceKeys {
-		where, args := semanticCatalogEligibilityWhere(sourceKey, profile.InputKind, "a")
-
-		eligible, err := countProcessingRows(ctx, db, `SELECT COUNT(*)
-			FROM catalog_assets a `+where, args...)
-		if err != nil {
-			return nil, nil, fmt.Errorf("count semantic eligible assets: %w", err)
-		}
-		sourceCounts := semanticProcessingCounts{EligibleCount: eligible}
-
-		progressWhere, progressArgs := semanticCatalogEligibilityWhere(sourceKey, profile.InputKind, "a")
-		progressArgs = append(progressArgs, modelID, vectorSpaceID)
-		var completed int
-		var failedVectors int
-		err = db.QueryRowContext(ctx, `SELECT
-				COALESCE(SUM(CASE WHEN v.status = 'ready' THEN 1 ELSE 0 END), 0),
-				COALESCE(SUM(CASE WHEN v.status = 'failed' THEN 1 ELSE 0 END), 0)
-			FROM catalog_assets a
-			JOIN semantic_vectors v
-				ON v.source_key = a.source_key
-				AND v.upstream_asset_id = a.upstream_asset_id
-			`+progressWhere+`
-				AND v.model_id = ?
-				AND v.vector_space_id = ?`, progressArgs...).Scan(&completed, &failedVectors)
-		if err != nil {
-			return nil, nil, fmt.Errorf("count semantic ready and failed vectors: %w", err)
-		}
-		sourceCounts.CompletedVectorCount = completed
-		sourceCounts.FailedVectorCount = failedVectors
-
 		indexed, err := countProcessingRows(ctx, db, `SELECT COALESCE((SELECT indexed_vector_count
 			FROM semantic_state
 			WHERE source_key = ?
@@ -769,27 +821,9 @@ func (s *Service) semanticProcessingCounts(ctx context.Context, db processingSta
 		if err != nil {
 			return nil, nil, fmt.Errorf("count indexed semantic vectors: %w", err)
 		}
-		sourceCounts.IndexedVectorCount = indexed
-
-		failedJobs, err := countProcessingRows(ctx, db, `SELECT COUNT(*)
-			FROM semantic_index_jobs
-			WHERE source_key = ?
-				AND model_id = ?
-				AND vector_space_id = ?
-				AND status = 'failed'`, sourceKey, modelID, vectorSpaceID)
-		if err != nil {
-			return nil, nil, fmt.Errorf("count semantic failed index jobs: %w", err)
-		}
-		sourceCounts.FailedIndexJobCount = failedJobs
-
-		bySource[sourceKey] = sourceCounts
-		total.EligibleCount += sourceCounts.EligibleCount
-		total.CompletedVectorCount += sourceCounts.CompletedVectorCount
-		total.IndexedVectorCount += sourceCounts.IndexedVectorCount
-		total.FailedVectorCount += sourceCounts.FailedVectorCount
-		total.FailedIndexJobCount += sourceCounts.FailedIndexJobCount
+		bySource[sourceKey] = semanticProcessingCounts{IndexedVectorCount: indexed}
 	}
-	return bySource, &total, nil
+	return bySource, total, nil
 }
 
 func (s *CatalogStore) AssetProcessingStats(ctx context.Context) (AssetProcessingStatsSnapshot, error) {

@@ -211,6 +211,26 @@ func TestMixedGalleryProjectionDeepPageUsesDayAnchorSeek(t *testing.T) {
 		t.Fatalf("commit projection seed: %v", err)
 	}
 
+	initialRequest, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{Kind: CollectionKindTimeline},
+		Page:       AssetSearchPageRequest{Index: 0, Size: 10},
+	})
+	if err != nil {
+		t.Fatalf("normalize initial mixed Gallery request: %v", err)
+	}
+	initialPage, err := store.SearchCatalogAssets(context.Background(), initialRequest)
+	if err != nil {
+		t.Fatalf("initial SearchCatalogAssets() error = %v", err)
+	}
+	if initialPage.Total != assetCount || initialPage.TotalAccuracy != TotalAccuracyExact {
+		t.Fatalf("initial mixed Gallery total = %d (%q), want %d exact", initialPage.Total, initialPage.TotalAccuracy, assetCount)
+	}
+	totalPlan := explainGalleryProjectionQueryPlan(t, store.db, galleryProjectionUnfilteredTotalSQL)
+	if !strings.Contains(totalPlan, "catalog_gallery_projection_days") ||
+		strings.Contains(totalPlan, "catalog_gallery_projection ") {
+		t.Fatalf("unfiltered total scans the full mixed projection:\n%s", totalPlan)
+	}
+
 	normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
 		Collection: AssetCollectionRequest{Kind: CollectionKindTimeline},
 		Page:       AssetSearchPageRequest{Index: 499, Size: 10},
@@ -249,7 +269,7 @@ func TestMixedGalleryProjectionDeepPageUsesDayAnchorSeek(t *testing.T) {
 		formatCatalogTime(newest.AddDate(0, 0, -198)),
 		15,
 	)
-	if !strings.Contains(anchorPlan, "idx_catalog_gallery_projection_captured") ||
+	if !strings.Contains(anchorPlan, "USING COVERING INDEX idx_catalog_gallery_projection_captured") ||
 		strings.Contains(anchorPlan, "SCAN catalog_gallery_projection") {
 		t.Fatalf("within-day anchor lookup does not use the captured index:\n%s", anchorPlan)
 	}
@@ -258,11 +278,10 @@ func TestMixedGalleryProjectionDeepPageUsesDayAnchorSeek(t *testing.T) {
 		store.db,
 		galleryProjectionAfterAnchorSQL,
 		formatCatalogTime(newest.AddDate(0, 0, -199)),
-		formatCatalogTime(newest.AddDate(0, 0, -199)),
 		"asset-004990",
 		11,
 	)
-	if !strings.Contains(pagePlan, "idx_catalog_gallery_projection_captured") ||
+	if !strings.Contains(pagePlan, "USING PRIMARY KEY (captured_at=? AND canonical_asset_id>?)") ||
 		strings.Contains(pagePlan, "SCAN catalog_gallery_projection") {
 		t.Fatalf("anchored page lookup does not use the captured index:\n%s", pagePlan)
 	}

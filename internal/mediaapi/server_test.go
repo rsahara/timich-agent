@@ -89,6 +89,65 @@ func TestMuxRootOnlyServesRouteIndex(t *testing.T) {
 	}
 }
 
+func TestAppRequestTimingPreservesResponseAndSanitizesTraceID(t *testing.T) {
+	t.Parallel()
+
+	handler := withAppRequestTiming(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Timich-Trace-ID") != "trace-123" {
+			t.Fatalf("trace header = %q, want trace-123", r.Header.Get("X-Timich-Trace-ID"))
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "ok"})
+	}))
+	request := httptest.NewRequest(http.MethodPost, "/v1/session/refresh", nil)
+	request.Header.Set("X-Timich-Trace-ID", "trace-123")
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusAccepted)
+	}
+	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if got := safeTraceID("line\nbreak"); got != "invalid" {
+		t.Fatalf("safeTraceID(newline) = %q, want invalid", got)
+	}
+	if got := safeTraceID("  trace_456  "); got != "trace_456" {
+		t.Fatalf("safeTraceID(valid) = %q, want trace_456", got)
+	}
+}
+
+func TestAppTimingEndpointOnlySelectsReconnectMetadataRoutes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		path         string
+		wantEndpoint string
+		wantSelected bool
+	}{
+		{path: "/v1/info", wantEndpoint: "info", wantSelected: true},
+		{path: "/v1/session/refresh", wantEndpoint: "session_refresh", wantSelected: true},
+		{path: "/v1/session/validate", wantEndpoint: "session_validate", wantSelected: true},
+		{path: "/v1/assets/search", wantEndpoint: "asset_search", wantSelected: true},
+		{path: "/v1/assets/test/preview", wantSelected: false},
+		{path: "/healthz", wantSelected: false},
+	}
+	for _, test := range tests {
+		endpoint, selected := appTimingEndpoint(test.path)
+		if endpoint != test.wantEndpoint || selected != test.wantSelected {
+			t.Fatalf(
+				"appTimingEndpoint(%q) = (%q, %t), want (%q, %t)",
+				test.path,
+				endpoint,
+				selected,
+				test.wantEndpoint,
+				test.wantSelected,
+			)
+		}
+	}
+}
+
 func TestParseAssetRequestSupportsMetadataAndMediaRoutes(t *testing.T) {
 	t.Parallel()
 
@@ -529,6 +588,7 @@ func TestProtectedRoutesRejectInvalidAuthorization(t *testing.T) {
 		path   string
 	}{
 		{name: "search capabilities", method: http.MethodGet, path: "/v1/assets/search/capabilities"},
+		{name: "session validation", method: http.MethodGet, path: "/v1/session/validate"},
 		{name: "asset search", method: http.MethodPost, path: "/v1/assets/search"},
 		{name: "asset metadata", method: http.MethodGet, path: "/v1/assets/asset-1"},
 		{name: "upload policy", method: http.MethodGet, path: "/v1/uploads/me"},
@@ -595,6 +655,26 @@ func TestAuthenticateRequestAcceptsValidBearerAndRejectsRevokedDevice(t *testing
 	assertJSONErrorResponse(t, revokedRecorder, http.StatusUnauthorized, "unauthorized")
 }
 
+func TestSessionValidationAcceptsValidBearer(t *testing.T) {
+	t.Parallel()
+
+	runtime := newUploadTestRuntime(t)
+	session, err := runtime.CreateHostedSession("Session Validation iPhone", "https://timich.example")
+	if err != nil {
+		t.Fatalf("CreateHostedSession() error = %v", err)
+	}
+	handler := NewMux(runtime)
+	request := httptest.NewRequest(http.MethodGet, "/v1/session/validate", nil)
+	request.Header.Set("Authorization", "Bearer "+session.AccessToken)
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNoContent || recorder.Body.Len() != 0 {
+		t.Fatalf("session validation = status %d body %q, want 204 with empty body", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestMuxRejectsUnsupportedMethods(t *testing.T) {
 	t.Parallel()
 
@@ -614,6 +694,7 @@ func TestMuxRejectsUnsupportedMethods(t *testing.T) {
 		{name: "cancel nearby link", method: http.MethodGet, path: "/v1/nearby-links/link-1/cancel"},
 		{name: "redeem pairing", method: http.MethodGet, path: "/v1/pairing/redeem"},
 		{name: "refresh session", method: http.MethodGet, path: "/v1/session/refresh"},
+		{name: "validate session", method: http.MethodPost, path: "/v1/session/validate"},
 		{name: "search capabilities", method: http.MethodPost, path: "/v1/assets/search/capabilities"},
 		{name: "search assets", method: http.MethodGet, path: "/v1/assets/search"},
 		{name: "upload policy", method: http.MethodPost, path: "/v1/uploads/me"},

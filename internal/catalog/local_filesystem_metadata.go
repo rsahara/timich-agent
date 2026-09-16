@@ -53,6 +53,7 @@ type localMetadataJob struct {
 type localLocationForMetadata struct {
 	ID            int64
 	SourceKey     string
+	AssetID       string
 	RootKey       string
 	RelativePath  string
 	Status        string
@@ -334,13 +335,43 @@ func (s *Service) requeueFailedLocalMetadataJobs(ctx context.Context) (int, erro
 	if err != nil {
 		return 0, fmt.Errorf("begin failed local metadata requeue: %w", err)
 	}
+	queued, err := s.requeueFailedLocalMetadataJobsInTx(
+		ctx,
+		tx,
+		sourceKeys,
+		false,
+		formatCatalogTime(time.Now().UTC()),
+	)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit failed local metadata requeue: %w", err)
+	}
+	return queued, nil
+}
+
+func (s *Service) requeueFailedLocalMetadataJobsInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	sourceKeys []string,
+	excludeMissingVideoDurations bool,
+	nowText string,
+) (int, error) {
+	if len(sourceKeys) == 0 {
+		return 0, nil
+	}
 	sourcePlaceholders := strings.TrimRight(strings.Repeat("?,", len(sourceKeys)), ",")
-	nowText := formatCatalogTime(time.Now().UTC())
 	updateArgs := []any{localMetadataRepairPriority, nowText, nowText, nowText, localMetadataJobKind}
 	for _, sourceKey := range sourceKeys {
 		updateArgs = append(updateArgs, sourceKey)
 	}
-	updateArgs = append(updateArgs, localMetadataJobKind, localMetadataJobKind)
+	excludeMissingDuration := 0
+	if excludeMissingVideoDurations {
+		excludeMissingDuration = 1
+	}
+	updateArgs = append(updateArgs, excludeMissingDuration, localMetadataJobKind, localMetadataJobKind)
 	result, err := tx.ExecContext(ctx, `UPDATE local_scan_jobs
 		SET status = 'queued',
 			priority = ?,
@@ -373,6 +404,17 @@ func (s *Service) requeueFailedLocalMetadataJobs(ctx context.Context) (int, erro
 				AND j.source_key IN (`+sourcePlaceholders+`)
 				AND j.location_id IS NOT NULL
 				AND j.status IN ('queued', 'failed')
+				AND (? = 0 OR NOT EXISTS (
+					SELECT 1
+					FROM local_asset_locations duration_location
+					JOIN local_assets duration_asset
+						ON duration_asset.source_key = duration_location.source_key
+						AND duration_asset.asset_id = duration_location.asset_id
+					WHERE duration_location.id = j.location_id
+						AND duration_asset.media_type = 'video'
+						AND duration_asset.visibility_status = 'active'
+						AND TRIM(COALESCE(duration_asset.duration, '')) = ''
+				))
 				AND EXISTS (
 					SELECT 1
 					FROM local_scan_jobs failed_job
@@ -392,26 +434,35 @@ func (s *Service) requeueFailedLocalMetadataJobs(ctx context.Context) (int, erro
 						AND running_job.status = 'running'
 				)
 			GROUP BY j.source_key, j.location_id
-		)`, updateArgs...)
+	)`, updateArgs...)
 	if err != nil {
-		_ = tx.Rollback()
 		return 0, fmt.Errorf("requeue failed local metadata jobs: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		_ = tx.Rollback()
 		return 0, fmt.Errorf("read requeued failed local metadata rows: %w", err)
 	}
 	cleanupArgs := []any{localMetadataJobKind}
 	for _, sourceKey := range sourceKeys {
 		cleanupArgs = append(cleanupArgs, sourceKey)
 	}
-	cleanupArgs = append(cleanupArgs, localMetadataJobKind)
+	cleanupArgs = append(cleanupArgs, excludeMissingDuration, localMetadataJobKind)
 	if _, err := tx.ExecContext(ctx, `DELETE FROM local_scan_jobs
 		WHERE job_kind = ?
 			AND source_key IN (`+sourcePlaceholders+`)
 			AND location_id IS NOT NULL
 			AND status = 'failed'
+			AND (? = 0 OR NOT EXISTS (
+				SELECT 1
+				FROM local_asset_locations duration_location
+				JOIN local_assets duration_asset
+					ON duration_asset.source_key = duration_location.source_key
+					AND duration_asset.asset_id = duration_location.asset_id
+				WHERE duration_location.id = local_scan_jobs.location_id
+					AND duration_asset.media_type = 'video'
+					AND duration_asset.visibility_status = 'active'
+					AND TRIM(COALESCE(duration_asset.duration, '')) = ''
+			))
 			AND EXISTS (
 				SELECT 1
 				FROM local_scan_jobs active_job
@@ -430,11 +481,7 @@ func (s *Service) requeueFailedLocalMetadataJobs(ctx context.Context) (int, erro
 					AND rs.root_generation = local_scan_jobs.root_generation
 				WHERE l.id = local_scan_jobs.location_id
 			)`, cleanupArgs...); err != nil {
-		_ = tx.Rollback()
 		return 0, fmt.Errorf("complete superseded failed local metadata jobs: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit failed local metadata requeue: %w", err)
 	}
 	return int(affected), nil
 }
@@ -495,6 +542,43 @@ func (s *Service) processLocalMetadataJob(ctx context.Context, job localMetadata
 		}
 		return false, errLocalMetadataSourceChanged
 	}
+	mediaType, ok := localMediaTypeFromFilename(location.RelativePath)
+	if !ok {
+		return false, fmt.Errorf("unsupported local media extension")
+	}
+	capability := s.localMediaHelperCapabilityStatusWithContext(ctx)
+	if location.AssetID != "" && capability.canCapture(mediaType) {
+		pending, err := s.localCaptureMetadataPending(ctx, location)
+		if err != nil {
+			return false, err
+		}
+		if pending {
+			metadata, err := s.inspectLocalCaptureMetadata(ctx, file, mediaType, info.ModTime(), now)
+			if err != nil {
+				return false, err
+			}
+			if err := s.revalidateLocalMetadataAfterInspection(ctx, trustedRoot, job.ID, location, file, info); err != nil {
+				return false, err
+			}
+			return false, s.updateLocalCaptureMetadata(ctx, location, job.ID, metadata, formatCatalogTime(time.Now().UTC()))
+		}
+	}
+	if mediaType == "video" && location.AssetID != "" {
+		missingDuration, err := s.localVideoDurationMissing(ctx, location.SourceKey, location.AssetID)
+		if err != nil {
+			return false, err
+		}
+		if missingDuration {
+			duration, err := s.inspectLocalVideoDuration(ctx, file)
+			if err != nil {
+				return false, err
+			}
+			if err := s.revalidateLocalMetadataAfterInspection(ctx, trustedRoot, job.ID, location, file, info); err != nil {
+				return false, err
+			}
+			return false, s.updateLocalVideoDuration(ctx, location, job.ID, *duration, formatCatalogTime(time.Now().UTC()))
+		}
+	}
 	if info.Size() >= localMetadataLargeFileLogThreshold {
 		log.Printf("timich-agent local metadata sha1 starting job_id=%d location_id=%d size_bytes=%d", job.ID, job.LocationID, info.Size())
 	}
@@ -523,15 +607,37 @@ func (s *Service) processLocalMetadataJob(ctx context.Context, job localMetadata
 		}
 		return false, errLocalMetadataSourceChanged
 	}
-	mediaType, ok := localMediaTypeFromFilename(location.RelativePath)
-	if !ok {
-		return false, fmt.Errorf("unsupported local media extension")
-	}
 	filename := filepath.Base(location.RelativePath)
-	capturedAt := info.ModTime().UTC()
+	metadata := fallbackLocalCaptureMetadata(info.ModTime(), now)
+	var duration *string
+	if capability.canCapture(mediaType) {
+		metadata, err = s.inspectLocalCaptureMetadata(ctx, pathFile, mediaType, info.ModTime(), now)
+		if err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
+			log.Printf("timich-agent local capture metadata inspection failed job_id=%d location_id=%d error=%v", job.ID, location.ID, err)
+		}
+		duration = metadata.Duration
+		if err := s.revalidateLocalMetadataAfterInspection(ctx, trustedRoot, job.ID, location, pathFile, infoAfter); err != nil {
+			return false, err
+		}
+	} else if mediaType == "video" {
+		if capability.Usable && capability.InspectVideo {
+			duration, err = s.inspectLocalVideoDuration(ctx, pathFile)
+			if err != nil {
+				log.Printf("timich-agent local video duration inspection failed job_id=%d location_id=%d error=%v", job.ID, job.LocationID, err)
+				duration = nil
+			}
+			if err := s.revalidateLocalMetadataAfterInspection(ctx, trustedRoot, job.ID, location, pathFile, infoAfter); err != nil {
+				return false, err
+			}
+		}
+	}
 	registerStarted := time.Now()
 	registrationNowText := formatCatalogTime(time.Now().UTC())
-	err = s.registerLocalMetadata(ctx, trustedRoot.datasource, trustedRoot.externalContentIdentityScopeKey, location, sha1Hex, mediaType, filename, capturedAt, infoAfter, registrationNowText, job.ID)
+	metadata.Duration = duration
+	err = s.registerLocalMetadata(ctx, trustedRoot.datasource, trustedRoot.externalContentIdentityScopeKey, location, sha1Hex, mediaType, filename, metadata, infoAfter, registrationNowText, job.ID)
 	if elapsed := time.Since(registerStarted); elapsed > localMetadataSlowStepThreshold {
 		log.Printf("timich-agent local metadata register slow job_id=%d location_id=%d size_bytes=%d elapsed=%s", job.ID, job.LocationID, info.Size(), elapsed.Round(time.Millisecond))
 	}
@@ -585,10 +691,10 @@ func (s *Service) claimLocalMetadataJob(ctx context.Context, job localMetadataJo
 
 func (s *Service) localLocationForMetadata(ctx context.Context, locationID int64) (localLocationForMetadata, error) {
 	var location localLocationForMetadata
-	if err := s.catalog.queryDB().QueryRowContext(ctx, `SELECT id, source_key, root_key, relative_path, status, size_bytes, mtime, fast_signature, file_identity
+	if err := s.catalog.queryDB().QueryRowContext(ctx, `SELECT id, source_key, COALESCE(asset_id, ''), root_key, relative_path, status, size_bytes, mtime, fast_signature, file_identity
 		FROM local_asset_locations
 		WHERE id = ?`, locationID).
-		Scan(&location.ID, &location.SourceKey, &location.RootKey, &location.RelativePath, &location.Status, &location.SizeBytes, &location.MTime, &location.FastSignature, &location.FileIdentity); err != nil {
+		Scan(&location.ID, &location.SourceKey, &location.AssetID, &location.RootKey, &location.RelativePath, &location.Status, &location.SizeBytes, &location.MTime, &location.FastSignature, &location.FileIdentity); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return localLocationForMetadata{}, ErrAssetNotFound
 		}
@@ -597,9 +703,11 @@ func (s *Service) localLocationForMetadata(ctx context.Context, locationID int64
 	return location, nil
 }
 
-func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.DatasourceConfig, externalContentIdentityScopeKey string, location localLocationForMetadata, sha1Hex string, mediaType string, filename string, capturedAt time.Time, info os.FileInfo, nowText string, jobID int64) error {
+func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.DatasourceConfig, externalContentIdentityScopeKey string, location localLocationForMetadata, sha1Hex string, mediaType string, filename string, metadata localCaptureMetadata, info os.FileInfo, nowText string, jobID int64) error {
 	assetID := localAssetID(sha1Hex, info.Size())
-	capturedAtText := formatCatalogTime(capturedAt)
+	capturedAtText := formatCatalogTime(metadata.CapturedAt)
+	capturedAtSource := metadata.Source
+	duration := metadata.Duration
 	mtimeText := formatCatalogTime(info.ModTime().UTC())
 	fastSignature := fmt.Sprintf("%d:%s", info.Size(), mtimeText)
 	fileIdentity := localFileIdentity(info)
@@ -639,11 +747,12 @@ func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.D
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO local_assets (
 			source_key, asset_id, sha1_hex, content_size_bytes, media_type, filename,
-			captured_at, captured_at_source, primary_location_id, visibility_status,
+			captured_at, captured_at_source, duration, primary_location_id, visibility_status,
 			thumbnail_status, first_seen_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'pending', ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'pending', ?, ?)
 		ON CONFLICT(source_key, asset_id) DO UPDATE SET
 			content_size_bytes = excluded.content_size_bytes,
+			duration = COALESCE(excluded.duration, local_assets.duration),
 			visibility_status = 'active',
 			primary_location_id = COALESCE(local_assets.primary_location_id, excluded.primary_location_id),
 			updated_at = excluded.updated_at`,
@@ -654,13 +763,38 @@ func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.D
 		mediaType,
 		filename,
 		capturedAtText,
-		"file_mtime",
+		capturedAtSource,
+		nullStringToAny(nullStringFromOptionalString(duration)),
 		location.ID,
 		nowText,
 		nowText,
 	); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("upsert local asset: %w", err)
+	}
+	// Identical bytes discovered at another path retain the primary location's
+	// date. Publish that same value to both Local and unified catalog rows.
+	var primaryLocationID int64
+	var storedCaptureSource string
+	if err := tx.QueryRowContext(ctx, `SELECT captured_at, captured_at_source, primary_location_id FROM local_assets WHERE source_key = ? AND asset_id = ?`,
+		datasource.SourceKey, assetID).Scan(&capturedAtText, &storedCaptureSource, &primaryLocationID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if primaryLocationID == location.ID && (metadata.Checked || storedCaptureSource == "file_mtime" || storedCaptureSource == "scan_time") &&
+		(capturedAtText != formatCatalogTime(metadata.CapturedAt) || storedCaptureSource != metadata.Source) {
+		capturedAtText = formatCatalogTime(metadata.CapturedAt)
+		if _, err := tx.ExecContext(ctx, `UPDATE local_assets SET captured_at = ?, captured_at_source = ? WHERE source_key = ? AND asset_id = ?`,
+			capturedAtText, metadata.Source, datasource.SourceKey, assetID); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if metadata.Checked && primaryLocationID == location.ID {
+		if err := s.markLocalCaptureMetadataInTx(ctx, tx, datasource.SourceKey, assetID, nowText); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE local_asset_locations
 		SET asset_id = ?,
@@ -701,12 +835,13 @@ func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.D
 			upstream_checksum_algorithm, content_sha1_hex, content_size_bytes,
 			canonical_content_sha1_hex, canonical_content_size_bytes,
 			place_label, description, first_seen_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, NULL, 'active', ?, 0, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, 0, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
 		ON CONFLICT(source_key, upstream_asset_id) DO UPDATE SET
 			datasource_kind = excluded.datasource_kind,
 			media_type = excluded.media_type,
 			filename = excluded.filename,
 			captured_at = excluded.captured_at,
+			duration = COALESCE(excluded.duration, catalog_assets.duration),
 			visibility_status = 'active',
 			source_updated_at = excluded.source_updated_at,
 			upstream_checksum_algorithm = excluded.upstream_checksum_algorithm,
@@ -721,6 +856,7 @@ func (s *Service) registerLocalMetadata(ctx context.Context, datasource config.D
 		mediaType,
 		filename,
 		capturedAtText,
+		nullStringToAny(nullStringFromOptionalString(duration)),
 		mtimeText,
 		upstreamChecksumAlgorithmSHA1,
 		sha1Hex,
@@ -770,6 +906,7 @@ func lockLocalMetadataRegistrationInTx(ctx context.Context, tx *sql.Tx, location
 		WHERE id = ?
 			AND source_key = ?
 			AND status = ?
+			AND COALESCE(asset_id, '') = ?
 			AND size_bytes = ?
 			AND mtime = ?
 			AND fast_signature = ?
@@ -785,6 +922,7 @@ func lockLocalMetadataRegistrationInTx(ctx context.Context, tx *sql.Tx, location
 		location.ID,
 		location.SourceKey,
 		location.Status,
+		location.AssetID,
 		location.SizeBytes,
 		location.MTime,
 		location.FastSignature,

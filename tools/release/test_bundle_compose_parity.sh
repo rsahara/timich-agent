@@ -36,9 +36,15 @@ grep -Fq 'docker compose "${compose_args[@]}" logs -f' "$public_readme"
 grep -Fq 'copy that complete' "$public_readme"
 grep -Fq -- '-config /var/lib/timich-agent/agent.json' "$public_readme"
 grep -Fq -- '-data-dir /var/lib/timich-agent/state' "$public_readme"
-grep -Fq 'pre-release-migrate-catalog-v2-v3' "$public_readme"
+if grep -Fq 'pre-release-migrate-catalog-v3-v4' "$public_readme"; then
+  echo "public README must not advertise the retired V3 migration" >&2
+  exit 1
+fi
 grep -Fq -- '--entrypoint /usr/local/bin/timich-agent' "$public_readme"
-grep -Fq -- '--backup /var/lib/timich-agent/backups/catalog-v2-before-v3.db' "$public_readme"
+grep -Fq 'pre-release-migrate-catalog-v4-v5' "$public_readme"
+grep -Fq -- '--source /var/lib/timich-agent/state/catalog-state-v1/catalog.db' "$public_readme"
+grep -Fq -- '--output /var/lib/timich-agent/state/catalog-state-v1/catalog-v5.db' "$public_readme"
+grep -Fq 'V4-to-V5 is the only offline catalog migration' "$public_readme"
 
 sed -n 's/^      \(TIMICH_AGENT_[A-Z0-9_]*\):.*/\1/p' "$source_compose" | sort -u > "$temporary_dir/source-environment"
 sed -n 's/^      \(TIMICH_AGENT_[A-Z0-9_]*\):.*/\1/p' "$bundle_compose" | sort -u > "$temporary_dir/bundle-environment"
@@ -95,12 +101,20 @@ grep -Fq \
 grep -Fq \
   '"state_root=/var/lib/timich-agent"' \
   "$temporary_dir/dist-dry-run"
+if grep -Fq 'pre-release-migrate-catalog-v3-v4' "$temporary_dir/dist-dry-run"; then
+  echo "bundle instructions must not advertise the retired V3 migration" >&2
+  exit 1
+fi
 grep -Fq \
-  'pre-release-migrate-catalog-v2-v3' \
+  'pre-release-migrate-catalog-v4-v5' \
   "$temporary_dir/dist-dry-run"
-grep -Fq \
-  '/var/lib/timich-agent/backups/catalog-v2-before-v3.db' \
+grep -Fq -- \
+  '--source /var/lib/timich-agent/state/catalog-state-v1/catalog.db' \
   "$temporary_dir/dist-dry-run"
+grep -Fq -- \
+  '--output /var/lib/timich-agent/state/catalog-state-v1/catalog-v5.db' \
+  "$temporary_dir/dist-dry-run"
+grep -Fq 'V4-to-V5 is the only offline catalog migration' "$temporary_dir/dist-dry-run"
 grep -Fq -- \
   "-X main.releaseTag=$release_tag" \
   "$temporary_dir/dist-dry-run"
