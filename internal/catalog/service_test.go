@@ -5556,6 +5556,9 @@ func TestImmichMirrorIncrementalSyncUsesUpdatedAfterAndMergesAssets(t *testing.T
 				t.Fatalf("decode request body: %v", err)
 			}
 			requestBodies = append(requestBodies, body)
+			if body["visibility"] != "timeline" {
+				return jsonResponse(`{"assets":{"total":0,"nextPage":null,"items":[]}}`), nil
+			}
 			if len(requestBodies) == 1 {
 				return jsonResponse(`{
 					"assets": {
@@ -5605,14 +5608,14 @@ func TestImmichMirrorIncrementalSyncUsesUpdatedAfterAndMergesAssets(t *testing.T
 	if incremental.Mode != MirrorSyncModeIncremental || incremental.FetchedCount != 1 || incremental.ActiveCount != 2 {
 		t.Fatalf("incremental result = %#v", incremental)
 	}
-	if len(requestBodies) != 2 {
-		t.Fatalf("request count = %d, want 2", len(requestBodies))
+	if len(requestBodies) != 4 {
+		t.Fatalf("request count = %d, want 4", len(requestBodies))
 	}
 	if _, ok := requestBodies[0]["updatedAfter"]; ok {
 		t.Fatalf("full request unexpectedly had updatedAfter: %#v", requestBodies[0])
 	}
-	if got := requestBodies[1]["updatedAfter"]; got != "2026-06-01T10:05:00Z" {
-		t.Fatalf("incremental updatedAfter = %#v, want previous max updatedAt", got)
+	if got := requestBodies[1]["updatedAfter"]; got != full.SyncedThrough.Format(time.RFC3339Nano) {
+		t.Fatalf("incremental updatedAfter = %#v, want full-sync start", got)
 	}
 	timeline, err := service.SearchAssets(AssetSearchRequest{
 		Collection: AssetCollectionRequest{Kind: CollectionKindTimeline},
@@ -5955,9 +5958,10 @@ func immichMirrorLargeTestClient(t *testing.T, totalAssets int) *http.Client {
 				t.Fatalf("x-api-key = %q, want test-key", r.Header.Get("x-api-key"))
 			}
 			var request struct {
-				Page  int    `json:"page"`
-				Size  int    `json:"size"`
-				Order string `json:"order"`
+				Page        int        `json:"page"`
+				Size        int        `json:"size"`
+				Order       string     `json:"order"`
+				TakenBefore *time.Time `json:"takenBefore"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Fatalf("decode mirror request: %v", err)
@@ -5966,9 +5970,16 @@ func immichMirrorLargeTestClient(t *testing.T, totalAssets int) *http.Client {
 				t.Fatalf("mirror request = %#v", request)
 			}
 			offset := (request.Page - 1) * request.Size
-			end := min(offset+request.Size, totalAssets)
+
 			items := []map[string]any{}
 			baseTime := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+			if request.TakenBefore != nil {
+				offset = max(0, int(baseTime.Sub(*request.TakenBefore)/time.Minute))
+				for offset < totalAssets && baseTime.Add(-time.Duration(offset)*time.Minute).After(*request.TakenBefore) {
+					offset++
+				}
+			}
+			end := min(offset+request.Size, totalAssets)
 			for index := offset; index < end; index++ {
 				capturedAt := baseTime.Add(-time.Duration(index) * time.Minute).Format(time.RFC3339Nano)
 				items = append(items, map[string]any{
@@ -7154,6 +7165,11 @@ func TestProfileHeadRequestsUseGetUpstreamAndReportRenderedLength(t *testing.T) 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Method == http.MethodGet && request.URL.Path == "/api/server/ping" {
+		response := jsonResponse(`{"res":"pong"}`)
+		response.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		return response, nil
+	}
 	return f(request)
 }
 

@@ -23,8 +23,8 @@ const (
 	// normal publish path below this threshold.
 	semanticIndexPartialPublishDivisor = 5
 	backgroundWorkerActiveDelay        = 500 * time.Millisecond
-	mixedMetadataWeightMultiplier      = 3.0
-	mixedThumbnailWeightMultiplier     = 5.0
+	mixedMetadataWeightMultiplier      = 5.0
+	mixedThumbnailWeightMultiplier     = 3.0
 	mixedMetadataQueueWeightCap        = 300
 	mixedThumbnailQueueWeightCap       = 300
 	mixedEmbeddingQueueWeightCap       = 500

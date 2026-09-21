@@ -37,6 +37,7 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 				"/v1/assets/search/capabilities",
 				"/v1/assets/{assetID}",
 				"/v1/uploads/me",
+				"/v1/uploads/check",
 				"/v1/uploads/sessions",
 				"/v1/uploads/sessions/{uploadId}",
 				"/v1/uploads/sessions/{uploadId}/chunk",
@@ -277,6 +278,27 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 			return
 		}
 		response, err := runtime.AppUploadState(claims.AppDeviceID)
+		if err != nil {
+			writeUploadError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, response)
+	})
+	mux.HandleFunc("/v1/uploads/check", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeMethodNotAllowed(w, "Use POST to check upload identities.")
+			return
+		}
+		claims, ok := authenticateRequest(w, runtime, r)
+		if !ok {
+			return
+		}
+		var request runtimestate.UploadCheckInput
+		if err := decodeJSONRequest(w, r, &request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request", "message": "Could not parse the upload check request."})
+			return
+		}
+		response, err := runtime.CheckUploads(claims.AppDeviceID, request)
 		if err != nil {
 			writeUploadError(w, err)
 			return

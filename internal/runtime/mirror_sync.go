@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	defaultDatasourceMirrorSyncInterval    = 15 * time.Minute
-	datasourceMirrorIncrementalSyncTimeout = 5 * time.Minute
-	datasourceMirrorFullSyncTimeout        = 12 * time.Hour
+	defaultDatasourceMirrorSyncInterval       = 30 * time.Minute
+	defaultDatasourceMirrorReconciliationTime = "02:00"
+	datasourceMirrorIncrementalSyncTimeout    = 5 * time.Minute
+	datasourceMirrorFullSyncTimeout           = 12 * time.Hour
 )
 
 type datasourceMirrorSchedule struct {
@@ -140,7 +141,7 @@ func (a *AgentRuntime) syncConfiguredDatasourceMirrors(ctx context.Context, reas
 		if ctx.Err() != nil {
 			return
 		}
-		mode := a.datasourceMirrorSyncModeForSource(ctx, sourceKey, reason)
+		mode := a.datasourceMirrorSyncModeForSource(ctx, sourceKey, time.Now())
 		syncCtx, cancel := context.WithTimeout(ctx, DatasourceMirrorSyncTimeoutForMode(mode))
 		result, err := catalogService.SyncDatasourceMirror(syncCtx, sourceKey, mode)
 		cancel()
@@ -174,28 +175,32 @@ func (a *AgentRuntime) notifyDatasourceMirrorSyncCompleted() {
 	a.wakeBackgroundWorkerScheduler()
 }
 
-func (a *AgentRuntime) datasourceMirrorSyncModeForSource(ctx context.Context, sourceKey string, reason string) string {
-	switch reason {
-	case "daily_full_sweep":
-		return catalog.MirrorSyncModeFull
-	default:
-		if a.datasourceMirrorHasCompletedFullSync(ctx, sourceKey) {
-			return catalog.MirrorSyncModeIncremental
-		}
-		return catalog.MirrorSyncModeFull
-	}
-}
-
-func (a *AgentRuntime) datasourceMirrorHasCompletedFullSync(ctx context.Context, sourceKey string) bool {
+// Every automatic wake checks the last successful reconciliation. This catches
+// missed daily runs after downtime, retries failures, and lets a manual run
+// satisfy the current daily occurrence without repeating it on restart.
+func (a *AgentRuntime) datasourceMirrorSyncModeForSource(ctx context.Context, sourceKey string, now time.Time) string {
 	catalogService := a.catalogService()
 	if catalogService == nil {
-		return false
+		return catalog.MirrorSyncModeFull
 	}
 	status, err := catalogService.MirrorStatusForDatasource(ctx, sourceKey)
-	if err != nil {
-		return false
+	if err != nil || status.LastFullSyncAt == nil {
+		return catalog.MirrorSyncModeFull
 	}
-	return status.LastFullSyncAt != nil
+	a.mu.RLock()
+	location := localScheduleLocation(a.config.Timezone)
+	clock := defaultDatasourceMirrorReconciliationTime
+	for _, datasource := range a.config.Datasources {
+		if datasource.SourceKey == sourceKey {
+			clock = datasourceMirrorReconciliationTime(datasource)
+			break
+		}
+	}
+	a.mu.RUnlock()
+	if status.LastFullSyncAt.Before(latestLocalDailySchedule(now, location, clock)) {
+		return catalog.MirrorSyncModeFull
+	}
+	return catalog.MirrorSyncModeIncremental
 }
 
 // DatasourceMirrorSyncTimeoutForMode returns the request budget for a mirror sync mode.
@@ -209,6 +214,10 @@ func DatasourceMirrorSyncTimeoutForMode(mode string) time.Duration {
 }
 
 func (a *AgentRuntime) datasourceMirrorSchedule() (datasourceMirrorSchedule, bool) {
+	return a.datasourceMirrorScheduleAt(time.Now())
+}
+
+func (a *AgentRuntime) datasourceMirrorScheduleAt(now time.Time) (datasourceMirrorSchedule, bool) {
 	if a == nil {
 		return datasourceMirrorSchedule{}, false
 	}
@@ -219,29 +228,33 @@ func (a *AgentRuntime) datasourceMirrorSchedule() (datasourceMirrorSchedule, boo
 	}
 	interval := time.Duration(0)
 	dailyFullSweepWindow := ""
+	var earliestReconciliation time.Time
+	location := localScheduleLocation(a.config.Timezone)
 	for _, datasource := range a.config.Datasources {
 		if datasource.Kind != config.DatasourceKindImmichIndexed {
 			continue
 		}
 		datasourceInterval := defaultDatasourceMirrorSyncInterval
-		if datasource.Indexing == nil {
-			if interval == 0 || datasourceInterval < interval {
-				interval = datasourceInterval
+		if datasource.Indexing != nil {
+			if rawInterval := strings.TrimSpace(datasource.Indexing.Phase0SyncInterval); rawInterval != "" {
+				parsed, err := time.ParseDuration(rawInterval)
+				if err != nil || parsed <= 0 {
+					return datasourceMirrorSchedule{}, false
+				}
+				datasourceInterval = parsed
 			}
-			continue
-		}
-		if rawInterval := strings.TrimSpace(datasource.Indexing.Phase0SyncInterval); rawInterval != "" {
-			parsed, err := time.ParseDuration(rawInterval)
-			if err != nil || parsed <= 0 {
-				return datasourceMirrorSchedule{}, false
-			}
-			datasourceInterval = parsed
 		}
 		if interval == 0 || datasourceInterval < interval {
 			interval = datasourceInterval
 		}
-		if dailyFullSweepWindow == "" {
-			dailyFullSweepWindow = strings.TrimSpace(datasource.Indexing.DailyFullSweepWindow)
+		clock := datasourceMirrorReconciliationTime(datasource)
+		next, ok := nextDatasourceMirrorDailyFullSweep(now, location, clock)
+		if !ok {
+			return datasourceMirrorSchedule{}, false
+		}
+		if earliestReconciliation.IsZero() || next.Before(earliestReconciliation) {
+			earliestReconciliation = next
+			dailyFullSweepWindow = clock
 		}
 	}
 	if interval == 0 {
@@ -251,6 +264,15 @@ func (a *AgentRuntime) datasourceMirrorSchedule() (datasourceMirrorSchedule, boo
 		Interval:             interval,
 		DailyFullSweepWindow: dailyFullSweepWindow,
 	}, true
+}
+
+func datasourceMirrorReconciliationTime(datasource config.DatasourceConfig) string {
+	if datasource.Indexing != nil {
+		if clock := strings.TrimSpace(datasource.Indexing.DailyFullSweepWindow); clock != "" {
+			return clock
+		}
+	}
+	return defaultDatasourceMirrorReconciliationTime
 }
 
 func nextDatasourceMirrorDailyFullSweep(now time.Time, location *time.Location, window string) (time.Time, bool) {

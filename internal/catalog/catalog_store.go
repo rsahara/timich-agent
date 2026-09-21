@@ -47,6 +47,8 @@ var (
 // ImmichMirrorAsset is one normalized Immich metadata row stored in the Agent
 // catalog.
 type ImmichMirrorAsset struct {
+	// Excluded is an incremental update for an existing row, never a new asset.
+	Excluded                        bool
 	UpstreamAssetID                 string
 	MediaType                       string
 	Filename                        string
@@ -103,6 +105,7 @@ type CatalogSemanticStatus struct {
 
 // MirrorSyncResult reports one manual mirror sync.
 type MirrorSyncResult struct {
+	SyncedThrough    time.Time    `json:"-"`
 	Mode             string       `json:"mode"`
 	Status           string       `json:"status"`
 	LatestAssetLimit int          `json:"latestAssetLimit,omitempty"`
@@ -593,7 +596,7 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 		if err := s.ensureCatalogQueryIndexes(context.Background()); err != nil {
 			return err
 		}
-		return nil
+		return s.ensureImmichMirrorCursorSchema()
 	}
 	if version != 0 || applicationID != 0 {
 		return fmt.Errorf("%w: found schema version %d and application id %#x, want version %d and application id %#x; stop Timich Agent and remove the catalog state directory %q before restarting", ErrCatalogSchemaResetRequired, version, applicationID, catalogSchemaVersion, catalogApplicationID, s.root)
@@ -901,6 +904,8 @@ func (s *CatalogStore) ensureCatalogSchema() error {
 			latest_asset_limit INTEGER NOT NULL DEFAULT 0,
 			last_full_sync_at TEXT,
 			last_incremental_sync_at TEXT,
+			synced_through TEXT,
+			sync_clock TEXT NOT NULL DEFAULT '',
 			last_error TEXT,
 			updated_at TEXT NOT NULL
 		)`,
@@ -1483,6 +1488,7 @@ func (s *CatalogStore) ReplaceFull(
 	assets []ImmichMirrorAsset,
 	latestAssetLimit int,
 	startedAt time.Time,
+	windowEnd ...time.Time,
 ) (MirrorSyncResult, error) {
 	if s == nil || s.db == nil {
 		return MirrorSyncResult{}, ErrCatalogNotConfigured
@@ -1494,8 +1500,13 @@ func (s *CatalogStore) ReplaceFull(
 	if latestAssetLimit < 0 {
 		latestAssetLimit = 0
 	}
+	syncedThrough := startedAt
+	if len(windowEnd) > 0 {
+		syncedThrough = windowEnd[0]
+	}
 	now := time.Now().UTC()
 	result := MirrorSyncResult{
+		SyncedThrough:    syncedThrough,
 		Mode:             MirrorSyncModeFull,
 		Status:           "ok",
 		LatestAssetLimit: latestAssetLimit,
@@ -1761,7 +1772,7 @@ func (s *CatalogStore) ReplaceFull(
 	status.LastFullSyncAt = &now
 	status.LastIncrementalSyncAt = previousState.LastIncrementalSyncAt
 	status.LastError = ""
-	if err = s.upsertStateInTx(ctx, tx, sourceKey, status, now); err != nil {
+	if err = s.upsertStateInTx(ctx, tx, sourceKey, status, now, syncedThrough); err != nil {
 		return MirrorSyncResult{}, err
 	}
 	if err = s.commitCatalogAssetChanges(ctx, tx, len(changedAssetIDs) > 0); err != nil {
@@ -1853,11 +1864,15 @@ func immichFullSyncChangesInTx(ctx context.Context, tx *sql.Tx, sourceKey string
 	return changedAssetIDs, semanticChanged, nil
 }
 
+// MergeIncremental commits a completely fetched window. An explicit windowEnd
+// separates the upstream cutoff from the diagnostic Agent start time. Store-only
+// callers can omit it when startedAt already represents their window cutoff.
 func (s *CatalogStore) MergeIncremental(
 	ctx context.Context,
 	sourceKey string,
 	assets []ImmichMirrorAsset,
 	startedAt time.Time,
+	windowEnd ...time.Time,
 ) (MirrorSyncResult, error) {
 	if s == nil || s.db == nil {
 		return MirrorSyncResult{}, ErrCatalogNotConfigured
@@ -1866,13 +1881,18 @@ func (s *CatalogStore) MergeIncremental(
 	if sourceKey == "" {
 		return MirrorSyncResult{}, ErrCatalogNotConfigured
 	}
+	syncedThrough := startedAt
+	if len(windowEnd) > 0 {
+		syncedThrough = windowEnd[0]
+	}
 	now := time.Now().UTC()
 	result := MirrorSyncResult{
-		Mode:         MirrorSyncModeIncremental,
-		Status:       "ok",
-		FetchedCount: len(assets),
-		StartedAt:    startedAt.UTC(),
-		CompletedAt:  now,
+		SyncedThrough: syncedThrough,
+		Mode:          MirrorSyncModeIncremental,
+		Status:        "ok",
+		FetchedCount:  len(assets),
+		StartedAt:     startedAt.UTC(),
+		CompletedAt:   now,
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1933,7 +1953,39 @@ func (s *CatalogStore) MergeIncremental(
 	seenUpstreamAssetIDs := make(map[string]struct{}, len(assets))
 	for _, asset := range assets {
 		upstreamAssetID := strings.TrimSpace(asset.UpstreamAssetID)
-		if upstreamAssetID == "" || asset.CapturedAt.IsZero() {
+		if upstreamAssetID == "" {
+			continue
+		}
+		if asset.Excluded {
+			var sourceUpdatedAt any
+			if asset.SourceUpdatedAt != nil && !asset.SourceUpdatedAt.IsZero() {
+				sourceUpdatedAt = formatCatalogTime(asset.SourceUpdatedAt.UTC())
+			}
+			// Preserve metadata/identity and scope the exclusion to this datasource.
+			// Previously unseen hidden assets must not enter the local catalog.
+			updated, updateErr := tx.ExecContext(ctx, `UPDATE catalog_assets
+				SET visibility_status = 'out_of_scope',
+					source_updated_at = COALESCE(?, source_updated_at), updated_at = ?
+				WHERE source_key = ? AND datasource_kind = 'immich' AND upstream_asset_id = ?
+					AND (visibility_status != 'out_of_scope'
+						OR source_updated_at IS NOT COALESCE(?, source_updated_at))`,
+				sourceUpdatedAt, nowText, sourceKey, upstreamAssetID, sourceUpdatedAt)
+			if updateErr != nil {
+				return MirrorSyncResult{}, fmt.Errorf("exclude immich mirror incremental asset %q: %w", upstreamAssetID, updateErr)
+			}
+			changed, rowsErr := updated.RowsAffected()
+			if rowsErr != nil {
+				return MirrorSyncResult{}, fmt.Errorf("inspect immich mirror exclusion %q: %w", upstreamAssetID, rowsErr)
+			}
+			if changed > 0 {
+				if _, ok := seenUpstreamAssetIDs[upstreamAssetID]; !ok {
+					seenUpstreamAssetIDs[upstreamAssetID] = struct{}{}
+					upstreamAssetIDs = append(upstreamAssetIDs, upstreamAssetID)
+				}
+			}
+			continue
+		}
+		if asset.CapturedAt.IsZero() {
 			continue
 		}
 		duration := sql.NullString{}
@@ -2000,7 +2052,7 @@ func (s *CatalogStore) MergeIncremental(
 	status.LastFullSyncAt = previousState.LastFullSyncAt
 	status.LastIncrementalSyncAt = &now
 	status.LastError = ""
-	if err = s.upsertStateInTx(ctx, tx, sourceKey, status, now); err != nil {
+	if err = s.upsertStateInTx(ctx, tx, sourceKey, status, now, syncedThrough); err != nil {
 		return MirrorSyncResult{}, err
 	}
 	for _, upstreamAssetID := range upstreamAssetIDs {
@@ -2075,9 +2127,11 @@ func (s *CatalogStore) status(ctx context.Context, sourceKey string) (MirrorStat
 	var lastFull sql.NullString
 	var lastIncremental sql.NullString
 	var lastError sql.NullString
-	err = db.QueryRowContext(ctx, `SELECT status, latest_asset_limit, last_full_sync_at, last_incremental_sync_at, last_error
+	var cursor sql.NullString
+	var clock string
+	err = db.QueryRowContext(ctx, `SELECT status, latest_asset_limit, last_full_sync_at, last_incremental_sync_at, last_error, synced_through, sync_clock
 		FROM immich_mirror_state WHERE source_key = ?`, sourceKey).
-		Scan(&stateStatus, &latestLimit, &lastFull, &lastIncremental, &lastError)
+		Scan(&stateStatus, &latestLimit, &lastFull, &lastIncremental, &lastError, &cursor, &clock)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return MirrorStatus{}, fmt.Errorf("read immich mirror state: %w", err)
 	}
@@ -2098,6 +2152,10 @@ func (s *CatalogStore) status(ctx context.Context, sourceKey string) (MirrorStat
 		}
 		if lastError.Valid {
 			status.LastError = lastError.String
+		}
+		if !cursor.Valid || clock != immichMirrorClock {
+			status.Status = "error"
+			status.LastError = immichMirrorReconciliationRequired
 		}
 	}
 	return status, nil
@@ -2191,7 +2249,7 @@ func (s *CatalogStore) statusCounts(ctx context.Context, sourceKey string) (Mirr
 	return s.statusInTx(ctx, tx, sourceKey)
 }
 
-func (s *CatalogStore) upsertStateInTx(ctx context.Context, tx *sql.Tx, sourceKey string, status MirrorStatus, now time.Time) error {
+func (s *CatalogStore) upsertStateInTx(ctx context.Context, tx *sql.Tx, sourceKey string, status MirrorStatus, now, syncedThrough time.Time) error {
 	var lastFull any
 	if status.LastFullSyncAt != nil {
 		lastFull = formatCatalogTime(status.LastFullSyncAt.UTC())
@@ -2204,17 +2262,23 @@ func (s *CatalogStore) upsertStateInTx(ctx context.Context, tx *sql.Tx, sourceKe
 	if strings.TrimSpace(status.LastError) != "" {
 		lastError = status.LastError
 	}
+	var cursor any
+	if !syncedThrough.IsZero() {
+		cursor = formatCatalogTime(syncedThrough)
+	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO immich_mirror_state (
 			source_key, status, latest_asset_limit, last_full_sync_at,
-			last_incremental_sync_at, last_error, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
+			last_incremental_sync_at, last_error, updated_at, synced_through, sync_clock
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(source_key) DO UPDATE SET
 			status = excluded.status,
 			latest_asset_limit = excluded.latest_asset_limit,
 			last_full_sync_at = excluded.last_full_sync_at,
 			last_incremental_sync_at = excluded.last_incremental_sync_at,
 			last_error = excluded.last_error,
-			updated_at = excluded.updated_at`,
+			updated_at = excluded.updated_at,
+			synced_through = excluded.synced_through,
+			sync_clock = excluded.sync_clock`,
 		sourceKey,
 		status.Status,
 		status.LatestAssetLimit,
@@ -2222,6 +2286,8 @@ func (s *CatalogStore) upsertStateInTx(ctx context.Context, tx *sql.Tx, sourceKe
 		lastIncremental,
 		lastError,
 		formatCatalogTime(now.UTC()),
+		cursor,
+		immichMirrorClock,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert immich mirror state: %w", err)

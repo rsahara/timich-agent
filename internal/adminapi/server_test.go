@@ -346,7 +346,7 @@ func TestIndexServesDashboardWithCopyPairingControl(t *testing.T) {
 		t.Fatalf("dashboard body still has the old datasource indexing section: %s", recorder.Body.String())
 	}
 	if !bytes.Contains(body, []byte("Run reconciliation now")) ||
-		!bytes.Contains(body, []byte("Quick discovery finds likely filesystem changes with low NAS load")) ||
+		!bytes.Contains(body, []byte("Run reconciliation now runs it for all indexed datasources")) ||
 		!bytes.Contains(body, []byte(`data-datasource-task-action="media-discovery"`)) {
 		t.Fatalf("dashboard body is missing explicit reconciliation controls: %s", recorder.Body.String())
 	}
@@ -2218,6 +2218,10 @@ func TestSemanticModelsRunsSemanticIndexingBatch(t *testing.T) {
 		case "/model.zip":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(artifact)
+		case "/api/server/ping":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
 		case "/api/search/metadata":
 			if r.Header.Get("x-api-key") != "immich-api-key" {
 				t.Fatalf("x-api-key = %q, want configured key", r.Header.Get("x-api-key"))
@@ -2530,6 +2534,10 @@ func TestSemanticModelsSearchEnableInstallsIndexesAndSchedules(t *testing.T) {
 		case "/model.zip":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(artifact)
+		case "/api/server/ping":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
 		case "/api/search/metadata":
 			if r.Header.Get("x-api-key") != "immich-api-key" {
 				t.Fatalf("x-api-key = %q, want configured key", r.Header.Get("x-api-key"))
@@ -3273,6 +3281,11 @@ func TestPrimaryDatasourceCheckReturnsDatasourceStatus(t *testing.T) {
 	t.Parallel()
 
 	datasourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/server/ping" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
+		}
 		if r.URL.Path != "/api/search/metadata" {
 			t.Fatalf("unexpected datasource path %s", r.URL.Path)
 		}
@@ -3406,6 +3419,11 @@ func TestDatasourceIndexingRunReturnsRemoteCounts(t *testing.T) {
 	t.Parallel()
 
 	datasourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/server/ping" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
+		}
 		if r.URL.Path != "/api/search/metadata" {
 			t.Fatalf("unexpected datasource path %s", r.URL.Path)
 		}
@@ -3498,6 +3516,19 @@ func TestDatasourceIndexingRunReturnsRemoteCounts(t *testing.T) {
 		statusPayload.Datasources[0].LatestAssetLimit != 1 ||
 		statusPayload.Datasources[0].ActiveAssets != 1 {
 		t.Fatalf("status payload = %#v", statusPayload)
+	}
+	if statusPayload.Datasources[0].LastReconciliationAt == nil ||
+		!statusPayload.Datasources[0].LastReconciliationAt.Equal(*statusPayload.Datasources[0].LastFullSyncAt) {
+		t.Fatalf("Immich reconciliation completion missing from datasource status: %+v", statusPayload.Datasources[0])
+	}
+	var reconciliationAt *time.Time
+	for _, task := range statusPayload.Tasks {
+		if task.Phase == "phase0" {
+			reconciliationAt = task.LastReconciliationAt
+		}
+	}
+	if reconciliationAt == nil || !reconciliationAt.Equal(*statusPayload.Datasources[0].LastReconciliationAt) {
+		t.Fatalf("Immich reconciliation completion missing from shared task: %+v", statusPayload.Tasks)
 	}
 
 	catalogRecorder := httptest.NewRecorder()

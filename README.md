@@ -356,6 +356,58 @@ published with that release. Semantic-enabled prereleases include a
 model pack and platform runtime pack from that registry when semantic search is
 enabled.
 
+### Reconciliation and Indexed Immich Sync
+
+**Reconciliation** compares the datasource's current media list with the Agent
+catalog, adding or updating entries and excluding media no longer in that list.
+It has the same meaning for Local and indexed Immich datasources. In Admin's
+**Datasource Tasks**, choose **Run reconciliation now** to reconcile all indexed
+datasources. Passthrough Immich does not maintain a catalog and is not included.
+
+Indexed Immich runs ordinary incremental sync every **30 minutes** and daily
+reconciliation at **02:00** in the Agent's configured timezone by default. Local
+reconciliation defaults to **04:00**, spreading out the scheduled full scans.
+Explicit Immich `indexing.phase0SyncInterval` and `indexing.dailyFullSweepWindow`
+settings are preserved; an omitted or empty daily clock now uses `02:00`.
+Full reconciliation has the normal full-library network and database cost.
+
+Startup and ordinary sync check whether the most recent scheduled reconciliation
+has completed. An overdue run is caught up, including after an upgrade or downtime;
+a failed run remains due and is retried at the next synchronization. A successful
+manual reconciliation after that day's scheduled time also satisfies that run,
+so a restart does not repeat it. Routine intervals otherwise remain incremental.
+
+If datasource status asks for a full reconciliation after an upgrade, run one
+full sync for that Immich Indexed datasource at a convenient time. Existing
+gallery data remains available; incremental sync resumes after the reconciliation
+completes. The migration preserves catalog identities. The daily reconciliation
+or its overdue catch-up can also complete this full scan.
+
+Incremental sync includes trash changes in its update window. After upgrading
+from a version that missed trash transitions, one full sync removes stale entries
+older than the current checkpoint.
+
+Immich API keys cannot search locked assets: that requires an elevated login
+session. Moving a photo to a locked folder, permanently deleting it, or revoking
+access can therefore leave its indexed entry and cached thumbnail visible until
+the next successful reconciliation, normally within about a day. Use **Run
+reconciliation now** when you need these changes reflected sooner. Failed or
+offline runs can extend that delay. A retained independent copy in another
+datasource remains visible.
+
+To target only that datasource, send an authenticated
+`POST /v1/datasources/indexing/run` request with
+`{"sourceKey":"YOUR_SOURCE_KEY","mode":"full"}`. Keep the existing data directory.
+
+Indexed sync uses Immich's server time. If the datasource URL uses a reverse
+proxy, preserve the upstream HTTP `Date` header and disable caching for
+`/api/server/ping`; synchronize the Immich server and database clocks. An invalid,
+cached, or backward clock response leaves the previous sync checkpoint intact.
+Each sync adds one small clock request. Extremely dense capture timestamps can
+exceed the metadata API's 1000-row paging boundary; in that case sync reports an
+incomplete result and keeps the previous catalog and checkpoint. A full retry
+does not remove this API limitation.
+
 ### Pre-Release Catalog Migration
 
 This build uses unreleased catalog schema V5. Fresh installations need no
@@ -896,7 +948,7 @@ Use indexed kinds when combining Immich with a NAS or another library:
       "url": "http://immich_server:2283",
       "accessToken": "IMMICH_API_KEY",
       "indexing": {
-        "phase0SyncInterval": "15m",
+        "phase0SyncInterval": "30m",
         "dailyFullSweepWindow": "02:00"
       }
     },

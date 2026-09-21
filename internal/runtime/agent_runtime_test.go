@@ -1889,6 +1889,9 @@ func TestStartUploadSessionAcceptedResumableAndAlreadyUploaded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AppUploadState() error = %v", err)
 	}
+	if alreadyUploaded.LedgerEpoch == "" || alreadyUploaded.LedgerEpoch != state.Sync.LedgerEpoch {
+		t.Fatalf("already_uploaded evidence epoch = %q, want %q", alreadyUploaded.LedgerEpoch, state.Sync.LedgerEpoch)
+	}
 	if state.LatestCommittedUploadAt == nil || !state.LatestCommittedUploadAt.Equal(committedAt) {
 		t.Fatalf("LatestCommittedUploadAt = %v, want %v", state.LatestCommittedUploadAt, committedAt)
 	}
@@ -2244,6 +2247,9 @@ func TestCompleteUploadSessionRecoversCommittingAssetAfterPolicyChange(t *testin
 			if err != nil {
 				t.Fatalf("CompleteUploadSession(recover after policy change) error = %v", err)
 			}
+			if completed.LedgerEpoch == "" {
+				t.Fatal("completed response omitted ledger epoch")
+			}
 			if completed.State != "completed" || completed.UploadedAsset == nil {
 				t.Fatalf("completed response = %+v, want recovered uploaded asset", completed)
 			}
@@ -2357,6 +2363,9 @@ func TestAppendCompleteAndAbortUploadSession(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("CompleteUploadSession() error = %v", err)
+	}
+	if completed.LedgerEpoch == "" {
+		t.Fatal("completed response omitted ledger epoch")
 	}
 	if completed.State != "completed" || completed.UploadedAsset == nil {
 		t.Fatalf("completed response = %+v, want uploaded asset", completed)
@@ -2541,6 +2550,9 @@ func TestUploadSessionUsesConfiguredTempPath(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("CompleteUploadSession() error = %v", err)
+	}
+	if completed.LedgerEpoch == "" {
+		t.Fatal("completed response omitted ledger epoch")
 	}
 	if completed.State != "completed" {
 		t.Fatalf("completed response = %+v, want completed", completed)
@@ -3129,6 +3141,10 @@ func TestImmichPassthroughRelaysSearchWithoutIndexing(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/api/server/ping":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
 		case "/api/search/metadata":
 			_, _ = io.WriteString(w, `{"assets":{"total":1,"items":[{"id":"asset-123","type":"IMAGE","originalFileName":"photo.jpg","fileCreatedAt":"2026-04-07T09:57:15.053Z"}]}}`)
 		case "/api/search/statistics":
@@ -3716,6 +3732,11 @@ func TestStartDatasourceMirrorSyncRunsStartupFullSync(t *testing.T) {
 
 	requests := make(chan struct{}, 1)
 	datasourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/server/ping" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
+		}
 		if r.URL.Path != "/api/search/metadata" {
 			t.Fatalf("unexpected datasource path %s", r.URL.Path)
 		}
@@ -3790,6 +3811,11 @@ func TestScheduledDatasourceMirrorSyncBlocksDatasourceRepair(t *testing.T) {
 		}
 	})
 	datasourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/server/ping" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
+		}
 		if r.URL.Path != "/api/search/metadata" {
 			t.Fatalf("unexpected datasource path %s", r.URL.Path)
 		}
@@ -3872,6 +3898,11 @@ func TestScheduledDatasourceMirrorIntervalRunsIncrementalSync(t *testing.T) {
 
 	requestBodies := []map[string]any{}
 	datasourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/server/ping" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
+		}
 		if r.URL.Path != "/api/search/metadata" {
 			t.Fatalf("unexpected datasource path %s", r.URL.Path)
 		}
@@ -3881,6 +3912,10 @@ func TestScheduledDatasourceMirrorIntervalRunsIncrementalSync(t *testing.T) {
 		}
 		requestBodies = append(requestBodies, body)
 		w.Header().Set("Content-Type", "application/json")
+		if body["visibility"] != "timeline" {
+			_, _ = io.WriteString(w, `{"assets":{"total":0,"nextPage":null,"items":[]}}`)
+			return
+		}
 		if len(requestBodies) == 1 {
 			_, _ = io.WriteString(w, `{
 				"assets": {
@@ -3929,19 +3964,25 @@ func TestScheduledDatasourceMirrorIntervalRunsIncrementalSync(t *testing.T) {
 	}})
 	defer runtime.Close()
 
-	if _, err := runtime.SyncPrimaryDatasourceMirror(context.Background(), catalog.MirrorSyncModeFull); err != nil {
+	full, err := runtime.SyncPrimaryDatasourceMirror(context.Background(), catalog.MirrorSyncModeFull)
+	if err != nil {
 		t.Fatalf("full SyncPrimaryDatasourceMirror() error = %v", err)
 	}
 	runtime.rememberDatasourceIndexingSnapshot(nil, runtime.emptyDatasourceIndexingResponse())
 	runtime.runScheduledDatasourceMirrorSync(context.Background(), "interval")
 
-	if len(requestBodies) != 2 {
-		t.Fatalf("request count = %d, want 2", len(requestBodies))
+	if len(requestBodies) != 4 {
+		t.Fatalf("request count = %d, want 4", len(requestBodies))
+	}
+	for i, visibility := range []string{"timeline", "hidden", "archive"} {
+		if requestBodies[i+1]["visibility"] != visibility || requestBodies[i+1]["updatedAfter"] != requestBodies[1]["updatedAfter"] || requestBodies[i+1]["updatedBefore"] != requestBodies[1]["updatedBefore"] {
+			t.Fatalf("inconsistent scheduled incremental requests: %#v", requestBodies)
+		}
 	}
 	if _, ok := requestBodies[0]["updatedAfter"]; ok {
 		t.Fatalf("full request unexpectedly had updatedAfter: %#v", requestBodies[0])
 	}
-	if got := requestBodies[1]["updatedAfter"]; got != "2026-06-01T10:05:00Z" {
+	if got := requestBodies[1]["updatedAfter"]; got != full.SyncedThrough.Format(time.RFC3339Nano) {
 		t.Fatalf("interval updatedAfter = %#v, want incremental cursor", got)
 	}
 	status, err := runtime.PrimaryDatasourceMirrorStatus(context.Background())
@@ -3968,6 +4009,11 @@ func TestScheduledDatasourceMirrorStartupUsesIncrementalAfterExistingFullSync(t 
 
 	requestBodies := []map[string]any{}
 	datasourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/server/ping" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
+		}
 		if r.URL.Path != "/api/search/metadata" {
 			t.Fatalf("unexpected datasource path %s", r.URL.Path)
 		}
@@ -3977,6 +4023,10 @@ func TestScheduledDatasourceMirrorStartupUsesIncrementalAfterExistingFullSync(t 
 		}
 		requestBodies = append(requestBodies, body)
 		w.Header().Set("Content-Type", "application/json")
+		if body["visibility"] != "timeline" {
+			_, _ = io.WriteString(w, `{"assets":{"total":0,"nextPage":null,"items":[]}}`)
+			return
+		}
 		if len(requestBodies) == 1 {
 			_, _ = io.WriteString(w, `{
 				"assets": {
@@ -4025,7 +4075,8 @@ func TestScheduledDatasourceMirrorStartupUsesIncrementalAfterExistingFullSync(t 
 	}})
 	defer runtime.Close()
 
-	if _, err := runtime.SyncPrimaryDatasourceMirror(context.Background(), catalog.MirrorSyncModeFull); err != nil {
+	full, err := runtime.SyncPrimaryDatasourceMirror(context.Background(), catalog.MirrorSyncModeFull)
+	if err != nil {
 		t.Fatalf("full SyncPrimaryDatasourceMirror() error = %v", err)
 	}
 	runtime.schedulerWorkStateMu.Lock()
@@ -4052,13 +4103,18 @@ func TestScheduledDatasourceMirrorStartupUsesIncrementalAfterExistingFullSync(t 
 		t.Fatal("background worker scheduler was not woken after successful mirror sync")
 	}
 
-	if len(requestBodies) != 2 {
-		t.Fatalf("request count = %d, want 2", len(requestBodies))
+	if len(requestBodies) != 4 {
+		t.Fatalf("request count = %d, want 4", len(requestBodies))
+	}
+	for i, visibility := range []string{"timeline", "hidden", "archive"} {
+		if requestBodies[i+1]["visibility"] != visibility || requestBodies[i+1]["updatedAfter"] != requestBodies[1]["updatedAfter"] || requestBodies[i+1]["updatedBefore"] != requestBodies[1]["updatedBefore"] {
+			t.Fatalf("inconsistent scheduled incremental requests: %#v", requestBodies)
+		}
 	}
 	if _, ok := requestBodies[0]["updatedAfter"]; ok {
 		t.Fatalf("full request unexpectedly had updatedAfter: %#v", requestBodies[0])
 	}
-	if got := requestBodies[1]["updatedAfter"]; got != "2026-06-01T10:05:00Z" {
+	if got := requestBodies[1]["updatedAfter"]; got != full.SyncedThrough.Format(time.RFC3339Nano) {
 		t.Fatalf("startup updatedAfter = %#v, want incremental cursor", got)
 	}
 }
@@ -4067,6 +4123,11 @@ func TestScheduledDatasourceMirrorModeIsSourceSpecific(t *testing.T) {
 	t.Parallel()
 
 	datasourceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/server/ping" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
+		}
 		if r.URL.Path != "/api/search/metadata" {
 			t.Fatalf("unexpected datasource path %s", r.URL.Path)
 		}
@@ -4116,16 +4177,16 @@ func TestScheduledDatasourceMirrorModeIsSourceSpecific(t *testing.T) {
 	if _, err := runtime.SyncPrimaryDatasourceMirror(context.Background(), catalog.MirrorSyncModeFull); err != nil {
 		t.Fatalf("full SyncPrimaryDatasourceMirror() error = %v", err)
 	}
-	if got := runtime.datasourceMirrorSyncModeForSource(context.Background(), "1111111111111111", "startup"); got != catalog.MirrorSyncModeIncremental {
+	if got := runtime.datasourceMirrorSyncModeForSource(context.Background(), "1111111111111111", time.Now()); got != catalog.MirrorSyncModeIncremental {
 		t.Fatalf("primary startup mode = %q, want incremental", got)
 	}
-	if got := runtime.datasourceMirrorSyncModeForSource(context.Background(), "2222222222222222", "startup"); got != catalog.MirrorSyncModeFull {
+	if got := runtime.datasourceMirrorSyncModeForSource(context.Background(), "2222222222222222", time.Now()); got != catalog.MirrorSyncModeFull {
 		t.Fatalf("secondary startup mode = %q, want full because it has no full sync", got)
 	}
-	if got := runtime.datasourceMirrorSyncModeForSource(context.Background(), "2222222222222222", "interval"); got != catalog.MirrorSyncModeFull {
+	if got := runtime.datasourceMirrorSyncModeForSource(context.Background(), "2222222222222222", time.Now()); got != catalog.MirrorSyncModeFull {
 		t.Fatalf("secondary interval mode = %q, want full because it has no full sync", got)
 	}
-	if got := runtime.datasourceMirrorSyncModeForSource(context.Background(), "1111111111111111", "daily_full_sweep"); got != catalog.MirrorSyncModeFull {
+	if got := runtime.datasourceMirrorSyncModeForSource(context.Background(), "1111111111111111", time.Now().Add(24*time.Hour)); got != catalog.MirrorSyncModeFull {
 		t.Fatalf("daily mode = %q, want full", got)
 	}
 }
@@ -4137,6 +4198,11 @@ func TestScheduledDatasourceMirrorSyncsAllConfiguredMirrors(t *testing.T) {
 	newMirrorServer := func(sourceName string, assetID string, filename string, capturedAt string) *httptest.Server {
 		t.Helper()
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/server/ping" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"res":"pong"}`))
+				return
+			}
 			if r.URL.Path != "/api/search/metadata" {
 				t.Fatalf("%s unexpected datasource path %s", sourceName, r.URL.Path)
 			}
@@ -5553,14 +5619,14 @@ func TestChooseMixedBackgroundWorkerPhaseWeightsQueueSizes(t *testing.T) {
 		{name: "embedding below batch skipped", metadataQueued: 0, thumbnailQueued: 0, embeddingQueued: 9, embeddingBatch: 10, randomValue: 0, want: ""},
 		{name: "embedding only", metadataQueued: 0, thumbnailQueued: 0, embeddingQueued: 10, embeddingBatch: 10, randomValue: 0.9, want: "embeddings"},
 		{name: "weighted metadata", metadataQueued: 8, thumbnailQueued: 2, embeddingQueued: 100, embeddingBatch: 10, randomValue: 0.1, want: "metadata"},
-		{name: "weighted thumbnail", metadataQueued: 8, thumbnailQueued: 2, embeddingQueued: 100, embeddingBatch: 10, randomValue: 0.2, want: "thumbnails"},
-		{name: "weighted embedding", metadataQueued: 8, thumbnailQueued: 2, embeddingQueued: 100, embeddingBatch: 10, randomValue: 0.3, want: "embeddings"},
-		{name: "capped queues retain each phase", metadataQueued: 300000, thumbnailQueued: 300000, embeddingQueued: 300000, embeddingBatch: 10, randomValue: 0.29, want: "metadata"},
-		{name: "capped queues retain thumbnail", metadataQueued: 300000, thumbnailQueued: 300000, embeddingQueued: 300000, embeddingBatch: 10, randomValue: 0.32, want: "thumbnails"},
+		{name: "weighted thumbnail", metadataQueued: 8, thumbnailQueued: 2, embeddingQueued: 100, embeddingBatch: 10, randomValue: 0.3, want: "thumbnails"},
+		{name: "weighted embedding", metadataQueued: 8, thumbnailQueued: 2, embeddingQueued: 100, embeddingBatch: 10, randomValue: 0.4, want: "embeddings"},
+		{name: "capped queues retain each phase", metadataQueued: 300000, thumbnailQueued: 300000, embeddingQueued: 300000, embeddingBatch: 10, randomValue: 0.5, want: "metadata"},
+		{name: "capped queues retain thumbnail", metadataQueued: 300000, thumbnailQueued: 300000, embeddingQueued: 300000, embeddingBatch: 10, randomValue: 0.6, want: "thumbnails"},
 		{name: "capped queues retain embedding", metadataQueued: 300000, thumbnailQueued: 300000, embeddingQueued: 300000, embeddingBatch: 10, randomValue: 0.9, want: "embeddings"},
 		{name: "reported backlog favors local work", metadataQueued: 310641, thumbnailQueued: 14574, embeddingQueued: 168, embeddingBatch: 10, randomValue: 0.93, want: "thumbnails"},
 		{name: "reported backlog still permits embeddings", metadataQueued: 310641, thumbnailQueued: 14574, embeddingQueued: 168, embeddingBatch: 10, randomValue: 0.95, want: "embeddings"},
-		{name: "large metadata backlog does not starve thumbnails", metadataQueued: 300000, thumbnailQueued: 48, randomValue: 0.9, want: "thumbnails"},
+		{name: "large metadata backlog does not starve thumbnails", metadataQueued: 300000, thumbnailQueued: 48, randomValue: 0.95, want: "thumbnails"},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -6177,6 +6243,10 @@ func TestRefreshDatasourceIndexingStatusShowsPausedInstalledSemanticWork(t *test
 			t.Fatalf("x-api-key = %q, want configured key", r.Header.Get("x-api-key"))
 		}
 		switch r.URL.Path {
+		case "/api/server/ping":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
 		case "/api/search/metadata":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{
@@ -8987,6 +9057,10 @@ func TestSemanticIndexingPrefersRuntimeReadyInstalledCandidate(t *testing.T) {
 			t.Fatalf("x-api-key = %q, want configured key", r.Header.Get("x-api-key"))
 		}
 		switch r.URL.Path {
+		case "/api/server/ping":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
 		case "/api/search/metadata":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{
@@ -9111,6 +9185,10 @@ func TestSemanticIndexingSchedulerSeesMissingBinaryIndexPublishWork(t *testing.T
 			t.Fatalf("x-api-key = %q, want configured key", r.Header.Get("x-api-key"))
 		}
 		switch r.URL.Path {
+		case "/api/server/ping":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
 		case "/api/search/metadata":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{
@@ -9212,6 +9290,10 @@ func TestSemanticIndexingZeroQueuesReadyVectorsAndAllowsReadyUninstallAfterPubli
 			t.Fatalf("x-api-key = %q, want configured key", r.Header.Get("x-api-key"))
 		}
 		switch r.URL.Path {
+		case "/api/server/ping":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"res":"pong"}`))
+			return
 		case "/api/search/metadata":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{

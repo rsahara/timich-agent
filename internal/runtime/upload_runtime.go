@@ -38,6 +38,7 @@ var (
 // AppUploadStateResponse is the app-facing upload policy and status for the
 // authenticated paired device.
 type AppUploadStateResponse struct {
+	Sync                    UploadSyncCapability     `json:"sync"`
 	DeviceID                string                   `json:"deviceId"`
 	Upload                  DeviceUploadPolicy       `json:"upload"`
 	Status                  DeviceUploadPolicyStatus `json:"status"`
@@ -63,6 +64,7 @@ type UploadSessionStartInput struct {
 // UploadSessionStartResponse reports how the app should proceed after asking
 // the Agent to upload one source asset version.
 type UploadSessionStartResponse struct {
+	LedgerEpoch   string                    `json:"ledgerEpoch,omitempty"`
 	State         string                    `json:"state"`
 	Reason        string                    `json:"reason,omitempty"`
 	Status        *DeviceUploadPolicyStatus `json:"status,omitempty"`
@@ -123,6 +125,7 @@ type UploadSessionCompleteInput struct {
 // UploadSessionActionResponse reports the result of chunk, complete, or abort
 // actions against an upload session.
 type UploadSessionActionResponse struct {
+	LedgerEpoch   string                `json:"ledgerEpoch,omitempty"`
 	State         string                `json:"state"`
 	Session       *UploadSessionSummary `json:"session,omitempty"`
 	UploadedAsset *UploadedAssetSummary `json:"uploadedAsset,omitempty"`
@@ -149,7 +152,12 @@ func (a *AgentRuntime) AppUploadState(deviceID string) (AppUploadStateResponse, 
 	if err != nil {
 		return AppUploadStateResponse{}, err
 	}
+	epoch, err := a.uploads.LedgerEpoch(profile.DeviceID)
+	if err != nil {
+		return AppUploadStateResponse{}, err
+	}
 	return AppUploadStateResponse{
+		Sync:                    UploadSyncCapability{Version: 1, LedgerEpoch: epoch, MaxCheckItems: maxUploadCheckItems},
 		DeviceID:                profile.DeviceID,
 		Upload:                  deviceUploadPolicy(profile.Upload),
 		Status:                  status,
@@ -183,6 +191,7 @@ func (a *AgentRuntime) StartUploadSession(deviceID string, input UploadSessionSt
 			} else if ok {
 				return UploadSessionStartResponse{
 					State:         "already_uploaded",
+					LedgerEpoch:   recovered.LedgerEpoch,
 					UploadedAsset: uploadedAssetSummary(recovered),
 				}, nil
 			}
@@ -190,6 +199,7 @@ func (a *AgentRuntime) StartUploadSession(deviceID string, input UploadSessionSt
 		}
 		return UploadSessionStartResponse{
 			State:         "already_uploaded",
+			LedgerEpoch:   asset.LedgerEpoch,
 			UploadedAsset: uploadedAssetSummary(asset),
 		}, nil
 	}
@@ -733,6 +743,7 @@ func uploadCapturedBeforePolicyStatus() DeviceUploadPolicyStatus {
 func completedUploadResponse(asset store.UploadedAsset) UploadSessionActionResponse {
 	return UploadSessionActionResponse{
 		State:         "completed",
+		LedgerEpoch:   asset.LedgerEpoch,
 		UploadedAsset: uploadedAssetSummary(asset),
 	}
 }

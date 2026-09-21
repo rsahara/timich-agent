@@ -1352,7 +1352,11 @@ const dashboardHTML = `<!doctype html>
       const showScanModeTimes = task?.phase === 'phase0' && Boolean(task?.lastQuickScanAt || task?.lastReconciliationAt);
       if (task?.phase === 'phase0' && rawStatus === 'idle') {
         if (showScanModeTimes) {
-          parts.push('quick discovery: ' + (task?.lastQuickScanAt ? date(task.lastQuickScanAt) : '-'));
+          if (task?.lastQuickScanAt) {
+            parts.push('quick discovery: ' + date(task.lastQuickScanAt));
+          } else if (task?.lastCompletedAt) {
+            parts.push('last sync: ' + date(task.lastCompletedAt));
+          }
           parts.push('reconciliation: ' + (task?.lastReconciliationAt ? date(task.lastReconciliationAt) : '-'));
         } else if (task?.lastCompletedAt) {
           parts.push('last: ' + date(task.lastCompletedAt));
@@ -1680,14 +1684,16 @@ const dashboardHTML = `<!doctype html>
     function datasourceRunCompletedAtForMode(result, mode) {
       let completedAt = '';
       (result?.results || []).forEach(item => {
-        if (item?.kind !== 'local_filesystem' || item?.mode !== mode) return;
+        const isLocalMode = item?.kind === 'local_filesystem' && item?.mode === mode;
+        const isImmichReconciliation = mode === 'reconciliation' && item?.kind === 'immich_indexed' && item?.mode === 'full';
+        if (!isLocalMode && !isImmichReconciliation) return;
         completedAt = latestDatasourceTaskTimestamp(completedAt, item?.completedAt || '');
       });
       return completedAt;
     }
 
     const datasourceTaskNotes = {
-      phase0: 'Quick discovery finds likely filesystem changes with low NAS load. Reconciliation inspects every supported path once daily at 04:00 in the Agent timezone and repairs additions, changes, and removals.',
+      phase0: 'Quick discovery and incremental sync pick up ordinary changes. Reconciliation compares each datasource\'s current media list with the catalog and removes entries no longer available. It runs daily in the Agent timezone (Immich: 02:00, Local: 04:00 by default); Run reconciliation now runs it for all indexed datasources. Locked or permanently deleted Immich photos can remain listed until reconciliation succeeds.',
       content_verification: 'At the configured daily time, re-hashes the least recently verified media with an idle heavy-task worker. If no worker is idle, that day is skipped. The default duration is 30 minutes; a duration of 0 disables this task.',
       metadata: 'Registers media information in the media database. Recently added or changed files remain settling before metadata processing (2 minutes by default). Metadata repair moves failed jobs and videos with missing duration back to the queue at repair priority. It also checks embedded capture dates for existing media that has not been checked yet, preserving existing thumbnails and search data. Processing starts after settling when a worker is available, and jobs that fail again return to failed.',
       thumbnails: 'Generates thumbnails so media can be previewed quickly. Requeue failed moves failed thumbnails back to the queue at repair priority. Processing starts when a worker is available, and items that fail again return to failed.',

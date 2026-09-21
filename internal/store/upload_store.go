@@ -94,6 +94,8 @@ type UploadCommitInput struct {
 
 // UploadedAsset is one canonical uploaded media metadata row.
 type UploadedAsset struct {
+	// LedgerEpoch is read in the same SQLite snapshot as the asset status.
+	LedgerEpoch        string
 	ID                 int64
 	DeviceID           string
 	SourceAssetID      string
@@ -216,6 +218,10 @@ func (s *UploadStore) migrate() error {
 		`PRAGMA foreign_keys = ON`,
 		`PRAGMA journal_mode = WAL`,
 		`PRAGMA busy_timeout = 5000`,
+		`CREATE TABLE IF NOT EXISTS upload_ledger_epochs (
+			device_id TEXT PRIMARY KEY,
+			epoch TEXT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS uploaded_assets (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			device_id TEXT NOT NULL,
@@ -295,6 +301,11 @@ func (s *UploadStore) migrate() error {
 			return fmt.Errorf("migrate upload store: %w", err)
 		}
 	}
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO upload_ledger_epochs(device_id, epoch)
+		SELECT device_id, lower(hex(randomblob(16))) FROM
+		(SELECT device_id FROM uploaded_assets UNION SELECT device_id FROM upload_sessions)`); err != nil {
+		return fmt.Errorf("migrate upload ledger epochs: %w", err)
+	}
 	if err := s.ensureUploadedAssetsSelectedRootKey(); err != nil {
 		return err
 	}
@@ -356,6 +367,9 @@ func (s *UploadStore) tableColumnExists(tableName string, columnName string) (bo
 func (s *UploadStore) CreateSession(input UploadSessionInput) (UploadSession, error) {
 	normalized, err := normalizeSessionInput(input)
 	if err != nil {
+		return UploadSession{}, err
+	}
+	if _, err := s.LedgerEpoch(normalized.DeviceID); err != nil {
 		return UploadSession{}, err
 	}
 	_, err = s.db.Exec(
@@ -819,6 +833,11 @@ func (s *UploadStore) ResetDeviceUploadState(input UploadResetInput) (UploadRese
 		}
 	}()
 
+	if _, err := tx.Exec(`INSERT INTO upload_ledger_epochs(device_id, epoch)
+		VALUES (?, lower(hex(randomblob(16))))
+		ON CONFLICT(device_id) DO UPDATE SET epoch = excluded.epoch`, normalized.DeviceID); err != nil {
+		return UploadResetResult{}, err
+	}
 	tempFiles, err := uploadSessionTempFilesForResetTx(tx, normalized)
 	if err != nil {
 		return UploadResetResult{}, err
@@ -1269,7 +1288,8 @@ func (s *UploadStore) checksumsForAsset(assetID int64) ([]UploadChecksum, error)
 func uploadedAssetSelectSQL() string {
 	return `SELECT id, device_id, source_asset_id, source_asset_version, upload_id,
 		status, media_type, original_filename, captured_at, expected_size_bytes,
-		selected_root_key, final_relative_path, created_at, updated_at, committing_at, uploaded_at
+		selected_root_key, final_relative_path, created_at, updated_at, committing_at, uploaded_at,
+		(SELECT epoch FROM upload_ledger_epochs WHERE device_id = uploaded_assets.device_id)
 		FROM uploaded_assets`
 }
 
@@ -1371,6 +1391,7 @@ func scanUploadedAsset(scanner rowScanner) (UploadedAsset, error) {
 		&updatedAt,
 		&committingAt,
 		&uploadedAt,
+		&asset.LedgerEpoch,
 	); err != nil {
 		return UploadedAsset{}, err
 	}
