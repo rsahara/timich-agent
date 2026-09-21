@@ -32,7 +32,7 @@ const (
 	datasourceIndexingReconcileInterval   = 30 * time.Minute
 	assetProcessingStatsRefreshMinAge     = 15 * time.Second
 	assetProcessingStatsRefreshTimeout    = 90 * time.Second
-	datasourceTaskNoteMediaDiscovery      = "Quick discovery finds ordinary additions, removals, and moves. Reconciliation inspects every supported file daily at 04:00 in the Agent timezone; Run reconciliation now starts it manually."
+	datasourceTaskNoteMediaDiscovery      = "Quick discovery and incremental sync pick up ordinary changes. Reconciliation compares each datasource's current media list with the catalog and removes entries no longer available. It runs daily in the Agent timezone (Immich: 02:00, Local: 04:00 by default); Run reconciliation now runs it for all indexed datasources. Locked or permanently deleted Immich photos can remain listed until reconciliation succeeds."
 	datasourceTaskNoteContentVerification = "At the configured daily time, uses an idle heavy-task worker to compare saved content hashes. If no worker is idle, that day's run is skipped. The default duration is 30 minutes; set contentVerificationDuration to 0 to disable it."
 	datasourceTaskNoteMetadata            = "Registers media information in the media database. Recently added or changed files remain settling before metadata processing (2 minutes by default). Metadata repair moves failed jobs and videos with missing duration back to the queue at repair priority. Processing starts after settling when a worker is available, and jobs that fail again return to failed."
 	datasourceTaskNoteThumbnails          = "Generates thumbnails so media can be previewed quickly. Requeue failed moves failed thumbnails back to the queue at repair priority. Processing starts when a worker is available, and items that fail again return to failed."
@@ -1406,6 +1406,7 @@ func (s *DatasourceIndexingStatus) applyRemoteStatus(status catalog.MirrorStatus
 	s.OutOfScopeAssets = status.OutOfScopeCount
 	s.MissingAssets = status.MissingCount
 	s.LastFullSyncAt = status.LastFullSyncAt
+	s.LastReconciliationAt = status.LastFullSyncAt
 	s.LastIncrementalSyncAt = status.LastIncrementalSyncAt
 	s.LastError = status.LastError
 }
@@ -1879,12 +1880,12 @@ func (a *AgentRuntime) datasourceTaskStatuses(ctx context.Context, datasources [
 		mediaDiscoveryLastCompletedAt = latestTimePtr(mediaDiscoveryLastCompletedAt, datasource.LastRunAt)
 		mediaDiscoveryLastCompletedAt = latestTimePtr(mediaDiscoveryLastCompletedAt, datasource.LastFullSyncAt)
 		mediaDiscoveryLastCompletedAt = latestTimePtr(mediaDiscoveryLastCompletedAt, datasource.LastIncrementalSyncAt)
+		mediaDiscoveryLastReconciliationAt = latestTimePtr(mediaDiscoveryLastReconciliationAt, datasource.LastReconciliationAt)
 		if datasource.IngestionKind != datasourceIngestionFilesystem {
 			continue
 		}
 		localDatasourceCount++
 		mediaDiscoveryLastQuickScanAt = latestTimePtr(mediaDiscoveryLastQuickScanAt, datasource.LastQuickScanAt)
-		mediaDiscoveryLastReconciliationAt = latestTimePtr(mediaDiscoveryLastReconciliationAt, datasource.LastReconciliationAt)
 		eventAt := latestTimePtr(datasource.LastContentVerificationAt, datasource.ContentVerificationStartedAt)
 		if eventAt != nil && (contentVerificationLatestEventAt == nil || eventAt.After(contentVerificationLatestEventAt.UTC())) {
 			contentVerificationLatestEventAt = timePtr(eventAt.UTC())

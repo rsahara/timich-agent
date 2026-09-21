@@ -14,6 +14,81 @@ components:
       type: http
       scheme: bearer
   schemas:
+    UploadSyncCapability:
+      type: object
+      required: [version, ledgerEpoch, maxCheckItems]
+      properties:
+        version:
+          const: 1
+        ledgerEpoch:
+          type: string
+          minLength: 1
+          description: Opaque per-device ledger generation, rotated atomically with administrative resets.
+        maxCheckItems:
+          const: 200
+    UploadCheckIdentity:
+      type: object
+      required: [sourceAssetId, sourceAssetVersion]
+      properties:
+        sourceAssetId:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        sourceAssetVersion:
+          type: string
+          minLength: 1
+          maxLength: 4096
+    UploadCheckRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 200
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/UploadCheckIdentity"
+    UploadCheckResponse:
+      type: object
+      required: [ledgerEpoch, items]
+      properties:
+        ledgerEpoch:
+          type: string
+          minLength: 1
+          description: Read in the same SQLite snapshot as every item decision.
+        items:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/UploadCheckIdentity"
+              - type: object
+                required: [state]
+                properties:
+                  state:
+                    enum: [uploaded, needs_start]
+    UploadState:
+      type: object
+      required: [deviceId, upload, status, chunkSizeBytes]
+      properties:
+        deviceId:
+          type: string
+        upload:
+          type: object
+          description: Effective paired-device upload policy.
+        status:
+          type: object
+          description: Effective ready, disabled, or blocked state and reason.
+        chunkSizeBytes:
+          type: integer
+        latestCommittedUploadAt:
+          type: string
+          format: date-time
+        activeSession:
+          type: object
+          description: Most recently updated resumable session allowed by the current policy.
+        sync:
+          $ref: "#/components/schemas/UploadSyncCapability"
     HealthResponse:
       type: object
       required:
@@ -1096,3 +1171,49 @@ paths:
             description: Could not fetch data from the configured datasource.
           "503":
             description: No datasource is configured on the local agent.
+
+  /v1/uploads/me:
+    get:
+      operationId: getDeviceUploadState
+      summary: Read the authenticated device's upload policy, session, and sync capability.
+      description: Direct Agent route only. Absence of sync requires legacy per-asset checks.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Effective upload state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadState"
+        "401":
+          description: App session bearer token is missing or invalid.
+  /v1/uploads/check:
+    post:
+      operationId: checkDeviceUploadIdentities
+      summary: Check up to 200 source identities in the authenticated device's ledger.
+      description: |
+        Direct Agent route only. JSON body limit is 1 MiB. Identities must be
+        nonempty, unpadded, and unique. This read-only check creates no sessions,
+        recovers no commits, and does not inspect final files. Committing and
+        absent rows return needs_start. Every result shares one SQLite snapshot
+        with ledgerEpoch. No caller-supplied device ID is accepted as authority.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UploadCheckRequest"
+      responses:
+        "200":
+          description: One decision per requested identity, in request order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadCheckResponse"
+        "400":
+          description: Invalid, duplicate, empty, or oversized request.
+        "401":
+          description: App session bearer token is missing or invalid.

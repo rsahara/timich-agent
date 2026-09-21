@@ -121,8 +121,9 @@ func (s *Service) searchImmichPassthroughAssets(
 
 func immichPassthroughSearchRequest(normalized normalizedAssetSearch) ([]byte, string, string, error) {
 	body := map[string]any{
-		"page": normalized.Request.Page.Index + 1,
-		"size": normalized.Request.Page.Size,
+		"page":       normalized.Request.Page.Index + 1,
+		"size":       normalized.Request.Page.Size,
+		"visibility": "timeline",
 	}
 	applyImmichPassthroughSearchFilters(body, normalized.Request.Collection.Filters)
 
@@ -275,7 +276,7 @@ func (s *Service) immichPassthroughTimelineAssetTotal(
 }
 
 func immichPassthroughStatisticsRequestBody(filters AssetSearchFilters) ([]byte, error) {
-	body := map[string]any{}
+	body := map[string]any{"visibility": "timeline"}
 	applyImmichPassthroughSearchFilters(body, filters)
 	rawBody, err := json.Marshal(body)
 	if err != nil {

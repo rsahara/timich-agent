@@ -193,7 +193,8 @@ paths:
   /v1/datasources/indexing/run:
     post:
       operationId: runDatasourceIndexing
-      summary: Start datasource indexing.
+      summary: Run datasource reconciliation or incremental sync.
+      description: The Admin Run reconciliation now action sends mode full and reconciles both Local and indexed Immich datasources. Optional sourceKey or kind scopes the run. Immich full-sync completion is also reported as lastReconciliationAt in datasource and shared task status; existing full and incremental wire modes are retained.
       security:
         - AdminBearerAuth: []
       requestBody:

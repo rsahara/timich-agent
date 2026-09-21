@@ -63,6 +63,10 @@ func TestCanonicalPublishKeepsCompletedTasksAfterSourceRemoval(t *testing.T) {
 			jpeg := encodeRuntimeJPEGForTest(t, 32, 32)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
+				case "/api/server/ping":
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"res":"pong"}`))
+					return
 				case "/api/search/metadata":
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = io.WriteString(w, `{"assets":{"total":1,"items":[{"id":"asset","type":"IMAGE","originalFileName":"asset.jpg","fileCreatedAt":"2026-06-01T10:00:00Z","updatedAt":"2026-06-01T10:05:00Z"}],"nextPage":null}}`)

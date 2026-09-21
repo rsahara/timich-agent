@@ -1174,7 +1174,7 @@ func (s *Service) Probe(ctx context.Context) error {
 		state.primary,
 		http.MethodPost,
 		"/api/search/metadata",
-		strings.NewReader(`{"page":1,"size":1,"order":"desc"}`),
+		strings.NewReader(`{"page":1,"size":1,"order":"desc","visibility":"timeline"}`),
 	)
 	if err != nil {
 		return err
@@ -1827,6 +1827,8 @@ func finalizeSemanticBackfillStatus(status *SemanticModelBackfillStatus) {
 type immichMirrorFetchOptions struct {
 	LatestAssetLimit int
 	UpdatedAfter     *time.Time
+	UpdatedBefore    *time.Time
+	Visibility       string
 	DetailLimit      int
 }
 
@@ -1864,8 +1866,29 @@ func (s *Service) syncMirrorDatasource(ctx context.Context, datasource *config.D
 	indexing := datasourceIndexingConfig(datasource)
 	limit := indexing.LatestAssetLimit
 	detailLimit := indexing.MetadataDetailLimit
+	var updatedAfter *time.Time
+	if mode == MirrorSyncModeIncremental {
+		needsFull, err := s.mirrorSyncNeedsFullForConfiguredLimit(ctx, sourceKey, limit)
+		if err != nil {
+			return MirrorSyncResult{}, err
+		}
+		if needsFull {
+			mode = MirrorSyncModeFull
+		} else {
+			updatedAfter, err = s.catalog.immichMirrorUpdatedAfter(ctx, sourceKey)
+			if err != nil {
+				return MirrorSyncResult{}, err
+			}
+			if updatedAfter == nil {
+				mode = MirrorSyncModeFull
+			}
+		}
+	}
+	windowEnd, err := s.immichMirrorWindowEnd(ctx, datasource)
+	if err != nil {
+		return MirrorSyncResult{}, err
+	}
 	var result MirrorSyncResult
-	var err error
 	switch mode {
 	case MirrorSyncModeFull:
 		assets, fetchErr := s.fetchImmichMirrorAssets(ctx, datasource, immichMirrorFetchOptions{
@@ -1875,33 +1898,31 @@ func (s *Service) syncMirrorDatasource(ctx context.Context, datasource *config.D
 		if fetchErr != nil {
 			return MirrorSyncResult{}, fetchErr
 		}
-		result, err = s.catalog.ReplaceFull(ctx, sourceKey, assets, limit, startedAt)
+		result, err = s.catalog.ReplaceFull(ctx, sourceKey, assets, limit, startedAt, windowEnd)
 		if err != nil {
 			return MirrorSyncResult{}, err
 		}
 	case MirrorSyncModeIncremental:
-		needsFull, fullCheckErr := s.mirrorSyncNeedsFullForConfiguredLimit(ctx, sourceKey, limit)
-		if fullCheckErr != nil {
-			return MirrorSyncResult{}, fullCheckErr
+		if windowEnd.Before(*updatedAfter) {
+			return MirrorSyncResult{}, fmt.Errorf("Immich server clock precedes the previous sync cursor; check its clock or run a full reconciliation")
 		}
-		if needsFull {
-			return s.syncMirrorDatasource(ctx, datasource, MirrorSyncModeFull)
+		// A timeline-only query cannot report assets leaving the timeline. Fetch
+		// every supported visibility scope over the same window before committing
+		// its upper bound with the assets, even when no catalog rows change.
+		var assets []ImmichMirrorAsset
+		for _, visibility := range []string{"timeline", "hidden", "archive"} {
+			changes, fetchErr := s.fetchImmichMirrorAssets(ctx, datasource, immichMirrorFetchOptions{
+				UpdatedAfter:  updatedAfter,
+				UpdatedBefore: &windowEnd,
+				Visibility:    visibility,
+				DetailLimit:   detailLimit,
+			})
+			if fetchErr != nil {
+				return MirrorSyncResult{}, fetchErr
+			}
+			assets = append(assets, changes...)
 		}
-		updatedAfter, cursorErr := s.catalog.LatestSourceUpdatedAt(ctx, sourceKey)
-		if cursorErr != nil {
-			return MirrorSyncResult{}, cursorErr
-		}
-		if updatedAfter == nil {
-			return s.syncMirrorDatasource(ctx, datasource, MirrorSyncModeFull)
-		}
-		assets, fetchErr := s.fetchImmichMirrorAssets(ctx, datasource, immichMirrorFetchOptions{
-			UpdatedAfter: updatedAfter,
-			DetailLimit:  detailLimit,
-		})
-		if fetchErr != nil {
-			return MirrorSyncResult{}, fetchErr
-		}
-		result, err = s.catalog.MergeIncremental(ctx, sourceKey, assets, startedAt)
+		result, err = s.catalog.MergeIncremental(ctx, sourceKey, assets, startedAt, windowEnd)
 		if err != nil {
 			return MirrorSyncResult{}, err
 		}
@@ -2151,8 +2172,13 @@ func (s *Service) fetchImmichMirrorAssets(ctx context.Context, datasource *confi
 	if detailLimit < 0 {
 		detailLimit = 0
 	}
-	const pageSize = maxPageSize
+	incremental := options.UpdatedAfter != nil && !options.UpdatedAfter.IsZero()
+	pager := immichMirrorPager{service: s, datasource: datasource, options: options}
 	assets := []ImmichMirrorAsset{}
+	var limitedAssetIndexes map[string]int
+	if latestAssetLimit > 0 {
+		limitedAssetIndexes = make(map[string]int)
+	}
 	datasourceState := s.datasourceStateSnapshot()
 	datasourceConfigs := datasourceConfigsFromState(datasourceState)
 	externalMappings := configuredImmichExternalLibraryMappings(datasourceConfigs)
@@ -2160,51 +2186,28 @@ func (s *Service) fetchImmichMirrorAssets(ctx context.Context, datasource *confi
 	if datasourceState != nil {
 		externalContentIdentityScopeKey = datasourceState.externalContentIdentityScopeKey
 	}
-	for page := 1; ; page++ {
-		body := map[string]any{
-			"page":  page,
-			"size":  pageSize,
-			"order": SortDirectionDesc,
-		}
-		if options.UpdatedAfter != nil && !options.UpdatedAfter.IsZero() {
-			body["updatedAfter"] = options.UpdatedAfter.UTC().Format(time.RFC3339Nano)
-		}
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("marshal immich mirror sync request: %w", err)
-		}
-		request, err := s.newRequestForDatasource(datasource, http.MethodPost, "/api/search/metadata", bytes.NewReader(raw))
+	for !pager.done {
+		items, err := pager.next(ctx)
 		if err != nil {
 			return nil, err
 		}
-		request = request.WithContext(ctx)
-		request.Header.Set("Content-Type", "application/json")
-		response, err := s.client.Do(request)
-		if err != nil {
-			return nil, fmt.Errorf("perform immich mirror sync request: %w", err)
-		}
-		var envelope searchAssetsEnvelope
-		decodeErr := func() error {
-			defer response.Body.Close()
-			if response.StatusCode < 200 || response.StatusCode >= 300 {
-				return fmt.Errorf("immich mirror sync returned status %d", response.StatusCode)
-			}
-			if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
-				return fmt.Errorf("decode immich mirror sync response: %w", err)
-			}
-			return nil
-		}()
-		if decodeErr != nil {
-			return nil, decodeErr
-		}
-		for _, asset := range envelope.Assets.Items {
-			if !asset.ShouldMirror() || strings.TrimSpace(asset.ID) == "" || asset.FileCreatedAt.IsZero() {
+		for _, asset := range items {
+			if strings.TrimSpace(asset.ID) == "" {
 				continue
 			}
 			var updatedAt *time.Time
 			if asset.UpdatedAt != nil && !asset.UpdatedAt.IsZero() {
 				value := asset.UpdatedAt.Time.UTC()
 				updatedAt = &value
+			}
+			if !asset.ShouldMirror() {
+				if incremental {
+					assets = append(assets, ImmichMirrorAsset{UpstreamAssetID: asset.ID, SourceUpdatedAt: updatedAt, Excluded: true})
+				}
+				continue
+			}
+			if asset.FileCreatedAt.IsZero() {
+				continue
 			}
 			city, state, country, description := asset.LocationMetadata()
 			checksumAlgorithm, checksumHex := asset.UpstreamChecksumIdentity()
@@ -2248,22 +2251,37 @@ func (s *Service) fetchImmichMirrorAssets(ctx context.Context, datasource *confi
 				}
 				detailLimit--
 				if !detail.ShouldMirror() {
-					assets = assets[:len(assets)-1]
+					if incremental {
+						assets[len(assets)-1] = ImmichMirrorAsset{UpstreamAssetID: asset.ID, SourceUpdatedAt: updatedAt, Excluded: true}
+					} else {
+						assets = assets[:len(assets)-1]
+					}
 					continue
 				}
 				enrichMirrorAssetFromImmichAsset(&assets[len(assets)-1], detail)
+				if incremental {
+					// Detail enrichment may observe a later update outside this window.
+					// Keep the metadata timestamp so it cannot skip unobserved changes.
+					assets[len(assets)-1].SourceUpdatedAt = updatedAt
+				}
 			}
-			if latestAssetLimit > 0 && len(assets) >= latestAssetLimit {
-				return assets, nil
+			if latestAssetLimit > 0 {
+				// A newer observation at an overlapping boundary updates the
+				// existing slot; it must not consume another unique-asset slot.
+				last := len(assets) - 1
+				if index, exists := limitedAssetIndexes[asset.ID]; exists {
+					assets[index] = assets[last]
+					assets = assets[:last]
+				} else {
+					limitedAssetIndexes[asset.ID] = last
+				}
+				if len(assets) >= latestAssetLimit {
+					return assets, nil
+				}
 			}
-		}
-		if envelope.Assets.NextPage == nil {
-			return assets, nil
-		}
-		if *envelope.Assets.NextPage <= page {
-			return assets, nil
 		}
 	}
+	return assets, nil
 }
 
 func (s *Service) fetchImmichMirrorAssetDetail(ctx context.Context, datasource *config.DatasourceConfig, upstreamAssetID string) (immichAsset, error) {
@@ -3556,6 +3574,33 @@ type immichAsset struct {
 	DeletedAt        *flexibleTime   `json:"deletedAt,omitempty"`
 	TrashedAt        *flexibleTime   `json:"trashedAt,omitempty"`
 	ExifInfo         *immichExif     `json:"exifInfo,omitempty"`
+}
+
+// Immich v3 returns milliseconds; keep the Agent's public and stored duration
+// string contract unchanged for both v2 and v3 upstream servers.
+func (a *immichAsset) UnmarshalJSON(data []byte) error {
+	type wireAsset immichAsset
+	var asset wireAsset
+	raw := struct {
+		*wireAsset
+		Duration json.RawMessage `json:"duration"`
+	}{wireAsset: &asset}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if len(raw.Duration) != 0 && string(raw.Duration) != "null" {
+		var duration string
+		if err := json.Unmarshal(raw.Duration, &duration); err != nil {
+			var milliseconds int64
+			if err := json.Unmarshal(raw.Duration, &milliseconds); err != nil || milliseconds < 0 {
+				return fmt.Errorf("decode Immich duration: expected string or nonnegative integer milliseconds")
+			}
+			duration = fmt.Sprintf("%d:%02d:%02d.%03d", milliseconds/3600000, milliseconds/60000%60, milliseconds/1000%60, milliseconds%1000)
+		}
+		asset.Duration = &duration
+	}
+	*a = immichAsset(asset)
+	return nil
 }
 
 func (a immichAsset) ShouldMirror() bool {
