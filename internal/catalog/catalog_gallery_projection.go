@@ -27,6 +27,20 @@ const galleryProjectionSeekIndexSQL = `CREATE INDEX IF NOT EXISTS idx_catalog_ga
 const galleryProjectionUnfilteredTotalSQL = `SELECT COALESCE(SUM(item_count), 0)
 	FROM catalog_gallery_projection_days`
 
+// Convert an arbitrary UTC capture-time boundary into its zero-based position
+// in the descending projection. Whole newer days come from the compact day
+// index; only the boundary's partial UTC day touches the asset projection.
+const galleryProjectionPositionBeforeSQL = `SELECT
+	COALESCE((
+		SELECT SUM(item_count)
+		FROM catalog_gallery_projection_days
+		WHERE captured_day > ?
+	), 0) + COALESCE((
+		SELECT COUNT(*)
+		FROM catalog_gallery_projection
+		WHERE captured_at >= ? AND captured_at < ?
+	), 0)`
+
 const galleryProjectionDayAtOffsetSQL = `WITH positioned_days AS (
 		SELECT captured_day, item_count,
 			COALESCE(SUM(item_count) OVER (
@@ -523,16 +537,42 @@ func (s *CatalogStore) searchGalleryProjection(
 	includeTotal := catalogSearchIncludesExactTotal(normalized)
 	limit := request.Page.Size
 	offset := request.Page.Index * request.Page.Size
+	mediaTypes := request.Collection.Filters.MediaTypes
+	capturedAt := request.Collection.Filters.CapturedAt
+	positionSeek := len(mediaTypes) == 0 && capturedAt != nil
+	startPosition := 0
+	endPosition := 0
+	if positionSeek {
+		if capturedAt.To != nil {
+			startPosition, err = galleryProjectionPositionBefore(ctx, tx, capturedAt.To.UTC())
+			if err != nil {
+				return AssetSearchPage{}, true, err
+			}
+		}
+		if capturedAt.From != nil {
+			endPosition, err = galleryProjectionPositionBefore(ctx, tx, capturedAt.From.UTC())
+			if err != nil {
+				return AssetSearchPage{}, true, err
+			}
+		} else if err := tx.QueryRowContext(ctx, galleryProjectionUnfilteredTotalSQL).Scan(&endPosition); err != nil {
+			return AssetSearchPage{}, true, fmt.Errorf("count mixed gallery projection positions: %w", err)
+		}
+		endPosition = max(startPosition, endPosition)
+	}
 	var total int
 	if includeTotal {
-		totalQuery := `SELECT COUNT(*) FROM catalog_gallery_projection ` + where
-		totalArgs := args
-		if len(request.Collection.Filters.MediaTypes) == 0 && request.Collection.Filters.CapturedAt == nil {
-			totalQuery = galleryProjectionUnfilteredTotalSQL
-			totalArgs = nil
-		}
-		if err := tx.QueryRowContext(ctx, totalQuery, totalArgs...).Scan(&total); err != nil {
-			return AssetSearchPage{}, true, fmt.Errorf("count mixed gallery projection: %w", err)
+		if positionSeek {
+			total = endPosition - startPosition
+		} else {
+			totalQuery := `SELECT COUNT(*) FROM catalog_gallery_projection ` + where
+			totalArgs := args
+			if len(mediaTypes) == 0 && capturedAt == nil {
+				totalQuery = galleryProjectionUnfilteredTotalSQL
+				totalArgs = nil
+			}
+			if err := tx.QueryRowContext(ctx, totalQuery, totalArgs...).Scan(&total); err != nil {
+				return AssetSearchPage{}, true, fmt.Errorf("count mixed gallery projection: %w", err)
+			}
 		}
 	}
 	queryLimit := limit
@@ -540,7 +580,30 @@ func (s *CatalogStore) searchGalleryProjection(
 		queryLimit++
 	}
 	var rows *sql.Rows
-	if offset > 0 && len(request.Collection.Filters.MediaTypes) == 0 && request.Collection.Filters.CapturedAt == nil {
+	if positionSeek {
+		pageStart := startPosition + offset
+		queryLimit = min(queryLimit, max(0, endPosition-pageStart))
+		var found bool
+		var anchorCapturedAt string
+		var anchorCanonicalAssetID string
+		if queryLimit > 0 {
+			anchorCapturedAt, anchorCanonicalAssetID, found, err = galleryProjectionAnchorAtOffset(ctx, tx, pageStart)
+		}
+		if err == nil && found {
+			rows, err = tx.QueryContext(
+				ctx,
+				galleryProjectionAfterAnchorSQL,
+				anchorCapturedAt,
+				anchorCanonicalAssetID,
+				queryLimit,
+			)
+		}
+		if err == nil && !found {
+			rows, err = tx.QueryContext(ctx, `SELECT `+galleryProjectionSelectColumns+`
+				FROM catalog_gallery_projection
+				WHERE 0`)
+		}
+	} else if offset > 0 && len(mediaTypes) == 0 && capturedAt == nil {
 		var found bool
 		var anchorCapturedAt string
 		var anchorCanonicalAssetID string
@@ -634,6 +697,27 @@ func (s *CatalogStore) searchGalleryProjection(
 		Boundary:      searchBoundary(request.Page, len(items)),
 		Resolved:      normalized.Resolved,
 	}, true, nil
+}
+
+func galleryProjectionPositionBefore(
+	ctx context.Context,
+	tx *sql.Tx,
+	boundary time.Time,
+) (int, error) {
+	boundary = boundary.UTC()
+	dayStart := time.Date(boundary.Year(), boundary.Month(), boundary.Day(), 0, 0, 0, 0, time.UTC)
+	var position int
+	err := tx.QueryRowContext(
+		ctx,
+		galleryProjectionPositionBeforeSQL,
+		dayStart.Format("2006-01-02"),
+		formatCatalogTime(boundary),
+		formatCatalogTime(dayStart.AddDate(0, 0, 1)),
+	).Scan(&position)
+	if err != nil {
+		return 0, fmt.Errorf("locate mixed gallery projection capture boundary: %w", err)
+	}
+	return position, nil
 }
 
 func galleryProjectionAnchorAtOffset(
