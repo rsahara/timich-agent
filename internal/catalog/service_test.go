@@ -1479,6 +1479,7 @@ func TestCatalogSemanticSearchRanksBoundedCandidateSnapshotAcrossChunks(t *testi
 			normalized,
 			[]catalogSemanticSourceTraversal{{traversal: traversal}},
 			nil,
+			0,
 			false,
 		)
 		if err != nil {
@@ -1593,6 +1594,7 @@ func TestCatalogSemanticAutoSearchPromotesMetadataBeyondInitialTraversalChunk(t 
 		normalized,
 		[]catalogSemanticSourceTraversal{{traversal: traversal}},
 		metadataCandidates,
+		catalogSemanticMetadataPromotionBudget,
 		false,
 	)
 	if err != nil {
@@ -2105,7 +2107,7 @@ func TestCatalogSemanticMetadataCandidateDiscoveryIsBoundedBeforeVectorReads(t *
 		t.Fatalf("commit metadata candidate fixture: %v", err)
 	}
 
-	for _, query := range []string{"favorites", "Kyoto", "京都"} {
+	for _, query := range []string{"favorites", "Kyoto"} {
 		normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
 			Collection: AssetCollectionRequest{
 				Kind:  CollectionKindSearch,
@@ -2151,22 +2153,24 @@ func TestCatalogSemanticMetadataCandidateDiscoveryIsBoundedBeforeVectorReads(t *
 		}
 	}
 
-	short, err := normalizeAssetSearchRequest(AssetSearchRequest{
-		Collection: AssetCollectionRequest{
-			Kind:  CollectionKindSearch,
-			Query: &AssetSearchQuery{Text: "東京", Mode: QueryModeAuto},
-		},
-		Page: AssetSearchPageRequest{Index: 0, Size: 1},
-	})
-	if err != nil {
-		t.Fatalf("normalize short metadata request: %v", err)
-	}
-	refs, err := service.catalogSemanticMetadataCandidateRefs(ctx, short, "東京", header)
-	if err != nil {
-		t.Fatalf("catalogSemanticMetadataCandidateRefs(short Tokyo) error = %v", err)
-	}
-	if len(refs) != 1 || refs[0].AssetID != "boundary-match-after-limit" || refs[0].Ordinal != semanticSearchVisitBudget {
-		t.Fatalf("short metadata refs = %#v, want the exact match after the ordinal prefix", refs)
+	for _, query := range []string{"津", "京都", "東京"} {
+		short, err := normalizeAssetSearchRequest(AssetSearchRequest{
+			Collection: AssetCollectionRequest{
+				Kind:  CollectionKindSearch,
+				Query: &AssetSearchQuery{Text: query, Mode: QueryModeAuto},
+			},
+			Page: AssetSearchPageRequest{Index: 0, Size: 1},
+		})
+		if err != nil {
+			t.Fatalf("normalize short metadata request %q: %v", query, err)
+		}
+		refs, err := service.catalogSemanticMetadataCandidateRefs(ctx, short, query, header)
+		if err != nil {
+			t.Fatalf("catalogSemanticMetadataCandidateRefs(%q) error = %v", query, err)
+		}
+		if len(refs) != 0 {
+			t.Fatalf("short metadata refs for %q = %#v, want none", query, refs)
+		}
 	}
 }
 
@@ -5722,7 +5726,7 @@ func TestImmichMirrorIncrementalSyncRunsFullWhenLatestLimitChanges(t *testing.T)
 	}
 }
 
-func TestCatalogSemanticAutoSearchFallsBackToFilenameWhenSemanticMissing(t *testing.T) {
+func TestCatalogSemanticAutoSearchFallsBackToFilenameOnlyForMetadataEligibleQuery(t *testing.T) {
 	t.Parallel()
 
 	dataDir := t.TempDir()
@@ -5752,6 +5756,12 @@ func TestCatalogSemanticAutoSearchFallsBackToFilenameWhenSemanticMissing(t *test
 			MediaType:       "image",
 			Filename:        "Summer Beach.JPG",
 			CapturedAt:      startedAt.Add(-time.Hour),
+		},
+		{
+			UpstreamAssetID: "asset-short-filename",
+			MediaType:       "image",
+			Filename:        "津.jpg",
+			CapturedAt:      startedAt.Add(-2 * time.Hour),
 		},
 	}, 0, startedAt)
 	if err != nil {
@@ -5787,6 +5797,26 @@ func TestCatalogSemanticAutoSearchFallsBackToFilenameWhenSemanticMissing(t *test
 	}
 	if page.Resolved.Semantic.MessageCode != semanticMessageIndexMissingFallback {
 		t.Fatalf("auto fallback semantic message = %q", page.Resolved.Semantic.MessageCode)
+	}
+
+	shortAuto, err := service.SearchAssets(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind: CollectionKindSearch,
+			Query: &AssetSearchQuery{
+				Text: "津",
+				Mode: QueryModeAuto,
+			},
+		},
+		Page: AssetSearchPageRequest{Index: 0, Size: 10},
+	})
+	if err != nil {
+		t.Fatalf("short auto search without model: %v", err)
+	}
+	if shortAuto.Total != 0 || len(shortAuto.Items) != 0 ||
+		shortAuto.Resolved.QueryMode != QueryModeSemantic ||
+		shortAuto.Resolved.Semantic == nil || shortAuto.Resolved.Semantic.Eligible ||
+		shortAuto.Resolved.Semantic.FallbackQueryMode != "" {
+		t.Fatalf("short auto missing-model page = %#v, want no metadata fallback", shortAuto)
 	}
 
 	semanticOnly, err := service.SearchAssets(AssetSearchRequest{

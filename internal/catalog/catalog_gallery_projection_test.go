@@ -231,6 +231,67 @@ func TestMixedGalleryProjectionDeepPageUsesDayAnchorSeek(t *testing.T) {
 		t.Fatalf("unfiltered total scans the full mixed projection:\n%s", totalPlan)
 	}
 
+	boundary := newest.AddDate(0, 0, -199)
+	toBoundary := boundary
+	olderRequest, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind: CollectionKindTimeline,
+			Filters: AssetSearchFilters{CapturedAt: &AssetSearchCapturedTime{
+				To: &toBoundary,
+			}},
+		},
+		Page: AssetSearchPageRequest{Index: 0, Size: 10},
+	})
+	if err != nil {
+		t.Fatalf("normalize older mixed Gallery request: %v", err)
+	}
+	olderPage, err := store.SearchCatalogAssets(context.Background(), olderRequest)
+	if err != nil {
+		t.Fatalf("older SearchCatalogAssets() error = %v", err)
+	}
+	if olderPage.Total != 1_025 || olderPage.TotalAccuracy != TotalAccuracyExact ||
+		len(olderPage.Items) != 10 || olderPage.Items[0].ID != "asset-004976" ||
+		olderPage.Items[9].ID != "asset-004985" {
+		t.Fatalf("older mixed Gallery page = %#v, want exact position-seek results", olderPage)
+	}
+
+	fromBoundary := boundary
+	newerRequest, err := normalizeAssetSearchRequest(AssetSearchRequest{
+		Collection: AssetCollectionRequest{
+			Kind: CollectionKindTimeline,
+			Filters: AssetSearchFilters{CapturedAt: &AssetSearchCapturedTime{
+				From: &fromBoundary,
+			}},
+		},
+		Page: AssetSearchPageRequest{Index: 497, Size: 10},
+	})
+	if err != nil {
+		t.Fatalf("normalize newer mixed Gallery request: %v", err)
+	}
+	newerPage, err := store.SearchCatalogAssets(context.Background(), newerRequest)
+	if err != nil {
+		t.Fatalf("newer SearchCatalogAssets() error = %v", err)
+	}
+	if newerPage.Total != 4_976 || newerPage.TotalAccuracy != TotalAccuracyExact ||
+		len(newerPage.Items) != 6 || newerPage.Items[0].ID != "asset-004970" ||
+		newerPage.Items[5].ID != "asset-004975" || newerPage.NextPageIndex != nil {
+		t.Fatalf("newer mixed Gallery page = %#v, want bounded final position-seek page", newerPage)
+	}
+
+	boundaryPlan := explainGalleryProjectionQueryPlan(
+		t,
+		store.db,
+		galleryProjectionPositionBeforeSQL,
+		boundary.Format("2006-01-02"),
+		formatCatalogTime(boundary),
+		formatCatalogTime(time.Date(boundary.Year(), boundary.Month(), boundary.Day()+1, 0, 0, 0, 0, time.UTC)),
+	)
+	if !strings.Contains(boundaryPlan, "catalog_gallery_projection_days") ||
+		!strings.Contains(boundaryPlan, "USING COVERING INDEX idx_catalog_gallery_projection_captured") ||
+		strings.Contains(boundaryPlan, "SCAN catalog_gallery_projection") {
+		t.Fatalf("capture boundary position does not use day counts plus one indexed day:\n%s", boundaryPlan)
+	}
+
 	normalized, err := normalizeAssetSearchRequest(AssetSearchRequest{
 		Collection: AssetCollectionRequest{Kind: CollectionKindTimeline},
 		Page:       AssetSearchPageRequest{Index: 499, Size: 10},

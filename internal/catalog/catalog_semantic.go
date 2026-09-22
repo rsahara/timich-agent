@@ -3,12 +3,18 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"math"
 	"sort"
 	"strings"
 	"time"
+)
+
+const (
+	catalogSemanticMetadataCandidateBudget = 3 * time.Second
+	catalogSemanticMetadataPromotionBudget = 1 * time.Second
 )
 
 type catalogSemanticCandidateTraversal interface {
@@ -25,9 +31,11 @@ type catalogSemanticSourceTraversal struct {
 }
 
 type catalogSemanticTraversalStats struct {
-	CandidateVisits    int
-	MetadataCandidates int
-	Rounds             int
+	CandidateVisits           int
+	MetadataCandidates        int
+	MetadataPromotionElapsed  time.Duration
+	MetadataPromotionTimedOut bool
+	Rounds                    int
 }
 
 type catalogSemanticMetadataCandidateRef struct {
@@ -41,7 +49,7 @@ func (s *Service) searchCatalogWithoutSemanticProfile(ctx context.Context, norma
 
 func (s *Service) searchCatalogWithoutUsableSemanticIndex(ctx context.Context, normalized normalizedAssetSearch, semantic CatalogSemanticStatus, profile semanticEmbeddingProfile) (AssetSearchPage, error) {
 	semantic = normalizeCatalogSemanticStatus(semantic, profile)
-	if semanticAutoRequested(normalized) {
+	if catalogSemanticAutoMetadataRequested(normalized) {
 		fallback, err := semanticFilenameFallback(normalized, semantic, profile)
 		if err != nil {
 			return AssetSearchPage{}, err
@@ -145,26 +153,58 @@ func (s *Service) searchCatalogSemanticAssets(ctx context.Context, normalized no
 		return s.searchCatalogWithoutUsableSemanticIndex(ctx, normalized, semantic, profile)
 	}
 	metadataCandidates := []semanticScoredAsset{}
-	if semanticAutoRequested(normalized) {
-		metadataCandidates, err = s.catalogSemanticMetadataCandidates(ctx, normalized, queryVector, traversals)
+	metadataCandidateElapsed := time.Duration(0)
+	metadataPromotionBudget := time.Duration(0)
+	metadataTimedOut := false
+	if catalogSemanticAutoMetadataRequested(normalized) {
+		metadataPromotionBudget = catalogSemanticMetadataPromotionBudget
+		metadataStarted := time.Now()
+		metadataCandidates, metadataTimedOut, err = catalogSemanticMetadataCandidatesWithinBudget(
+			ctx,
+			catalogSemanticMetadataCandidateBudget,
+			func(metadataCtx context.Context) ([]semanticScoredAsset, error) {
+				return s.catalogSemanticMetadataCandidates(metadataCtx, normalized, queryVector, traversals)
+			},
+		)
+		metadataCandidateElapsed = time.Since(metadataStarted)
 		if err != nil {
 			return AssetSearchPage{}, err
 		}
+		if metadataTimedOut {
+			log.Printf(
+				"timich-agent catalog semantic metadata candidates status skipped reason=budget_exhausted elapsed=%s",
+				metadataCandidateElapsed.Round(time.Millisecond),
+			)
+		}
 	}
+	traversalStarted := time.Now()
 	resolvedPage, traversalStats, err := s.resolveCatalogSemanticTraversalPage(
 		ctx,
 		normalized,
 		traversals,
 		metadataCandidates,
+		metadataPromotionBudget,
 		options.IncludeSemanticScores,
 	)
 	if err != nil {
 		return AssetSearchPage{}, err
 	}
+	if traversalStats.MetadataPromotionTimedOut {
+		metadataTimedOut = true
+		log.Printf(
+			"timich-agent catalog semantic metadata promotion status skipped reason=budget_exhausted elapsed=%s",
+			traversalStats.MetadataPromotionElapsed.Round(time.Millisecond),
+		)
+	}
+	metadataElapsed := metadataCandidateElapsed + traversalStats.MetadataPromotionElapsed
+	traversalElapsed := time.Since(traversalStarted) - traversalStats.MetadataPromotionElapsed
+	if traversalElapsed < 0 {
+		traversalElapsed = 0
+	}
 	candidateSeen := traversalStats.CandidateVisits > 0 || traversalStats.MetadataCandidates > 0
 	semantic = finalizeCatalogSemanticDirectStatus(semantic, directStatusSeen, directStatusAllReady, profile)
 	log.Printf(
-		"timich-agent catalog semantic search %s status completed model=%s vector_space=%s status=%s completed=%d indexed=%d metadata_candidates=%d visits=%d rounds=%d elapsed=%s",
+		"timich-agent catalog semantic search %s status completed model=%s vector_space=%s status=%s completed=%d indexed=%d metadata_candidates=%d metadata_timed_out=%t visits=%d rounds=%d metadata_candidate_elapsed=%s metadata_promotion_elapsed=%s metadata_elapsed=%s traversal_elapsed=%s elapsed=%s",
 		statusMode,
 		profile.ModelID(),
 		profile.VectorSpaceID(),
@@ -172,8 +212,13 @@ func (s *Service) searchCatalogSemanticAssets(ctx context.Context, normalized no
 		semantic.CompletedVectorCount,
 		semantic.IndexedVectorCount,
 		traversalStats.MetadataCandidates,
+		metadataTimedOut,
 		traversalStats.CandidateVisits,
 		traversalStats.Rounds,
+		metadataCandidateElapsed.Round(time.Millisecond),
+		traversalStats.MetadataPromotionElapsed.Round(time.Millisecond),
+		metadataElapsed.Round(time.Millisecond),
+		traversalElapsed.Round(time.Millisecond),
 		time.Since(directStatusStarted).Round(time.Millisecond),
 	)
 	log.Printf(
@@ -216,6 +261,52 @@ func (s *Service) searchCatalogSemanticAssets(ctx context.Context, normalized no
 	}, nil
 }
 
+func catalogSemanticMetadataCandidatesWithinBudget(
+	ctx context.Context,
+	budget time.Duration,
+	load func(context.Context) ([]semanticScoredAsset, error),
+) ([]semanticScoredAsset, bool, error) {
+	return catalogSemanticMetadataOperationWithinBudget(ctx, budget, load)
+}
+
+func catalogSemanticMetadataMatchKeysWithinBudget(
+	ctx context.Context,
+	budget time.Duration,
+	load func(context.Context) (map[string]struct{}, error),
+) (map[string]struct{}, bool, error) {
+	return catalogSemanticMetadataOperationWithinBudget(ctx, budget, load)
+}
+
+func catalogSemanticMetadataOperationWithinBudget[T any](
+	ctx context.Context,
+	budget time.Duration,
+	load func(context.Context) (T, error),
+) (T, bool, error) {
+	var zero T
+	if load == nil {
+		return zero, false, nil
+	}
+	if parentErr := ctx.Err(); parentErr != nil {
+		return zero, false, parentErr
+	}
+	if budget <= 0 {
+		return zero, true, nil
+	}
+	metadataCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	candidates, err := load(metadataCtx)
+	if err == nil {
+		return candidates, false, nil
+	}
+	if parentErr := ctx.Err(); parentErr != nil {
+		return zero, false, parentErr
+	}
+	if errors.Is(metadataCtx.Err(), context.DeadlineExceeded) {
+		return zero, true, nil
+	}
+	return zero, false, err
+}
+
 func finalizeCatalogSemanticDirectStatus(semantic CatalogSemanticStatus, directStatusSeen bool, directStatusAllReady bool, profile semanticEmbeddingProfile) CatalogSemanticStatus {
 	switch {
 	case semantic.CompletedVectorCount > 0 && semantic.IndexedVectorCount == 0:
@@ -237,6 +328,7 @@ func (s *Service) resolveCatalogSemanticTraversalPage(
 	normalized normalizedAssetSearch,
 	traversals []catalogSemanticSourceTraversal,
 	metadataCandidates []semanticScoredAsset,
+	metadataPromotionBudget time.Duration,
 	includeSemanticScores bool,
 ) (catalogSemanticResolvedPage, catalogSemanticTraversalStats, error) {
 	accumulator, err := s.newCatalogSemanticResultAccumulator(ctx, normalized, includeSemanticScores)
@@ -286,12 +378,23 @@ func (s *Service) resolveCatalogSemanticTraversalPage(
 	// discover a higher-scoring node. Rank the complete bounded candidate
 	// snapshot before pagination so relevance order is stable across pages.
 	sortSemanticScoredAssets(ranked)
-	if semanticAutoRequested(normalized) {
-		metadataMatches, err := s.catalogSemanticMetadataMatchKeys(ctx, normalized, ranked)
+	if catalogSemanticAutoMetadataRequested(normalized) && metadataPromotionBudget > 0 {
+		metadataPromotionStarted := time.Now()
+		metadataMatches, timedOut, err := catalogSemanticMetadataMatchKeysWithinBudget(
+			ctx,
+			metadataPromotionBudget,
+			func(metadataCtx context.Context) (map[string]struct{}, error) {
+				return s.catalogSemanticMetadataMatchKeys(metadataCtx, normalized, ranked)
+			},
+		)
+		stats.MetadataPromotionElapsed = time.Since(metadataPromotionStarted)
+		stats.MetadataPromotionTimedOut = timedOut
 		if err != nil {
 			return catalogSemanticResolvedPage{}, stats, err
 		}
-		ranked = promoteCatalogMetadataMatches(ranked, metadataMatches)
+		if !timedOut {
+			ranked = promoteCatalogMetadataMatches(ranked, metadataMatches)
+		}
 	}
 	ranked = diversifySemanticCandidateSnapshot(ranked)
 	if err := accumulator.Add(ctx, ranked); err != nil {
@@ -647,7 +750,7 @@ func (s *Service) catalogSemanticMetadataCandidates(
 	queryVector []float32,
 	traversals []catalogSemanticSourceTraversal,
 ) ([]semanticScoredAsset, error) {
-	if normalized.Request.Collection.Query == nil || len(queryVector) == 0 || len(traversals) == 0 {
+	if !catalogSemanticAutoMetadataRequested(normalized) || len(queryVector) == 0 || len(traversals) == 0 {
 		return nil, nil
 	}
 	query := strings.TrimSpace(normalized.Request.Collection.Query.Text)
@@ -699,11 +802,11 @@ func (s *Service) catalogSemanticMetadataCandidateRefs(
 	query string,
 	header semanticBinaryIndexHeader,
 ) ([]catalogSemanticMetadataCandidateRef, error) {
+	if len([]rune(strings.TrimSpace(query))) < 3 {
+		return nil, nil
+	}
 	if header.SourceKey == canonicalSemanticCorpusSourceKey {
 		return s.catalogSemanticCanonicalMetadataCandidateRefs(ctx, normalized, query, header)
-	}
-	if len([]rune(query)) < 3 {
-		return s.catalogSemanticShortMetadataCandidateRefs(ctx, normalized, query, header)
 	}
 	textWhere, textFilterArgs := catalogSemanticMetadataFilterWhere(normalized, "fa")
 	favoriteWhere, favoriteFilterArgs := catalogSemanticMetadataFilterWhere(normalized, "fav")
@@ -730,8 +833,8 @@ func (s *Service) catalogSemanticMetadataCandidateRefs(
 		text_rows(asset_id, ordinal) AS (
 			SELECT fa.upstream_asset_id, tm.ordinal
 			FROM catalog_assets_metadata_fts
-			JOIN catalog_assets fa ON fa.rowid = catalog_assets_metadata_fts.rowid
-			JOIN semantic_index_membership tm
+			CROSS JOIN catalog_assets fa ON fa.rowid = catalog_assets_metadata_fts.rowid
+			CROSS JOIN semantic_index_membership tm
 				ON tm.source_key = fa.source_key
 				AND tm.upstream_asset_id = fa.upstream_asset_id
 			`+textWhere+`
@@ -777,9 +880,6 @@ func (s *Service) catalogSemanticCanonicalMetadataCandidateRefs(
 	query string,
 	header semanticBinaryIndexHeader,
 ) ([]catalogSemanticMetadataCandidateRef, error) {
-	if len([]rune(query)) < 3 {
-		return s.catalogSemanticCanonicalShortMetadataCandidateRefs(ctx, normalized, query, header)
-	}
 	textWhere, textFilterArgs := catalogSemanticMetadataFilterWhere(normalized, "c")
 	favoriteWhere, favoriteFilterArgs := catalogSemanticMetadataFilterWhere(normalized, "fav")
 	args := append([]any{}, textFilterArgs...)
@@ -805,8 +905,8 @@ func (s *Service) catalogSemanticCanonicalMetadataCandidateRefs(
 		text_rows(asset_id, ordinal) AS (
 			SELECT c.canonical_asset_id, tm.ordinal
 			FROM catalog_canonical_metadata_fts
-			JOIN catalog_canonical_assets c ON c.rowid = catalog_canonical_metadata_fts.rowid
-			JOIN semantic_index_membership tm
+			CROSS JOIN catalog_canonical_assets c ON c.rowid = catalog_canonical_metadata_fts.rowid
+			CROSS JOIN semantic_index_membership tm
 				ON tm.upstream_asset_id = c.canonical_asset_id
 			`+textWhere+`
 				AND catalog_canonical_metadata_fts MATCH ?
@@ -844,69 +944,6 @@ func (s *Service) catalogSemanticCanonicalMetadataCandidateRefs(
 	return scanCatalogSemanticMetadataCandidateRefs(rows)
 }
 
-func (s *Service) catalogSemanticShortMetadataCandidateRefs(
-	ctx context.Context,
-	normalized normalizedAssetSearch,
-	query string,
-	header semanticBinaryIndexHeader,
-) ([]catalogSemanticMetadataCandidateRef, error) {
-	where, filterArgs := catalogSemanticMetadataWhere(normalized, query, "a")
-	args := append([]any{}, filterArgs...)
-	args = append(args,
-		header.SourceKey,
-		header.ModelID,
-		header.VectorSpaceID,
-		header.AssetGeneration,
-		semanticSearchVisitBudget,
-	)
-	rows, err := s.catalog.queryDB().QueryContext(ctx, `SELECT a.upstream_asset_id, m.ordinal
-		FROM catalog_assets a
-		JOIN semantic_index_membership m
-			ON m.source_key = a.source_key
-			AND m.upstream_asset_id = a.upstream_asset_id
-		`+where+`
-			AND m.source_key = ?
-			AND m.model_id = ?
-			AND m.vector_space_id = ?
-			AND m.asset_generation = ?
-		LIMIT ?`, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query short catalog semantic metadata candidates: %w", err)
-	}
-	return scanCatalogSemanticMetadataCandidateRefs(rows)
-}
-
-func (s *Service) catalogSemanticCanonicalShortMetadataCandidateRefs(
-	ctx context.Context,
-	normalized normalizedAssetSearch,
-	query string,
-	header semanticBinaryIndexHeader,
-) ([]catalogSemanticMetadataCandidateRef, error) {
-	where, filterArgs := catalogSemanticMetadataWhere(normalized, query, "c")
-	args := append([]any{}, filterArgs...)
-	args = append(args,
-		header.SourceKey,
-		header.ModelID,
-		header.VectorSpaceID,
-		header.AssetGeneration,
-		semanticSearchVisitBudget,
-	)
-	rows, err := s.catalog.queryDB().QueryContext(ctx, `SELECT c.canonical_asset_id, m.ordinal
-		FROM catalog_canonical_assets c
-		JOIN semantic_index_membership m
-			ON m.upstream_asset_id = c.canonical_asset_id
-		`+where+`
-			AND m.source_key = ?
-			AND m.model_id = ?
-			AND m.vector_space_id = ?
-			AND m.asset_generation = ?
-		LIMIT ?`, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query short canonical semantic metadata candidates: %w", err)
-	}
-	return scanCatalogSemanticMetadataCandidateRefs(rows)
-}
-
 func scanCatalogSemanticMetadataCandidateRefs(rows *sql.Rows) ([]catalogSemanticMetadataCandidateRef, error) {
 	defer rows.Close()
 	refs := make([]catalogSemanticMetadataCandidateRef, 0, semanticSearchVisitBudget)
@@ -925,6 +962,13 @@ func scanCatalogSemanticMetadataCandidateRefs(rows *sql.Rows) ([]catalogSemantic
 
 func catalogSemanticFTSQuery(query string) string {
 	return `"` + strings.ReplaceAll(strings.TrimSpace(query), `"`, `""`) + `"`
+}
+
+func catalogSemanticAutoMetadataRequested(normalized normalizedAssetSearch) bool {
+	if !semanticAutoRequested(normalized) || normalized.Request.Collection.Query == nil {
+		return false
+	}
+	return len([]rune(strings.TrimSpace(normalized.Request.Collection.Query.Text))) >= 3
 }
 
 func catalogSemanticMetadataWhere(normalized normalizedAssetSearch, query string, alias string) (string, []any) {
