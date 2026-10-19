@@ -242,24 +242,24 @@ def preflight_release_archive_budget(registry: dict, args: argparse.Namespace) -
         args.model_dir,
         args.runtime_pack_dir,
     )
-    smoke_paths = [
-        recommended_archive_path(registry, "recommended", "models", args.model_dir, allow_default=True),
-        recommended_archive_path(
-            registry,
-            "recommendedRuntimePack",
-            "runtimePacks",
-            args.runtime_pack_dir,
-            allow_default=False,
-        ),
-    ]
+    # Validate the largest native smoke pair; each architecture runs separately.
     smoke_extract_bytes = 0
-    for path in smoke_paths:
-        if path is None:
-            continue
-        stats = archive_stats.get(path.resolve())
-        if stats is None:
-            raise SystemExit(f"recommended semantic artifact is missing from validated archives: {path.name}")
-        smoke_extract_bytes += stats.uncompressed_size_bytes
+    for platform in ("linux-amd64", "linux-arm64"):
+        smoke_paths = [
+            recommended_archive_path(registry, "recommended", "models", args.model_dir,
+                                     allow_default=True, platform=platform),
+            recommended_archive_path(registry, "recommendedRuntimePack", "runtimePacks",
+                                     args.runtime_pack_dir, allow_default=False, platform=platform),
+        ]
+        pair_bytes = 0
+        for path in smoke_paths:
+            if path is None:
+                continue
+            stats = archive_stats.get(path.resolve())
+            if stats is None:
+                raise SystemExit(f"recommended semantic artifact is missing from validated archives: {path.name}")
+            pair_bytes += stats.uncompressed_size_bytes
+        smoke_extract_bytes = max(smoke_extract_bytes, pair_bytes)
     try:
         enforce_semantic_working_set(
             downloaded_size_bytes,
@@ -291,6 +291,7 @@ def recommended_archive_path(
     artifact_dir: Path,
     *,
     allow_default: bool,
+    platform: str = "linux-amd64",
 ) -> Path | None:
     recommended_id = str(registry.get(recommended_key) or "").strip()
     if not recommended_id:
@@ -308,7 +309,7 @@ def recommended_archive_path(
     artifacts = owner.get("artifacts") or {}
     if not isinstance(artifacts, dict):
         return None
-    artifact = artifacts.get("linux-amd64")
+    artifact = artifacts.get(platform)
     if not isinstance(artifact, dict) and allow_default:
         artifact = artifacts.get("default")
     if not isinstance(artifact, dict):
@@ -474,7 +475,7 @@ def validate_pack_layout(
             "--expected-version", str(owner.get("version") or "").strip(),
             "--expected-runtime", str(owner.get("runtime") or "").strip(),
         ]
-        if platform == "linux-amd64":
+        if platform in {"linux-amd64", "linux-arm64"}:
             command.append("--require-bundled-python")
     if sidecars["signature"] is not None:
         command.extend(["--signature", str(sidecars["signature"])])

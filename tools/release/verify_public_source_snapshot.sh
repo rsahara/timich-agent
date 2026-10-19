@@ -17,8 +17,22 @@ if [ -z "$public_dir" ] || [ ! -d "$public_dir/.git" ]; then
 fi
 command -v git >/dev/null 2>&1 || fail "git is required"
 
-# The public repository owns its GitHub workflows and legacy release helper
-# scripts. Every other root path must have the same Git object type, executable
+# Inspect the committed snapshot that will be tagged, not just its worktree:
+# deleting an obsolete publisher locally does not retire it from that commit.
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+while IFS= read -r path || [ -n "$path" ]; do
+  [ -n "$path" ] || continue
+  if [ -e "$expected_dir/$path" ] || [ -L "$expected_dir/$path" ]; then
+    fail "export reintroduces a retired release path: $path"
+  fi
+  retired_entry=$(git -C "$public_dir" ls-tree --name-only HEAD -- "$path") || fail "cannot inspect public release paths"
+  if [ -n "$retired_entry" ]; then
+    fail "public source still contains a retired release path: $path"
+  fi
+done < "$script_dir/retired-public-release-paths.txt"
+
+# The public repository owns its other GitHub workflows and helper scripts.
+# Every other root path must have the same Git object type, executable
 # mode, and blob content as the generated public export. Temporary indexes keep
 # both source trees untouched while producing one normalized Git tree format.
 verify_root=$(mktemp -d)

@@ -262,12 +262,13 @@ func (c *Client) runOnce(ctx context.Context) error {
 		return err
 	}
 
-	go c.heartbeatLoop(runCtx, stream)
+	var workers sync.WaitGroup
+	workers.Add(1)
+	go func() { defer workers.Done(); c.heartbeatLoop(runCtx, stream) }()
 
 	sessionJobs := make(chan *RelayRequest, hostedRelaySessionQueueSize)
 	mediaJobs := make(chan *RelayRequest, hostedRelayMediaQueueSize)
 	workerErrors := make(chan error, 1)
-	var workers sync.WaitGroup
 	startWorkers := func(count int, jobs <-chan *RelayRequest) {
 		for range count {
 			workers.Add(1)
@@ -407,6 +408,23 @@ func (c *Client) handleRelayRequest(request *RelayRequest) RelayResponse {
 }
 
 func (c *Client) handleRelayRequestContext(ctx context.Context, request *RelayRequest) RelayResponse {
+	if c.runtime != nil {
+		root, release, ok := c.runtime.AcquireRequest()
+		if !ok {
+			id := ""
+			if request != nil {
+				id = request.FetchID
+			}
+			return jsonErrorResponse(id, http.StatusServiceUnavailable, "agent_shutting_down", "The Agent is shutting down.")
+		}
+		defer release()
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		stop := context.AfterFunc(root, cancel)
+		defer stop()
+		defer cancel()
+	}
+
 	if request == nil {
 		return jsonErrorResponse("", http.StatusBadRequest, "invalid_request", "The control-plane request is not valid.")
 	}
@@ -440,6 +458,7 @@ func (c *Client) handleRelayRequestContext(ctx context.Context, request *RelayRe
 func (c *Client) handleHostedPairing(request *RelayRequest) RelayResponse {
 	var payload struct {
 		DeviceName string `json:"deviceName"`
+		Review     bool   `json:"review"`
 	}
 	if err := json.Unmarshal(request.Body, &payload); err != nil {
 		return jsonErrorResponse(request.FetchID, http.StatusBadRequest, "invalid_request", "Could not parse the pairing redemption request.")
@@ -455,7 +474,13 @@ func (c *Client) handleHostedPairing(request *RelayRequest) RelayResponse {
 		)
 	}
 
-	response, err := c.createHostedSession(payload.DeviceName, hostedBaseURL)
+	var response any
+	var err error
+	if payload.Review {
+		response, err = c.runtime.CreateHostedReviewSession(payload.DeviceName, hostedBaseURL)
+	} else {
+		response, err = c.createHostedSession(payload.DeviceName, hostedBaseURL)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrDeviceLimitReached):
@@ -493,10 +518,18 @@ func (c *Client) handleMediaRequestContext(ctx context.Context, request *RelayRe
 		)
 	}
 
-	targetURL, err := url.Parse(strings.TrimRight(baseURL, "/") + parsedURL.RequestURI())
-	if err != nil {
-		return jsonErrorResponse(request.FetchID, http.StatusBadRequest, "invalid_request", "The control-plane request path is not valid.")
+	targetURL, err := url.Parse(baseURL)
+	if err != nil || (targetURL.Scheme != "http" && targetURL.Scheme != "https") ||
+		targetURL.Host == "" || targetURL.User != nil || targetURL.Opaque != "" ||
+		targetURL.Path != "" || targetURL.RawQuery != "" || targetURL.ForceQuery || strings.Contains(baseURL, "#") {
+		return jsonErrorResponse(request.FetchID, http.StatusBadRequest, "invalid_request", "The relay server URL must be an HTTP or HTTPS origin.")
 	}
+	// The hosted base supplies only the authority. Dispatch the exact path and
+	// query authorized by Reach, including escaped path bytes and empty queries.
+	targetURL.Path = parsedURL.Path
+	targetURL.RawPath = parsedURL.RawPath
+	targetURL.RawQuery = parsedURL.RawQuery
+	targetURL.ForceQuery = parsedURL.ForceQuery
 
 	httpRequest, err := http.NewRequestWithContext(ctx, request.Method, targetURL.String(), bytes.NewReader(request.Body))
 	if err != nil {

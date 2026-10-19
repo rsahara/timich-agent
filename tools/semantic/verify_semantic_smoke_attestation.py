@@ -22,7 +22,7 @@ def main() -> int:
     attestation = read_json(args.attestation)
     if attestation.get("schemaVersion") != 1 or attestation.get("product") != PRODUCT:
         raise SystemExit("semantic smoke attestation contract is invalid")
-    if attestation.get("platform") != PLATFORM:
+    if attestation.get("platform") != args.platform:
         raise SystemExit("semantic smoke attestation platform is invalid")
     if attestation.get("recommendedModel") != registry.get("recommended"):
         raise SystemExit("semantic smoke attestation recommended model mismatch")
@@ -51,7 +51,7 @@ def main() -> int:
         raise SystemExit("semantic smoke attestation interpreter is not CPython")
     if set(interpreter.get("imports") or {}) != {"numpy", "onnxruntime", "PIL", "transformers"}:
         raise SystemExit("semantic smoke attestation required imports are incomplete")
-    print(json.dumps({"status": "ok", "assets": len(attestation["assets"]), "platform": PLATFORM}, sort_keys=True))
+    print(json.dumps({"status": "ok", "assets": len(attestation["assets"]), "platform": args.platform}, sort_keys=True))
     return 0
 
 
@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--assets-dir", type=Path, required=True)
     parser.add_argument("--attestation", type=Path, required=True)
+    parser.add_argument("--platform", choices=("linux-amd64", "linux-arm64"), default=PLATFORM)
     return parser.parse_args()
 
 

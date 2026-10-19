@@ -79,7 +79,11 @@ func (a *AgentRuntime) StartLocalDatasourceScan() bool {
 		notifyScheduleReset(a.localVerifyScheduleReset)
 		return false
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	parent, release, ok := a.background.Acquire()
+	if !ok {
+		return false
+	}
+	ctx, cancel := context.WithCancel(parent)
 	if a.localScanScheduleReset == nil {
 		a.localScanScheduleReset = make(chan struct{}, 1)
 	}
@@ -88,8 +92,14 @@ func (a *AgentRuntime) StartLocalDatasourceScan() bool {
 	}
 	a.localScanCancel = cancel
 	a.localScanWG.Add(2)
-	go a.runLocalDatasourceScanLoop(ctx)
-	go a.runLocalContentVerificationScheduleLoop(ctx)
+	go func() {
+		defer release()
+		defer cancel()
+		done := make(chan struct{})
+		go func() { defer close(done); a.runLocalDatasourceScanLoop(ctx) }()
+		a.runLocalContentVerificationScheduleLoop(ctx)
+		<-done
+	}()
 	return true
 }
 
@@ -498,11 +508,11 @@ func (a *AgentRuntime) triggerLocalPhase0Scan(reason string) {
 	if _, ok := a.localDatasourceScanSchedule(); !ok {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), localPhase0ScanTimeout)
+	a.background.Go(func(parent context.Context) {
+		ctx, cancel := context.WithTimeout(parent, localPhase0ScanTimeout)
 		defer cancel()
 		a.syncLocalPhase0Scans(ctx, reason)
-	}()
+	})
 }
 
 func (a *AgentRuntime) syncLocalPhase0Scans(ctx context.Context, reason string) {

@@ -66,12 +66,22 @@ download_and_verify_semantic_release_assets() {
     "$public_source_sha" \
     "$base_url" \
     "$semantic_verify_dir"
-  if [ ! -f "$semantic_smoke_attestation" ]; then
-    fail "secretless semantic smoke attestation is required"
-  fi
-  python3 "$agent_dir/tools/semantic/verify_semantic_smoke_attestation.py" \
-    --assets-dir "$semantic_verify_dir" \
-    --attestation "$semantic_smoke_attestation"
+  local required_platform attestation
+  local -a required_platforms
+  IFS=',' read -ra required_platforms <<< "${REQUIRED_RELEASE_PLATFORMS:-linux-amd64}"
+  for required_platform in "${required_platforms[@]}"; do
+    attestation="$semantic_smoke_attestation"
+    if [ -d "$attestation" ]; then
+      attestation="$attestation/semantic-smoke-attestation-${required_platform}.json"
+    fi
+    if [ ! -f "$attestation" ]; then
+      fail "secretless semantic smoke attestation is required for $required_platform"
+    fi
+    python3 "$agent_dir/tools/semantic/verify_semantic_smoke_attestation.py" \
+      --assets-dir "$semantic_verify_dir" \
+      --platform "$required_platform" \
+      --attestation "$attestation"
+  done
   while IFS= read -r semantic_asset; do
     semantic_asset_paths+=("$semantic_asset")
   done < <(find "$semantic_verify_dir" -maxdepth 1 -type f ! -name 'semantic-asset-snapshot.json' | sort)

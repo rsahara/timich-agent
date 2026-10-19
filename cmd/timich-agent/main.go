@@ -37,8 +37,16 @@ var (
 
 func main() {
 	if err := runCLI(os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		log.Fatal(err)
+		exitCLIError(err)
 	}
+}
+
+func exitCLIError(err error) {
+	var stopped *shutdownError
+	if !errors.As(err, &stopped) {
+		log.Print(err)
+	}
+	os.Exit(1)
 }
 
 func runCLI(args []string, stdout io.Writer, stderr io.Writer) error {
@@ -185,11 +193,6 @@ func serve(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err := runtime.Close(); err != nil {
-			log.Printf("timich-agent runtime close failed: %v", err)
-		}
-	}()
 	runtime.StartUploadMaintenance()
 	runtime.StartDatasourceMirrorSync()
 	runtime.StartLocalDatasourceScan()
@@ -200,19 +203,21 @@ func serve(args []string, stderr io.Writer) error {
 	restartCh := make(chan struct{}, 1)
 	adminServer := &http.Server{
 		Addr: cfg.AdminListenAddress,
-		Handler: adminapi.NewMuxWithOptions(runtime, adminapi.Options{
+		Handler: runtime.RequestHandler(adminapi.NewMuxWithOptions(runtime, adminapi.Options{
 			UpdateManifestURL:        resolveUpdateManifestURL(),
 			SemanticModelManifestURL: resolveSemanticModelManifestURL(),
 			Restart: func(context.Context) error {
 				scheduleRestart(restartCh)
 				return nil
 			},
-		}),
+		})),
+		BaseContext:       func(net.Listener) context.Context { return runtime.RequestContext() },
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	mediaServer := &http.Server{
 		Addr:              cfg.MediaListenAddress,
-		Handler:           mediaapi.NewMux(runtime),
+		Handler:           runtime.RequestHandler(mediaapi.NewMux(runtime)),
+		BaseContext:       func(net.Listener) context.Context { return runtime.RequestContext() },
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -228,7 +233,7 @@ func serve(args []string, stderr io.Writer) error {
 	logFirstRunAdminSetupPrompt(runtime, cfg, loadedState.Path)
 
 	controlPlaneCtx, cancelControlPlane := context.WithCancel(context.Background())
-	defer cancelControlPlane()
+	controlPlaneDone := make(chan struct{})
 	if cfg.Hosted.Enabled && strings.TrimSpace(cfg.ControlPlaneAddress) != "" {
 		client := controlplane.NewClient(version, cfg.ControlPlaneAddress, cfg.Hosted.ServerURL, runtime, controlplane.ClientOptions{
 			TLS: controlplane.TLSConfig{
@@ -245,13 +250,18 @@ func serve(args []string, stderr io.Writer) error {
 			},
 		})
 		go func() {
+			defer close(controlPlaneDone)
 			if err := client.Run(controlPlaneCtx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("timich-agent control plane stopped: %v", err)
 			}
 		}()
+	} else {
+		close(controlPlaneDone)
 	}
-
-	return serveUntilShutdown(adminServer, mediaServer, restartCh)
+	coordinator := newShutdownCoordinator(runtime, adminServer, mediaServer)
+	coordinator.stopControlPlane = cancelControlPlane
+	coordinator.controlPlaneDone = controlPlaneDone
+	return serveUntilShutdown(adminServer, mediaServer, restartCh, coordinator)
 }
 
 func resolveUpdateManifestURL() string {
@@ -346,28 +356,24 @@ func loadConfigForServe(args []string, stderr io.Writer) (config.ResolvedConfig,
 	return config.ApplyRuntimeOverrides(cfg, *adminListenAddress, *mediaListenAddress, *dataDir)
 }
 
-func serveUntilShutdown(adminServer *http.Server, mediaServer *http.Server, restartCh <-chan struct{}) error {
-	errCh := make(chan error, 2)
-	go serveHTTP("admin", adminServer, errCh)
-	go serveHTTP("media", mediaServer, errCh)
-
+func serveUntilShutdown(adminServer *http.Server, mediaServer *http.Server, restartCh <-chan struct{}, coordinator *shutdownCoordinator) error {
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(signalCh)
+	errCh := make(chan error, 2)
+	go serveHTTP("admin", adminServer, errCh)
+	go serveHTTP("media", mediaServer, errCh)
+	return waitForShutdown(signalCh, restartCh, errCh, coordinator)
+}
 
+func waitForShutdown(signalCh <-chan os.Signal, restartCh <-chan struct{}, errCh <-chan error, coordinator *shutdownCoordinator) error {
 	select {
 	case sig := <-signalCh:
-		log.Printf("timich-agent shutting down after signal=%s", sig)
-		return shutdownServers(adminServer, mediaServer)
+		return coordinator.shutdownWithCause(fmt.Sprintf("timich-agent shutting down after signal=%s", sig), nil)
 	case <-restartCh:
-		log.Printf("timich-agent restarting after admin request")
-		return shutdownServers(adminServer, mediaServer)
+		return coordinator.shutdownWithCause("timich-agent restarting after admin request", nil)
 	case err := <-errCh:
-		if err == nil {
-			return nil
-		}
-		_ = shutdownServers(adminServer, mediaServer)
-		return err
+		return coordinator.shutdownWithCause("", err)
 	}
 }
 
@@ -385,17 +391,4 @@ func serveHTTP(name string, server *http.Server, errCh chan<- error) {
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		errCh <- fmt.Errorf("%s API server: %w", name, err)
 	}
-}
-
-func shutdownServers(servers ...*http.Server) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var shutdownErr error
-	for _, server := range servers {
-		if err := server.Shutdown(ctx); err != nil && shutdownErr == nil {
-			shutdownErr = err
-		}
-	}
-	return shutdownErr
 }

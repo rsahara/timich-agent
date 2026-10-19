@@ -21,10 +21,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rsahara/timich-agent/internal/catalog"
 	"github.com/rsahara/timich-agent/internal/config"
+	"github.com/rsahara/timich-agent/internal/lifecycle"
 	"github.com/rsahara/timich-agent/internal/semanticruntimehelper"
 )
 
@@ -80,6 +82,9 @@ type SemanticONNXRuntimeProcess struct {
 }
 
 type semanticONNXRuntimeManager struct {
+	stopping           atomic.Bool
+	callbacks          lifecycle.Group
+	retryWork          lifecycle.Group
 	cfg                config.SemanticONNXRuntimeConfig
 	modelStore         *catalog.SemanticModelPackStore
 	runtimePackStore   *catalog.SemanticRuntimePackStore
@@ -146,11 +151,16 @@ func (a *AgentRuntime) reconcileSemanticModelRuntime() {
 	if a == nil || a.semanticONNXRuntime == nil {
 		return
 	}
+	ctx, release, ok := a.background.Acquire()
+	if !ok {
+		return
+	}
+	defer release()
 	a.mu.RLock()
 	topologyGeneration := a.semanticTopologyGeneration
 	indexingConfigured := a.datasourceIndexingConfiguredLocked()
 	a.mu.RUnlock()
-	a.semanticONNXRuntime.Reconcile(context.Background(), topologyGeneration, indexingConfigured)
+	a.semanticONNXRuntime.Reconcile(ctx, topologyGeneration, indexingConfigured)
 }
 
 func newSemanticONNXRuntimeManager(cfg config.SemanticONNXRuntimeConfig, modelStore *catalog.SemanticModelPackStore, runtimePackStore *catalog.SemanticRuntimePackStore) *semanticONNXRuntimeManager {
@@ -178,7 +188,7 @@ func (m *semanticONNXRuntimeManager) Reconcile(ctx context.Context, topologyGene
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.closed {
+	if m.closed || m.stopping.Load() {
 		return
 	}
 
@@ -263,14 +273,11 @@ func (m *semanticONNXRuntimeManager) nextAvailablePortOffsetLocked(cfg config.Se
 }
 
 func (m *semanticONNXRuntimeManager) Close() {
-	if m == nil {
-		return
+	ctx, cancel := context.WithTimeout(context.Background(), defaultSemanticONNXRuntimeStopWait+time.Second)
+	defer cancel()
+	if err := m.CloseContext(ctx); err != nil {
+		log.Printf("timich-agent semantic runtime close failed: %v", err)
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.closed = true
-	m.cancelAllRetriesLocked()
-	m.stopAllLocked()
 }
 
 func (m *semanticONNXRuntimeManager) InvalidateLaunchIdentities() {
@@ -701,7 +708,7 @@ func (m *semanticONNXRuntimeManager) stopAllLocked() {
 }
 
 func (m *semanticONNXRuntimeManager) scheduleRetryLocked(key string) {
-	if m.closed || !m.indexingConfigured || strings.TrimSpace(key) == "" {
+	if m.closed || m.stopping.Load() || !m.indexingConfigured || strings.TrimSpace(key) == "" {
 		return
 	}
 	retry := m.retries[key]
@@ -730,12 +737,17 @@ func (m *semanticONNXRuntimeManager) retryProcess(key string, generation uint64)
 	if m == nil {
 		return
 	}
+	ctx, release, ok := m.retryWork.Acquire()
+	if !ok {
+		return
+	}
+	defer release()
 	m.mu.Lock()
 	retry := m.retries[key]
 	if retry != nil {
 		retry.timer = nil
 	}
-	if m.closed || !m.indexingConfigured || generation != m.topologyGen {
+	if m.closed || m.stopping.Load() || !m.indexingConfigured || generation != m.topologyGen {
 		m.mu.Unlock()
 		return
 	}
@@ -762,7 +774,7 @@ func (m *semanticONNXRuntimeManager) retryProcess(key string, generation uint64)
 		return
 	}
 	delete(m.processes, key)
-	process, err := m.startProcessLocked(context.Background(), cfg, *desired, m.nextAvailablePortOffsetLocked(cfg))
+	process, err := m.startProcessLocked(ctx, cfg, *desired, m.nextAvailablePortOffsetLocked(cfg))
 	if err != nil {
 		log.Printf("timich-agent semantic ONNX runtime restart failed model=%s vector_space=%s error=%v", desired.ModelID, desired.VectorSpaceID, err)
 		m.processes[key] = failedSemanticONNXRuntimeProcess(*desired, err)
@@ -793,7 +805,7 @@ func (m *semanticONNXRuntimeManager) cancelAllRetriesLocked() {
 func (m *semanticONNXRuntimeManager) notifyStateChangeLocked() {
 	callback := m.onStateChange
 	if callback != nil {
-		go callback()
+		m.callbacks.Go(func(context.Context) { callback() })
 	}
 }
 

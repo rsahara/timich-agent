@@ -1,0 +1,2 @@
+.github/workflows/release.yml
+scripts/release/build-agent-release.sh

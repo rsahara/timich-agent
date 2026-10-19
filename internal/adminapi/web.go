@@ -995,11 +995,12 @@ const dashboardHTML = `<!doctype html>
         uploadRootsNode.innerHTML = '<div class="notice warn"><strong>No upload roots configured</strong><div class="muted">Add uploadRoots to the Agent config before enabling device uploads.</div></div>';
         return;
       }
-      uploadRootsNode.innerHTML = '<table><thead><tr><th>Key</th><th>Path</th><th>Temp path</th><th>Status</th></tr></thead><tbody>' + latestUploadRoots.map(root =>
+      uploadRootsNode.innerHTML = '<table><thead><tr><th>Key</th><th>Path</th><th>Temp path</th><th>Owner / group</th><th>Status</th></tr></thead><tbody>' + latestUploadRoots.map(root =>
         '<tr>' +
           '<td>' + escapeHTML(root.key) + '</td>' +
           '<td>' + escapeHTML(root.path) + '</td>' +
           '<td>' + escapeHTML(root.tempPath || '') + '</td>' +
+          '<td>' + escapeHTML(root.ownerUser || 'Default') + ' / ' + escapeHTML(root.ownerGroup || 'Default') + '</td>' +
           '<td><span class="' + uploadRootStatusClass(root.status) + '">' + escapeHTML(root.status || '') + '</span><div class="muted">' + escapeHTML(root.message || '') + '</div></td>' +
         '</tr>'
       ).join('') + '</tbody></table>';

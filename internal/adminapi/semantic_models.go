@@ -83,18 +83,24 @@ func (s *server) scheduleSemanticModelStatusRefresh() {
 		s.semanticModelsRefreshMu.Unlock()
 		return
 	}
+	parent, release, ok := s.runtime.AcquireBackgroundWork()
+	if !ok {
+		s.semanticModelsRefreshMu.Unlock()
+		return
+	}
 	s.semanticModelsRefreshBusy = true
 	s.semanticModelsRefreshStarted = time.Now().UTC()
 	s.semanticModelsRefreshMu.Unlock()
 
 	go func() {
+		defer release()
 		defer func() {
 			s.semanticModelsRefreshMu.Lock()
 			s.semanticModelsRefreshBusy = false
 			s.semanticModelsRefreshStarted = time.Time{}
 			s.semanticModelsRefreshMu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), semanticModelStatusRefreshTimeout)
+		ctx, cancel := context.WithTimeout(parent, semanticModelStatusRefreshTimeout)
 		defer cancel()
 		_, _ = s.refreshSemanticModelStatusSnapshot(ctx)
 	}()
@@ -103,6 +109,9 @@ func (s *server) scheduleSemanticModelStatusRefresh() {
 func (s *server) refreshSemanticModelStatusSnapshot(ctx context.Context) (catalog.SemanticModelRegistryStatus, error) {
 	status, err := s.buildSemanticModelsStatus(ctx)
 	if err != nil {
+		return status, err
+	}
+	if err := ctx.Err(); err != nil {
 		return status, err
 	}
 	s.runtime.RememberSemanticModelRegistryStatus(status)
@@ -118,7 +127,7 @@ func (s *server) buildSemanticModelsStatus(ctx context.Context) (catalog.Semanti
 	if manifestURL == "" {
 		status.RegistryStatus = "disabled"
 		status.RegistryMessage = "Semantic model registry is not configured for this build."
-		return s.runtime.EnrichSemanticModelRegistryCachedIndexingStatusWithContext(ctx, status), nil
+		return s.runtime.EnrichSemanticModelRegistryCachedIndexingStatusWithContext(ctx, status), ctx.Err()
 	}
 	status.ManifestURL = manifestURL
 	client := s.options.SemanticModelHTTPClient
@@ -127,13 +136,16 @@ func (s *server) buildSemanticModelsStatus(ctx context.Context) (catalog.Semanti
 	}
 	manifest, err := fetchSemanticModelManifest(ctx, client, manifestURL)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return status, ctxErr
+		}
 		status.RegistryStatus = "unavailable"
 		status.RegistryMessage = err.Error()
 		enriched := s.runtime.EnrichSemanticModelRegistryCachedIndexingStatusWithContext(ctx, status)
-		return enriched, nil
+		return enriched, ctx.Err()
 	}
 	enriched := s.runtime.EnrichSemanticModelRegistryCachedIndexingStatusWithContext(ctx, buildSemanticModelRegistryResponse(status, manifestURL, runtimePlatform(), manifest))
-	return enriched, nil
+	return enriched, ctx.Err()
 }
 
 type semanticModelInstallResponse struct {

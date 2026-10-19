@@ -3854,10 +3854,10 @@ func TestScheduledDatasourceMirrorSyncBlocksDatasourceRepair(t *testing.T) {
 	if active := runtime.datasourceMirrorSyncActive.Load(); active != 1 {
 		t.Fatalf("datasourceMirrorSyncActive = %d, want 1", active)
 	}
-	if runtime.datasourceIndexingReconciliationReady() {
+	if runtime.datasourceIndexingReconciliationReady(context.Background()) {
 		t.Fatal("datasourceIndexingReconciliationReady() = true during scheduled mirror sync")
 	}
-	runtime.runDatasourceIndexingSnapshotRefresh(runtime.catalogService(), 0)
+	runtime.runDatasourceIndexingSnapshotRefresh(context.Background(), runtime.catalogService(), 0)
 	runtime.datasourceTaskMu.Lock()
 	finishedAt := runtime.datasourceSnapshotFinished
 	runtime.datasourceTaskMu.Unlock()
@@ -5616,11 +5616,23 @@ func TestChooseMixedBackgroundWorkerPhaseWeightsQueueSizes(t *testing.T) {
 		{name: "empty", metadataQueued: 0, thumbnailQueued: 0, randomValue: 0, want: ""},
 		{name: "metadata only", metadataQueued: 5, thumbnailQueued: 0, randomValue: 0.9, want: "metadata"},
 		{name: "thumbnail only", metadataQueued: 0, thumbnailQueued: 5, randomValue: 0, want: "thumbnails"},
+		{name: "empty metadata queue has no minimum weight", metadataQueued: 0, thumbnailQueued: 65073, randomValue: 0, want: "thumbnails"},
+		{name: "negative metadata queue has no minimum weight", metadataQueued: -1, thumbnailQueued: 65073, randomValue: 0, want: "thumbnails"},
+		{name: "one metadata job retains minimum share", metadataQueued: 1, thumbnailQueued: 65073, randomValue: 0.099999, want: "metadata"},
+		{name: "one metadata job yields at minimum share", metadataQueued: 1, thumbnailQueued: 65073, randomValue: 0.1, want: "thumbnails"},
+		{name: "four metadata jobs retain minimum share", metadataQueued: 4, thumbnailQueued: 65073, randomValue: 0.099999, want: "metadata"},
+		{name: "four metadata jobs yield at minimum share", metadataQueued: 4, thumbnailQueued: 65073, randomValue: 0.1, want: "thumbnails"},
+		{name: "twenty metadata jobs retain minimum share", metadataQueued: 20, thumbnailQueued: 65073, randomValue: 0.099999, want: "metadata"},
+		{name: "twenty metadata jobs yield at minimum share", metadataQueued: 20, thumbnailQueued: 65073, randomValue: 0.1, want: "thumbnails"},
+		{name: "above floor metadata keeps queue weighting", metadataQueued: 21, thumbnailQueued: 65073, randomValue: 0.104, want: "metadata"},
+		{name: "above floor thumbnails keep queue weighting", metadataQueued: 21, thumbnailQueued: 65073, randomValue: 0.105, want: "thumbnails"},
+		{name: "capped local queues retain metadata share", metadataQueued: 300000, thumbnailQueued: 300000, randomValue: 0.624999, want: "metadata"},
+		{name: "capped local queues retain thumbnail share", metadataQueued: 300000, thumbnailQueued: 300000, randomValue: 0.625, want: "thumbnails"},
 		{name: "embedding below batch skipped", metadataQueued: 0, thumbnailQueued: 0, embeddingQueued: 9, embeddingBatch: 10, randomValue: 0, want: ""},
 		{name: "embedding only", metadataQueued: 0, thumbnailQueued: 0, embeddingQueued: 10, embeddingBatch: 10, randomValue: 0.9, want: "embeddings"},
 		{name: "weighted metadata", metadataQueued: 8, thumbnailQueued: 2, embeddingQueued: 100, embeddingBatch: 10, randomValue: 0.1, want: "metadata"},
-		{name: "weighted thumbnail", metadataQueued: 8, thumbnailQueued: 2, embeddingQueued: 100, embeddingBatch: 10, randomValue: 0.3, want: "thumbnails"},
-		{name: "weighted embedding", metadataQueued: 8, thumbnailQueued: 2, embeddingQueued: 100, embeddingBatch: 10, randomValue: 0.4, want: "embeddings"},
+		{name: "weighted thumbnail", metadataQueued: 8, thumbnailQueued: 2, embeddingQueued: 100, embeddingBatch: 10, randomValue: 0.5, want: "thumbnails"},
+		{name: "weighted embedding", metadataQueued: 8, thumbnailQueued: 2, embeddingQueued: 100, embeddingBatch: 10, randomValue: 0.6, want: "embeddings"},
 		{name: "capped queues retain each phase", metadataQueued: 300000, thumbnailQueued: 300000, embeddingQueued: 300000, embeddingBatch: 10, randomValue: 0.5, want: "metadata"},
 		{name: "capped queues retain thumbnail", metadataQueued: 300000, thumbnailQueued: 300000, embeddingQueued: 300000, embeddingBatch: 10, randomValue: 0.6, want: "thumbnails"},
 		{name: "capped queues retain embedding", metadataQueued: 300000, thumbnailQueued: 300000, embeddingQueued: 300000, embeddingBatch: 10, randomValue: 0.9, want: "embeddings"},
@@ -6019,7 +6031,7 @@ func TestDatasourceIndexingReconciliationWaitsForDrainedSchedulerWork(t *testing
 	}}, "test-admin-token", func(cfg *config.ResolvedConfig) {
 		cfg.LocalMediaRoots = []config.LocalMediaRootConfig{{Key: "nas-photos", Path: t.TempDir()}}
 	})
-	if runtime.datasourceIndexingReconciliationReady() {
+	if runtime.datasourceIndexingReconciliationReady(context.Background()) {
 		t.Fatal("datasourceIndexingReconciliationReady() = true without required local scheduler cache")
 	}
 	schedule, semanticScheduled := runtime.semanticIndexingSchedule()
@@ -6031,14 +6043,14 @@ func TestDatasourceIndexingReconciliationWaitsForDrainedSchedulerWork(t *testing
 		MetadataQueued: 1,
 	}
 	runtime.schedulerWorkStateMu.Unlock()
-	if runtime.datasourceIndexingReconciliationReady() {
+	if runtime.datasourceIndexingReconciliationReady(context.Background()) {
 		t.Fatal("datasourceIndexingReconciliationReady() = true with queued metadata")
 	}
 
 	runtime.schedulerWorkStateMu.Lock()
 	runtime.schedulerWorkState.MetadataQueued = 0
 	runtime.schedulerWorkStateMu.Unlock()
-	if !runtime.datasourceIndexingReconciliationReady() {
+	if !runtime.datasourceIndexingReconciliationReady(context.Background()) {
 		t.Fatal("datasourceIndexingReconciliationReady() = false after background work drained")
 	}
 }
@@ -6065,7 +6077,7 @@ func TestDatasourceIndexingReconciliationAllowsQueuedWorkWhilePaused(t *testing.
 	}
 	runtime.schedulerWorkStateMu.Unlock()
 
-	if !runtime.datasourceIndexingReconciliationReady() {
+	if !runtime.datasourceIndexingReconciliationReady(context.Background()) {
 		t.Fatal("datasourceIndexingReconciliationReady() = false with paused workers, want queued read model recount allowed")
 	}
 }
@@ -6083,11 +6095,11 @@ func TestDatasourceIndexingReconciliationRunsWithoutUnusedSchedulerCache(t *test
 	if runtime.backgroundWorkerSchedulerConfigured() {
 		t.Fatal("backgroundWorkerSchedulerConfigured() = true for remote-only semantic-disabled runtime")
 	}
-	if !runtime.datasourceIndexingReconciliationReady() {
+	if !runtime.datasourceIndexingReconciliationReady(context.Background()) {
 		t.Fatal("datasourceIndexingReconciliationReady() = false without a configured scheduler")
 	}
 
-	runtime.runDatasourceIndexingSnapshotRefresh(runtime.catalogService(), 0)
+	runtime.runDatasourceIndexingSnapshotRefresh(context.Background(), runtime.catalogService(), 0)
 	runtime.datasourceTaskMu.Lock()
 	finishedAt := runtime.datasourceSnapshotFinished
 	runtime.datasourceTaskMu.Unlock()

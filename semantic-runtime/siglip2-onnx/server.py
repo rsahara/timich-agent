@@ -149,7 +149,9 @@ class SigLIP2ONNXRuntime:
                 image = source.convert("RGB")
         except (UnidentifiedImageError, OSError, ValueError) as error:
             raise AssetInputError(f"invalid image input: {error}") from error
-        inputs = self.processor(images=[image], return_tensors="np")
+        # PIL RGB arrays are HWC. For 1- or 3-pixel dimensions, automatic channel
+        # inference can mistake the height for the RGB channel axis.
+        inputs = self.processor(images=[image], input_data_format="channels_last", return_tensors="np")
         pixel_values = np.asarray(inputs["pixel_values"], dtype=np.float32)
         embedding = self.image_session.run(None, {"pixel_values": pixel_values})[0]
         vector = normalize(embedding)

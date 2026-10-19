@@ -31,6 +31,32 @@ if [ "$actual_sha" != "$expected_sha" ]; then
   exit 1
 fi
 
+for retired_path in .github/workflows/release.yml scripts/release/build-agent-release.sh; do
+  # The release gate checks HEAD: a local deletion must not hide the publisher
+  # from the commit used for the release tag.
+  printf 'retired\n' > "$public/$retired_path"
+  git -C "$public" add "$retired_path"
+  git -C "$public" commit -qm retired-path
+  rm "$public/$retired_path"
+  if bash "$verifier" "$expected" "$public" > "$test_root/failure.log" 2>&1; then
+    echo "accepted committed retired path: $retired_path" >&2
+    exit 1
+  fi
+  grep -q 'public source still contains a retired release path' "$test_root/failure.log"
+  git -C "$public" add -u
+  git -C "$public" commit -qm remove-retired-path
+  bash "$verifier" "$expected" "$public" >/dev/null
+
+  mkdir -p "$(dirname "$expected/$retired_path")"
+  ln -s missing "$expected/$retired_path"
+  if bash "$verifier" "$expected" "$public" > "$test_root/failure.log" 2>&1; then
+    echo "accepted retired path in expected export: $retired_path" >&2
+    exit 1
+  fi
+  grep -q 'export reintroduces a retired release path' "$test_root/failure.log"
+  rm "$expected/$retired_path"
+done
+
 printf 'changed\n' > "$public/internal/value.go"
 git -C "$public" add internal/value.go
 git -C "$public" commit -qm content-mismatch
@@ -61,3 +87,5 @@ if bash "$verifier" "$expected" "$public" >/dev/null 2>&1; then
   echo "expected symlink object type mismatch to fail" >&2
   exit 1
 fi
+
+echo "public source snapshot verification tests passed"

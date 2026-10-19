@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
 	"github.com/rsahara/timich-agent/internal/catalog"
+	"github.com/rsahara/timich-agent/internal/lifecycle"
 )
 
 const (
@@ -40,9 +41,14 @@ type dataChannel interface {
 
 type Manager struct {
 	original OriginalLoader
+	work     *lifecycle.Group
+	offers   lifecycle.Group
 
-	mu       sync.Mutex
-	sessions map[string]*session
+	mu         sync.Mutex
+	sessions   map[string]*session
+	canceled   bool
+	cancelOnce sync.Once
+	cancelErr  error
 }
 
 type OfferRequest struct {
@@ -129,13 +135,27 @@ type mediaError struct {
 }
 
 func NewManager(original OriginalLoader) *Manager {
+	return NewManagerWithLifecycle(original, &lifecycle.Group{})
+}
+
+func NewManagerWithLifecycle(original OriginalLoader, work *lifecycle.Group) *Manager {
 	return &Manager{
+		work:     work,
 		original: original,
 		sessions: make(map[string]*session),
 	}
 }
 
 func (m *Manager) AnswerOffer(ctx context.Context, request OfferRequest) (OfferResponse, error) {
+	_, release, ok := m.offers.Acquire()
+	if !ok {
+		return OfferResponse{}, errors.New("agent is shutting down")
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(m.work.Context(), cancel)
+	defer stop()
+	defer cancel()
 	if strings.TrimSpace(request.SDP) == "" {
 		return OfferResponse{}, errors.New("sdp is required")
 	}
@@ -181,7 +201,7 @@ func (m *Manager) AnswerOffer(ctx context.Context, request OfferRequest) (OfferR
 					})
 					return
 				}
-				go m.handleMediaRequest(active, channel, mediaRequest)
+				m.work.Go(func(ctx context.Context) { m.handleMediaRequestOwned(ctx, active, channel, mediaRequest) })
 			case "media_cancel":
 				var cancel mediaCancel
 				if err := json.Unmarshal(message.Data, &cancel); err != nil {
@@ -241,6 +261,11 @@ func (m *Manager) AnswerOffer(ctx context.Context, request OfferRequest) (OfferR
 	}
 
 	m.mu.Lock()
+	if m.canceled {
+		m.mu.Unlock()
+		_ = peer.Close()
+		return OfferResponse{}, context.Canceled
+	}
 	m.sessions[sessionID] = active
 	m.mu.Unlock()
 
@@ -258,6 +283,15 @@ func (m *Manager) AnswerOffer(ctx context.Context, request OfferRequest) (OfferR
 }
 
 func (m *Manager) handleMediaRequest(active *session, channel dataChannel, request mediaRequest) {
+	ctx, release, ok := m.work.Acquire()
+	if !ok {
+		return
+	}
+	defer release()
+	m.handleMediaRequestOwned(ctx, active, channel, request)
+}
+
+func (m *Manager) handleMediaRequestOwned(ctx context.Context, active *session, channel dataChannel, request mediaRequest) {
 	startedAt := time.Now()
 	requestID := strings.TrimSpace(request.RequestID)
 	if requestID == "" || strings.TrimSpace(request.AssetID) == "" {
@@ -282,7 +316,7 @@ func (m *Manager) handleMediaRequest(active *session, channel dataChannel, reque
 		})
 		return
 	}
-	requestCtx, unregister := active.registerMediaRequest(requestID)
+	requestCtx, unregister := active.registerMediaRequestContext(ctx, requestID)
 	defer unregister()
 
 	log.Printf(
@@ -581,7 +615,11 @@ func (m *Manager) removeSession(sessionID string) {
 }
 
 func (s *session) registerMediaRequest(requestID string) (context.Context, func()) {
-	ctx, cancel := context.WithCancel(context.Background())
+	return s.registerMediaRequestContext(context.Background(), requestID)
+}
+
+func (s *session) registerMediaRequestContext(parent context.Context, requestID string) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
 	entry := &activeMediaRequest{cancel: cancel}
 
 	s.requestMu.Lock()

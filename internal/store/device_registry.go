@@ -44,6 +44,7 @@ type PairingSession struct {
 type DeviceRecord struct {
 	DeviceID                       string    `json:"deviceId"`
 	DeviceName                     string    `json:"deviceName"`
+	ReviewOnly                     bool      `json:"reviewOnly,omitempty"`
 	CreatedAt                      time.Time `json:"createdAt"`
 	LastRefreshedAt                time.Time `json:"lastRefreshedAt"`
 	CurrentRefreshToken            string    `json:"-"`
@@ -74,6 +75,7 @@ type DeviceRegistryStore struct {
 type deviceRecordJSON struct {
 	DeviceID                       string    `json:"deviceId"`
 	DeviceName                     string    `json:"deviceName"`
+	ReviewOnly                     bool      `json:"reviewOnly,omitempty"`
 	CreatedAt                      time.Time `json:"createdAt"`
 	LastRefreshedAt                time.Time `json:"lastRefreshedAt"`
 	CurrentRefreshToken            string    `json:"currentRefreshToken,omitempty"`
@@ -313,6 +315,61 @@ func (s *DeviceRegistryStore) CreateHostedDevice(
 	return device, nil
 }
 
+// CreateHostedReviewDevice reserves one slot for ordinary pairing and, when
+// needed, replaces only the least recently refreshed review device.
+func (s *DeviceRegistryStore) CreateHostedReviewDevice(
+	deviceName string,
+	now time.Time,
+	refreshTokenExpiresAt time.Time,
+) (DeviceRecord, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupExpiredLocked(now)
+	reviewCapacity := s.deviceLimit - 1
+	if reviewCapacity < 1 {
+		reviewCapacity = 1
+	}
+	evictedIndex := -1
+	if len(s.registry.Devices) >= reviewCapacity {
+		evictedIndex = oldestReviewDeviceIndex(s.registry.Devices)
+		if evictedIndex < 0 {
+			return DeviceRecord{}, "", ErrDeviceLimitReached
+		}
+	}
+
+	device, err := newDeviceRecord(deviceName, now, refreshTokenExpiresAt)
+	if err != nil {
+		return DeviceRecord{}, "", err
+	}
+	device.ReviewOnly = true
+	updated := cloneRegistry(s.registry)
+	evictedID := ""
+	if evictedIndex >= 0 {
+		evictedID = updated.Devices[evictedIndex].DeviceID
+		updated.Devices = append(updated.Devices[:evictedIndex], updated.Devices[evictedIndex+1:]...)
+	}
+	updated.Devices = append(updated.Devices, device)
+	if err := writeDeviceRegistryFile(s.path, updated); err != nil {
+		return DeviceRecord{}, "", err
+	}
+	s.registry = updated
+	return device, evictedID, nil
+}
+
+func oldestReviewDeviceIndex(devices []DeviceRecord) int {
+	oldestIndex := -1
+	for index, device := range devices {
+		if !device.ReviewOnly {
+			continue
+		}
+		if oldestIndex < 0 || device.LastRefreshedAt.Before(devices[oldestIndex].LastRefreshedAt) {
+			oldestIndex = index
+		}
+	}
+	return oldestIndex
+}
+
 // HasDevice reports whether a paired device still exists in the registry.
 func (s *DeviceRegistryStore) HasDevice(deviceID string) bool {
 	s.mu.Lock()
@@ -515,6 +572,7 @@ func (d *DeviceRecord) UnmarshalJSON(data []byte) error {
 	*d = DeviceRecord{
 		DeviceID:                       payload.DeviceID,
 		DeviceName:                     payload.DeviceName,
+		ReviewOnly:                     payload.ReviewOnly,
 		CreatedAt:                      payload.CreatedAt,
 		LastRefreshedAt:                payload.LastRefreshedAt,
 		CurrentRefreshTokenHash:        strings.TrimSpace(payload.CurrentRefreshTokenHash),

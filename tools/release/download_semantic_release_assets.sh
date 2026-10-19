@@ -136,14 +136,21 @@ if [ "$registry_size" -gt "$max_registry_size_bytes" ]; then
 fi
 download_and_verify semantic-models.json
 
-(
-  cd "$agent_dir"
-  go run ./cmd/timich-semantic-helper validate-manifest \
-    --manifest "$output_dir/semantic-models.json" \
-    --required-platform linux-amd64 \
-    --require-recommended-model \
-    --require-recommended-runtime-pack
-)
+IFS=',' read -ra required_platforms <<< "${REQUIRED_RELEASE_PLATFORMS:-linux-amd64}"
+for required_platform in "${required_platforms[@]}"; do
+  case "$required_platform" in
+    linux-amd64|linux-arm64) ;;
+    *) fail "unsupported required platform: $required_platform" ;;
+  esac
+  (
+    cd "$agent_dir"
+    go run ./cmd/timich-semantic-helper validate-manifest \
+      --manifest "$output_dir/semantic-models.json" \
+      --required-platform "$required_platform" \
+      --require-recommended-model \
+      --require-recommended-runtime-pack
+  )
+done
 
 artifact_records=$(jq -c '
   [(.models // [])[] as $owner |

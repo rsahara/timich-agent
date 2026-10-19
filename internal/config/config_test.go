@@ -800,7 +800,7 @@ func TestWriteFileNormalizesUploadConfiguration(t *testing.T) {
 	cfg.DataDir = filepath.Join(t.TempDir(), "state")
 	cfg.Timezone = " Asia/Tokyo "
 	cfg.UploadRoots = []UploadRootConfig{
-		{Key: " nas-photos ", Path: " " + rootPath + " ", TempPath: " working/../working/.timich-upload-tmp "},
+		{Key: " nas-photos ", Path: " " + rootPath + " ", TempPath: " working/../working/.timich-upload-tmp ", OwnerUser: " photo-user ", OwnerGroup: " media-group "},
 	}
 
 	if err := WriteFile(configPath, cfg); err != nil {
@@ -819,7 +819,8 @@ func TestWriteFileNormalizesUploadConfiguration(t *testing.T) {
 	}
 	if loaded.UploadRoots[0].Key != "nas-photos" ||
 		loaded.UploadRoots[0].Path != rootPath ||
-		loaded.UploadRoots[0].TempPath != "working/.timich-upload-tmp" {
+		loaded.UploadRoots[0].TempPath != "working/.timich-upload-tmp" ||
+		loaded.UploadRoots[0].OwnerUser != "photo-user" || loaded.UploadRoots[0].OwnerGroup != "media-group" {
 		t.Fatalf("UploadRoots[0] = %+v, want normalized root", loaded.UploadRoots[0])
 	}
 }

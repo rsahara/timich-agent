@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import shutil
 import socket
@@ -29,12 +30,20 @@ from semantic_archive_budget import (
 
 
 PRODUCT = "timich-semantic-release-smoke"
-PLATFORM = "linux-amd64"
+def native_platform() -> str:
+    machine = platform.machine().lower()
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
+    if sys.platform != "linux" or arch is None:
+        raise SystemExit(f"unsupported semantic smoke host: {sys.platform}/{machine}")
+    return f"linux-{arch}"
+
+
 REQUIRED_IMPORTS = ("numpy", "onnxruntime", "PIL", "transformers")
 
 
 def main() -> int:
     args = parse_args()
+    target_platform = native_platform()
     helper_path = args.helper_path.resolve()
     if not helper_path.is_file() or not os.access(helper_path, os.X_OK):
         raise SystemExit(f"bundled semantic helper is not executable: {helper_path}")
@@ -74,7 +83,7 @@ def main() -> int:
     attestation = {
         "schemaVersion": 1,
         "product": PRODUCT,
-        "platform": PLATFORM,
+        "platform": target_platform,
         "recommendedModel": str(model.get("id") or ""),
         "recommendedRuntimePack": str(runtime_pack.get("id") or ""),
         "registrySha256": sha256_file(registry_path),
@@ -119,9 +128,10 @@ def recommended_entry(registry: dict[str, Any], key: str, collection_key: str) -
 
 def artifact_path(assets_dir: Path, owner: dict[str, Any], label: str, allow_default: bool) -> Path:
     artifacts = owner.get("artifacts") or {}
-    artifact = artifacts.get(PLATFORM) or (artifacts.get("default") if allow_default else None)
+    target_platform = native_platform()
+    artifact = artifacts.get(target_platform) or (artifacts.get("default") if allow_default else None)
     if not isinstance(artifact, dict):
-        raise SystemExit(f"recommended {label} has no {PLATFORM} artifact")
+        raise SystemExit(f"recommended {label} has no {target_platform} artifact")
     filename = str(artifact.get("filename") or "").strip()
     if not filename or Path(filename).name != filename:
         raise SystemExit(f"recommended {label} artifact filename is unsafe")

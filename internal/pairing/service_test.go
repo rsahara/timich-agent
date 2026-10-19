@@ -169,6 +169,28 @@ func TestHostedSessionRefreshAndAuthenticationLifecycle(t *testing.T) {
 	}
 }
 
+func TestHostedReviewSessionReplacesOldSessionWithoutReusingItsTokens(t *testing.T) {
+	t.Parallel()
+	service, registry := newTestService(t, 2)
+	first, evictedID, err := service.CreateHostedReviewSession("Review TV", "https://timich.example")
+	if err != nil || evictedID != "" {
+		t.Fatalf("first review session evictedID=%q error=%v", evictedID, err)
+	}
+	second, evictedID, err := service.CreateHostedReviewSession("Review TV", "https://timich.example")
+	if err != nil || evictedID != first.DeviceID {
+		t.Fatalf("second review session evictedID=%q error=%v, want %q", evictedID, err, first.DeviceID)
+	}
+	if first.DeviceID == second.DeviceID || registry.HasDevice(first.DeviceID) || !registry.HasDevice(second.DeviceID) {
+		t.Fatal("review session did not replace the old device")
+	}
+	if _, err := service.AuthenticateAccessToken(first.AccessToken); err == nil {
+		t.Fatal("replaced review device still authenticates")
+	}
+	if _, err := service.AuthenticateAccessToken(second.AccessToken); err != nil {
+		t.Fatalf("new review session does not authenticate: %v", err)
+	}
+}
+
 func TestNewServiceRejectsInvalidSigningConfiguration(t *testing.T) {
 	t.Parallel()
 

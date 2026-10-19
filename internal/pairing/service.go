@@ -248,6 +248,26 @@ func (s *Service) CreateHostedSession(deviceName string, baseURL string) (Sessio
 	return s.buildSessionBundle(device, baseURL, now)
 }
 
+// CreateHostedReviewSession provisions a review-only device and returns any
+// older review device that was replaced to keep ordinary pairing capacity.
+func (s *Service) CreateHostedReviewSession(deviceName string, baseURL string) (SessionBundle, string, error) {
+	now := time.Now().UTC()
+	device, evictedID, err := s.registry.CreateHostedReviewDevice(
+		strings.TrimSpace(deviceName),
+		now,
+		now.Add(defaultRefreshTokenTTL),
+	)
+	if err != nil {
+		return SessionBundle{}, "", err
+	}
+	bundle, err := s.buildSessionBundle(device, baseURL, now)
+	if err != nil {
+		_ = s.registry.RevokeDevice(device.DeviceID)
+		return SessionBundle{}, evictedID, err
+	}
+	return bundle, evictedID, nil
+}
+
 // RefreshSession rotates the refresh-token family and mints a fresh access token.
 func (s *Service) RefreshSession(refreshToken string, baseURL string) (SessionBundle, error) {
 	now := time.Now().UTC()

@@ -132,9 +132,11 @@ func LocalDatasourceImmichFallbackEnabled(datasource DatasourceConfig) bool {
 // UploadRootConfig describes an administrator-configured writable destination
 // root for device media uploads. Paths are runtime/container paths.
 type UploadRootConfig struct {
-	Key      string `json:"key"`
-	Path     string `json:"path"`
-	TempPath string `json:"tempPath,omitempty"`
+	Key        string `json:"key"`
+	Path       string `json:"path"`
+	TempPath   string `json:"tempPath,omitempty"`
+	OwnerUser  string `json:"ownerUser,omitempty"`
+	OwnerGroup string `json:"ownerGroup,omitempty"`
 }
 
 // RemoteBrowsingConfig controls whether the local agent should connect to the relay service.
@@ -875,6 +877,8 @@ func normalizeConfig(cfg *Config) {
 		cfg.UploadRoots[index].Key = strings.TrimSpace(cfg.UploadRoots[index].Key)
 		cfg.UploadRoots[index].Path = strings.TrimSpace(cfg.UploadRoots[index].Path)
 		cfg.UploadRoots[index].TempPath = normalizeUploadRootTempPath(cfg.UploadRoots[index].TempPath)
+		cfg.UploadRoots[index].OwnerUser = strings.TrimSpace(cfg.UploadRoots[index].OwnerUser)
+		cfg.UploadRoots[index].OwnerGroup = strings.TrimSpace(cfg.UploadRoots[index].OwnerGroup)
 	}
 }
 

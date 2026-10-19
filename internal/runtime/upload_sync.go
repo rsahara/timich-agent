@@ -33,6 +33,8 @@ type UploadCheckResponse struct {
 
 // CheckUploads returns evidence for only the caller's identities, in request order.
 func (a *AgentRuntime) CheckUploads(deviceID string, input UploadCheckInput) (UploadCheckResponse, error) {
+	release := a.uploadDevices.readLock(deviceID)
+	defer release()
 	_, profile, err := a.deviceProfile(deviceID)
 	if err != nil {
 		return UploadCheckResponse{}, err

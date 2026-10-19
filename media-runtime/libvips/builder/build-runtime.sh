@@ -5,6 +5,12 @@ platform=${TIMICH_LIBVIPS_PLATFORM:-linux_amd64}
 output_dir=${TIMICH_LIBVIPS_OUTPUT:-/out}
 apk_packages=${TIMICH_LIBVIPS_APK_PACKAGES:-"ca-certificates vips-tools vips-heif pax-utils"}
 
+case "$platform/$(uname -m)" in
+  linux_amd64/x86_64) loader_name=ld-musl-x86_64.so.1 ;;
+  linux_arm64/aarch64) loader_name=ld-musl-aarch64.so.1 ;;
+  *) echo "libvips target/host mismatch: $platform/$(uname -m)" >&2; exit 2 ;;
+esac
+
 apk add --no-cache $apk_packages
 
 vips_path=$(command -v vips)
@@ -25,10 +31,10 @@ mkdir -p \
 cp "$vips_path" "${output_dir}/bin/vips.real"
 chmod +x "${output_dir}/bin/vips.real"
 
-if [ -f /lib/ld-musl-x86_64.so.1 ]; then
-  cp /lib/ld-musl-x86_64.so.1 "${output_dir}/lib/ld-musl-x86_64.so.1"
+if [ -f /lib/$loader_name ]; then
+  cp /lib/$loader_name "${output_dir}/lib/$loader_name"
 else
-  echo "missing Alpine musl loader /lib/ld-musl-x86_64.so.1" >&2
+  echo "missing Alpine musl loader /lib/$loader_name" >&2
   exit 1
 fi
 
@@ -90,7 +96,7 @@ bin_dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd)
 runtime_root=$(CDPATH= cd -- "$bin_dir/.." && pwd)
 lib_dir="$runtime_root/lib"
 share_dir="$runtime_root/share"
-loader="$lib_dir/ld-musl-x86_64.so.1"
+loader="$lib_dir/@MUSL_LOADER@"
 vips_real="$bin_dir/vips.real"
 
 module_path=""
@@ -114,6 +120,7 @@ fi
 
 exec "$loader" --library-path "$lib_dir" "$vips_real" "$@"
 EOF
+sed -i "s/@MUSL_LOADER@/$loader_name/g" "${output_dir}/bin/vips"
 chmod +x "${output_dir}/bin/vips"
 
 apk info -vv > "${output_dir}/APK-PACKAGES.txt"

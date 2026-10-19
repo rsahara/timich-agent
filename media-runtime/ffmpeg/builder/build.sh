@@ -73,7 +73,7 @@ case "$build_strategy" in
     ;;
 esac
 
-"$script_dir/verify.sh" "$runtime_dir"
+TIMICH_MEDIA_FFMPEG_DOCKER_PLATFORM="$docker_platform" "$script_dir/verify.sh" "$runtime_dir"
 
 python3 "$agent_root/tools/media/make_ffmpeg_runtime_pack.py" \
   --runtime-dir "$runtime_dir" \
