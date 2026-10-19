@@ -36,10 +36,14 @@ func (a *AgentRuntime) StartDatasourceMirrorSync() {
 	if a.mirrorCancel != nil {
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	parent, release, ok := a.background.Acquire()
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
 	a.mirrorCancel = cancel
 	a.mirrorWG.Add(1)
-	go a.runDatasourceMirrorSyncLoop(ctx)
+	go func() { defer release(); defer cancel(); a.runDatasourceMirrorSyncLoop(ctx) }()
 }
 
 func (a *AgentRuntime) stopDatasourceMirrorSync() {

@@ -242,10 +242,14 @@ func (a *AgentRuntime) StartDatasourceIndexingStatusRefresh() {
 	if a.datasourceStatusCancel != nil {
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	parent, release, ok := a.background.Acquire()
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
 	a.datasourceStatusCancel = cancel
 	a.datasourceStatusWG.Add(1)
-	go a.runDatasourceIndexingStatusRefreshLoop(ctx)
+	go func() { defer release(); defer cancel(); a.runDatasourceIndexingStatusRefreshLoop(ctx) }()
 }
 
 func (a *AgentRuntime) stopDatasourceIndexingStatusRefresh() {
@@ -266,7 +270,7 @@ func (a *AgentRuntime) runDatasourceIndexingStatusRefreshLoop(ctx context.Contex
 		if !sleepDatasourceIndexingRefreshLoop(ctx, interval) {
 			return
 		}
-		a.runDatasourceIndexingSnapshotRefresh(a.catalogService(), datasourceIndexingReconcileInterval)
+		a.runDatasourceIndexingSnapshotRefresh(ctx, a.catalogService(), datasourceIndexingReconcileInterval)
 		interval = datasourceIndexingReconcileInterval
 	}
 }
@@ -443,6 +447,9 @@ func (a *AgentRuntime) datasourceIndexingSemanticProfile() *catalog.SemanticMode
 
 func (a *AgentRuntime) refreshDatasourceIndexingSnapshot(ctx context.Context, catalogService *catalog.Service) (DatasourceIndexingResponse, error) {
 	response, err := a.buildDatasourceIndexingStatus(ctx, catalogService)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
 	if err != nil {
 		if datasourceIndexingSnapshotFallbackAllowed(err) {
 			if snapshot, ok := a.datasourceIndexingSnapshot(ctx, catalogService); ok {
@@ -459,15 +466,15 @@ func (a *AgentRuntime) refreshDatasourceIndexingSnapshot(ctx context.Context, ca
 	return response, nil
 }
 
-func (a *AgentRuntime) runDatasourceIndexingSnapshotRefresh(catalogService *catalog.Service, minInterval time.Duration) {
+func (a *AgentRuntime) runDatasourceIndexingSnapshotRefresh(parent context.Context, catalogService *catalog.Service, minInterval time.Duration) {
 	if a == nil || catalogService == nil {
 		return
 	}
-	if !a.datasourceIndexingReconciliationReady() {
+	timeoutCtx, timeoutCancel := context.WithTimeout(parent, datasourceIndexingSnapshotTimeout)
+	defer timeoutCancel()
+	if !a.datasourceIndexingReconciliationReady(timeoutCtx) {
 		return
 	}
-	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), datasourceIndexingSnapshotTimeout)
-	defer timeoutCancel()
 	ctx, release, err := a.foregroundCatalog.beginCancelableBackground(timeoutCtx)
 	if err != nil {
 		return
@@ -477,7 +484,7 @@ func (a *AgentRuntime) runDatasourceIndexingSnapshotRefresh(catalogService *cata
 		return
 	}
 	defer a.mirrorSyncMu.Unlock()
-	if !a.datasourceIndexingReconciliationReady() {
+	if !a.datasourceIndexingReconciliationReady(ctx) {
 		return
 	}
 
@@ -510,7 +517,10 @@ func (a *AgentRuntime) runDatasourceIndexingSnapshotRefresh(catalogService *cata
 			log.Printf("timich-agent datasource task stats refresh failed error=%v", refreshErr)
 		}
 	} else {
-		a.rememberDatasourceTaskStatsSnapshot(context.Background(), catalogService, stats)
+		a.rememberDatasourceTaskStatsSnapshot(ctx, catalogService, stats)
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	if _, refreshErr := a.refreshDatasourceIndexingSnapshot(ctx, catalogService); refreshErr != nil && !datasourceIndexingSnapshotFallbackAllowed(refreshErr) {
 		log.Printf("timich-agent datasource indexing snapshot refresh failed error=%v", refreshErr)
@@ -521,8 +531,8 @@ func (a *AgentRuntime) runDatasourceIndexingSnapshotRefresh(catalogService *cata
 // the same window as ingestion/indexing. A configured background scheduler
 // must provide a fresh cache; remote-only configurations without schedulable
 // local or semantic work do not need one.
-func (a *AgentRuntime) datasourceIndexingReconciliationReady() bool {
-	if a == nil || a.datasourceDiscoveryActiveCount() > 0 || a.datasourceMirrorSyncActive.Load() > 0 {
+func (a *AgentRuntime) datasourceIndexingReconciliationReady(ctx context.Context) bool {
+	if a == nil || ctx.Err() != nil || a.datasourceDiscoveryActiveCount() > 0 || a.datasourceMirrorSyncActive.Load() > 0 {
 		return false
 	}
 	if active, _ := a.backgroundWorkerActiveState(); active > 0 {
@@ -546,7 +556,7 @@ func (a *AgentRuntime) datasourceIndexingReconciliationReady() bool {
 	schedule, semanticScheduled := a.semanticIndexingSchedule()
 	state, ok := a.cachedSchedulerWorkStateForDisplay(semanticSingleWorkerSchedule(schedule), semanticScheduled)
 	if !ok {
-		return !a.datasourceIndexingReconciliationRequiresSchedulerState()
+		return !a.datasourceIndexingReconciliationRequiresSchedulerState(ctx)
 	}
 	return state.MetadataQueued == 0 &&
 		state.MetadataSettling == 0 &&
@@ -562,7 +572,7 @@ func (a *AgentRuntime) datasourceIndexingReconciliationReady() bool {
 		state.SemanticEligibleIndexJobs == 0
 }
 
-func (a *AgentRuntime) datasourceIndexingReconciliationRequiresSchedulerState() bool {
+func (a *AgentRuntime) datasourceIndexingReconciliationRequiresSchedulerState(parent context.Context) bool {
 	if a == nil {
 		return true
 	}
@@ -576,7 +586,7 @@ func (a *AgentRuntime) datasourceIndexingReconciliationRequiresSchedulerState() 
 	if catalogService == nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), localWorkerCountTimeout)
+	ctx, cancel := context.WithTimeout(parent, localWorkerCountTimeout)
 	defer cancel()
 	pending, err := catalogService.PendingSemanticIndexJobs(ctx)
 	return err != nil || pending
@@ -981,7 +991,7 @@ func (a *AgentRuntime) rememberDatasourceTaskReadModel(catalogService *catalog.S
 }
 
 func (a *AgentRuntime) rememberDatasourceTaskStatsSnapshot(ctx context.Context, catalogService *catalog.Service, stats catalog.AssetProcessingStatsSnapshot) {
-	if a == nil || stats.Empty() || (catalogService != nil && !a.assetProcessingStatsMatchCurrentSemanticProfile(stats)) {
+	if a == nil || ctx.Err() != nil || stats.Empty() || (catalogService != nil && !a.assetProcessingStatsMatchCurrentSemanticProfile(stats)) {
 		return
 	}
 	response, ok := a.datasourceIndexingSnapshot(ctx, catalogService)
@@ -992,11 +1002,12 @@ func (a *AgentRuntime) rememberDatasourceTaskStatsSnapshot(ctx context.Context, 
 	response.StatusSnapshotAt = nil
 	if datasourceStatusesArePassthroughOnly(response.Datasources) {
 		response.Tasks = nil
-		a.rememberDatasourceIndexingSnapshotAt(catalogService, response, stats.RefreshedAt)
-		return
+	} else {
+		response = a.applyDatasourceTaskStats(ctx, response, stats)
 	}
-	response = a.applyDatasourceTaskStats(ctx, response, stats)
-	a.rememberDatasourceIndexingSnapshotAt(catalogService, response, stats.RefreshedAt)
+	if ctx.Err() == nil {
+		a.rememberDatasourceIndexingSnapshotAt(catalogService, response, stats.RefreshedAt)
+	}
 }
 
 func (a *AgentRuntime) mergeDatasourceDiscoveryLastCompletedAt(response DatasourceIndexingResponse) DatasourceIndexingResponse {

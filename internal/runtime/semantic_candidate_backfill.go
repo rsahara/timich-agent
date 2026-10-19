@@ -24,6 +24,7 @@ const (
 	semanticIndexPartialPublishDivisor = 5
 	backgroundWorkerActiveDelay        = 500 * time.Millisecond
 	mixedMetadataWeightMultiplier      = 5.0
+	mixedMetadataWeightFloor           = 100.0
 	mixedThumbnailWeightMultiplier     = 3.0
 	mixedMetadataQueueWeightCap        = 300
 	mixedThumbnailQueueWeightCap       = 300
@@ -59,7 +60,11 @@ func (a *AgentRuntime) StartBackgroundWorkerScheduler() bool {
 	if a.semanticBackfillCancel != nil {
 		return false
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	parent, release, ok := a.background.Acquire()
+	if !ok {
+		return false
+	}
+	ctx, cancel := context.WithCancel(parent)
 	wake := make(chan struct{}, 1)
 	a.semanticBackfillCancel = cancel
 	a.backgroundWorkerWake = wake
@@ -71,7 +76,7 @@ func (a *AgentRuntime) StartBackgroundWorkerScheduler() bool {
 		resetCancel()
 	}
 	a.semanticBackfillWG.Add(1)
-	go a.runBackgroundWorkerSchedulerLoop(ctx, wake)
+	go func() { defer release(); defer cancel(); a.runBackgroundWorkerSchedulerLoop(ctx, wake) }()
 	log.Printf("timich-agent background worker scheduler started workers=%d idle_interval=%s", a.effectiveHeavyTaskWorkers(), a.backgroundWorkerIdleInterval())
 	return true
 }
@@ -437,6 +442,11 @@ func chooseMixedBackgroundWorkerPhase(metadataQueued int, thumbnailQueued int, e
 	// searchable media. Bound each phase's contribution while retaining its
 	// relative priority, so a very large backlog cannot monopolize workers.
 	metadataWeight := float64(min(max(metadataQueued, 0), mixedMetadataQueueWeightCap)) * mixedMetadataWeightMultiplier
+	if metadataWeight > 0 {
+		// Runnable metadata blocks semantic work. Retain at least a 10% share
+		// against the thumbnail queue, whose weight is capped at 900.
+		metadataWeight = max(metadataWeight, mixedMetadataWeightFloor)
+	}
 	thumbnailWeight := float64(min(max(thumbnailQueued, 0), mixedThumbnailQueueWeightCap)) * mixedThumbnailWeightMultiplier
 	embeddingWeight := 0.0
 	if embeddingBatchSize > 0 && embeddingQueued >= embeddingBatchSize {
@@ -542,10 +552,15 @@ func (a *AgentRuntime) launchBackgroundWorkerAssignment(ctx context.Context, ass
 	if total+assignment.workers > maxWorkers {
 		return false
 	}
+	_, release, ok := a.background.Acquire()
+	if !ok {
+		return false
+	}
 	a.backgroundWorkerActive[assignment.phase] = assignment.workers
 	a.schedulerWorkStateAssign(assignment.phase, assignment.planned)
 	a.semanticBackfillWG.Add(1)
 	go func(task backgroundWorkerAssignment) {
+		defer release()
 		defer a.semanticBackfillWG.Done()
 		defer a.finishBackgroundWorkerAssignment(task.phase, task.workers)
 		if task.phase == "embeddings" || task.phase == "search_index" || task.phase == "content_verification" {

@@ -31,6 +31,8 @@ DEFAULT_ZIP_MTIME = (2026, 1, 1, 0, 0, 0)
 
 def main() -> int:
     args = parse_args()
+    if args.platform != detect_platform():
+        raise SystemExit(f"runtime packs require a native {args.platform} builder; host is {detect_platform()}")
     source_dir = Path(__file__).resolve().parent
     output_dir = args.output_dir.resolve()
     work_dir = args.work_dir.resolve() if args.work_dir else output_dir / "_work" / artifact_stem(args)
@@ -388,7 +390,15 @@ def parse_ldd_dependency(line: str) -> Path | None:
 
 def should_bundle_linux_shared_library(path: Path) -> bool:
     raw = str(path)
-    return raw.startswith("/opt/_internal/") or raw.startswith("/opt/python/")
+    # manylinux Python may link OpenSSL from /usr/lib64 instead of /opt.
+    # Debian and Amazon Linux no longer supply this older SONAME. Carry Python's
+    # dependencies with it, but keep glibc and its loader owned by the host.
+    python_system_libraries = (
+        "libssl.so.", "libcrypto.so.", "libffi.so.", "libbz2.so.",
+        "liblzma.so.", "libz.so.", "libcrypt.so.",
+    )
+    return (raw.startswith("/opt/_internal/") or raw.startswith("/opt/python/")
+            or path.name.startswith(python_system_libraries))
 
 
 def python_runtime_info(python: str) -> dict[str, str]:

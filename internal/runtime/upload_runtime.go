@@ -133,6 +133,8 @@ type UploadSessionActionResponse struct {
 
 // AppUploadState returns the effective upload state for a paired app device.
 func (a *AgentRuntime) AppUploadState(deviceID string) (AppUploadStateResponse, error) {
+	release := a.uploadDevices.readLock(deviceID)
+	defer release()
 	_, profile, err := a.deviceProfile(deviceID)
 	if err != nil {
 		return AppUploadStateResponse{}, err
@@ -174,6 +176,8 @@ func (a *AgentRuntime) StartUploadSession(deviceID string, input UploadSessionSt
 	if err != nil {
 		return UploadSessionStartResponse{}, err
 	}
+	releaseDevice := a.uploadDevices.readLock(deviceID)
+	defer releaseDevice()
 	device, profile, err := a.deviceProfile(deviceID)
 	if err != nil {
 		return UploadSessionStartResponse{}, err
@@ -304,8 +308,8 @@ func (a *AgentRuntime) AppendUploadChunk(deviceID string, uploadID string, input
 		return UploadSessionActionResponse{}, ErrUploadRequestInvalid
 	}
 
-	a.uploadMu.Lock()
-	defer a.uploadMu.Unlock()
+	release := a.lockUploadSession(deviceID, uploadID)
+	defer release()
 
 	session, root, _, err := a.activeUploadSessionContext(deviceID, uploadID)
 	if err != nil {
@@ -356,8 +360,11 @@ func (a *AgentRuntime) CompleteUploadSession(deviceID string, uploadID string, i
 		return UploadSessionActionResponse{}, ErrUploadRequestInvalid
 	}
 
-	a.uploadMu.Lock()
-	defer a.uploadMu.Unlock()
+	release := a.lockUploadSession(deviceID, uploadID)
+	defer release()
+	if _, err := a.deviceRecord(deviceID); err != nil {
+		return UploadSessionActionResponse{}, err
+	}
 
 	session, err := a.uploadSessionForComplete(deviceID, uploadID)
 	if err != nil {
@@ -434,8 +441,8 @@ func (a *AgentRuntime) CompleteUploadSession(deviceID string, uploadID string, i
 // AbortUploadSession stops an active upload session and removes its temp file
 // when the temp path still belongs to the selected root.
 func (a *AgentRuntime) AbortUploadSession(deviceID string, uploadID string) (UploadSessionActionResponse, error) {
-	a.uploadMu.Lock()
-	defer a.uploadMu.Unlock()
+	release := a.lockUploadSession(deviceID, uploadID)
+	defer release()
 
 	session, root, _, err := a.activeUploadSessionContext(deviceID, uploadID)
 	if err != nil {
@@ -803,11 +810,19 @@ func appendUploadChunkToTemp(
 	if err != nil {
 		return 0, "", err
 	}
-	file, err := os.OpenFile(tempPath, os.O_WRONLY, 0)
+	var file *os.File
+	if uploadOwnershipConfigured(root) {
+		file, err = openUploadChild(root, tempRelativePath, os.O_WRONLY, false)
+	} else {
+		file, err = os.OpenFile(tempPath, os.O_WRONLY, 0)
+	}
 	if err != nil {
 		return 0, "", err
 	}
 	defer file.Close()
+	if err := applyUploadOwnership(file, root); err != nil {
+		return 0, "", err
+	}
 	if _, err := file.Seek(offset, io.SeekStart); err != nil {
 		return 0, "", err
 	}
@@ -866,22 +881,7 @@ func ensureUploadTempDir(root config.UploadRootConfig) error {
 	if err != nil {
 		return err
 	}
-	current := root.Path
-	for _, segment := range strings.Split(cleanTempDir, "/") {
-		current = filepath.Join(current, filepath.FromSlash(segment))
-		if info, err := os.Lstat(current); err == nil {
-			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-				return ErrUploadPolicyInvalid
-			}
-			continue
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		if err := os.Mkdir(current, uploadCreatedDirMode); err != nil {
-			return err
-		}
-	}
-	return nil
+	return ensureUploadDirectory(root, cleanTempDir)
 }
 
 func uploadTempDirExists(root config.UploadRootConfig) (bool, error) {
@@ -1017,14 +1017,28 @@ func finalizeUploadFile(root config.UploadRootConfig, tempRelativePath string, f
 	if err != nil {
 		return err
 	}
-	if err := ensureUploadFinalParent(root.Path, path.Dir(path.Clean(finalRelativePath))); err != nil {
+	if err := ensureUploadDirectory(root, path.Dir(path.Clean(finalRelativePath))); err != nil {
 		return err
 	}
-	if err := os.Link(tempPath, finalPath); err != nil {
-		if errors.Is(err, os.ErrExist) {
+	if err := applyUploadChildOwnership(root, tempRelativePath, false); err != nil {
+		return err
+	}
+	var linkErr error
+	if uploadOwnershipConfigured(root) {
+		pinned, err := os.OpenRoot(root.Path)
+		if err != nil {
+			return err
+		}
+		linkErr = pinned.Link(tempRelativePath, finalRelativePath)
+		pinned.Close()
+	} else {
+		linkErr = os.Link(tempPath, finalPath)
+	}
+	if linkErr != nil {
+		if errors.Is(linkErr, os.ErrExist) {
 			return ErrUploadFinalPathConflict
 		}
-		return err
+		return linkErr
 	}
 	if err := os.Remove(tempPath); err != nil {
 		return err
@@ -1032,19 +1046,16 @@ func finalizeUploadFile(root config.UploadRootConfig, tempRelativePath string, f
 	return nil
 }
 
-func ensureUploadFinalParent(rootPath string, parentRelativePath string) error {
-	cleanParent := path.Clean(strings.TrimSpace(parentRelativePath))
-	if cleanParent == "." {
+func ensureUploadDirectory(root config.UploadRootConfig, relativePath string) error {
+	cleanRelative := path.Clean(strings.TrimSpace(relativePath))
+	if cleanRelative == "." {
 		return nil
 	}
-	if path.IsAbs(cleanParent) || cleanParent == ".." || strings.HasPrefix(cleanParent, "../") {
+	if path.IsAbs(cleanRelative) || cleanRelative == ".." || strings.HasPrefix(cleanRelative, "../") {
 		return ErrUploadPolicyInvalid
 	}
-	current := rootPath
-	for _, segment := range strings.Split(cleanParent, "/") {
-		if segment == "" || segment == "." || segment == ".." {
-			return ErrUploadPolicyInvalid
-		}
+	current := root.Path
+	for _, segment := range strings.Split(cleanRelative, "/") {
 		current = filepath.Join(current, segment)
 		info, err := os.Lstat(current)
 		if err == nil {
@@ -1056,11 +1067,33 @@ func ensureUploadFinalParent(rootPath string, parentRelativePath string) error {
 		if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		if err := os.Mkdir(current, uploadCreatedDirMode); err != nil {
+		if err := createUploadDirectory(root, current); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// Independent sessions may create the same parent concurrently. Accept an
+// existing directory only after rechecking that it is not a symlink or file,
+// and preserve its ownership just like other preexisting parents.
+func createUploadDirectory(root config.UploadRootConfig, directory string) error {
+	err := os.Mkdir(directory, uploadCreatedDirMode)
+	created := err == nil
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	info, err := os.Lstat(directory)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return ErrUploadPolicyInvalid
+	}
+	if !created {
+		return nil
+	}
+	return applyUploadDirectoryOwnership(root, directory)
 }
 
 func renderUploadFinalRelativePath(profile store.DeviceProfile, session store.UploadSession, now time.Time, location *time.Location) (string, error) {
@@ -1160,10 +1193,18 @@ func (a *AgentRuntime) uploadLocation() *time.Location {
 }
 
 func (a *AgentRuntime) recoverPendingUploadAsset(asset store.UploadedAsset) (store.UploadedAsset, bool, error) {
-	a.uploadMu.Lock()
-	defer a.uploadMu.Unlock()
-
-	return a.recoverPendingUploadAssetLocked(asset)
+	// StartUploadSession already holds the device gate. Reload the reservation
+	// after acquiring the session lock: another completion may have moved it.
+	release := a.uploadSessions.lock(asset.UploadID)
+	defer release()
+	current, ok, err := a.uploads.GetUploadedAssetByUploadID(asset.UploadID)
+	if err != nil {
+		return store.UploadedAsset{}, false, err
+	}
+	if !ok {
+		return store.UploadedAsset{}, false, store.ErrUploadedAssetNotFound
+	}
+	return a.recoverPendingUploadAssetLocked(current)
 }
 
 func (a *AgentRuntime) recoverPendingUploadAssetLocked(asset store.UploadedAsset) (store.UploadedAsset, bool, error) {

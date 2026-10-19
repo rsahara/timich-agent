@@ -17,7 +17,12 @@ if [ ! -x "$runtime_dir/bin/vips.real" ]; then
   echo "missing executable vips.real: $runtime_dir/bin/vips.real" >&2
   exit 1
 fi
-if [ ! -f "$runtime_dir/lib/ld-musl-x86_64.so.1" ]; then
+case "${TIMICH_MEDIA_LIBVIPS_DOCKER_PLATFORM:-linux/amd64}" in
+  linux/amd64) loader_name=ld-musl-x86_64.so.1 ;;
+  linux/arm64) loader_name=ld-musl-aarch64.so.1 ;;
+  *) echo "unsupported libvips verification platform" >&2; exit 2 ;;
+esac
+if [ ! -f "$runtime_dir/lib/$loader_name" ]; then
   echo "missing bundled musl loader" >&2
   exit 1
 fi

@@ -8,6 +8,10 @@ source_url=${FFMPEG_SOURCE_URL:-https://ffmpeg.org/releases/ffmpeg-${version}.ta
 gpg_key_url=${FFMPEG_GPG_KEY_URL:-https://ffmpeg.org/ffmpeg-devel.asc}
 gpg_fingerprint=${FFMPEG_GPG_FINGERPRINT:-FCF986EA15E6E293A5644F10B4322F04D67658D8}
 platform=${TIMICH_FFMPEG_PLATFORM:-linux_amd64}
+case "$platform/$(uname -m)" in
+  linux_amd64/x86_64|linux_arm64/aarch64) ;;
+  *) echo "ffmpeg target/host mismatch: $platform/$(uname -m)" >&2; exit 2 ;;
+esac
 configure_file=${TIMICH_FFMPEG_CONFIGURE:-/builder/config-lgpl-decode-only.txt}
 output_dir=${TIMICH_FFMPEG_OUTPUT:-/out}
 make_jobs=${TIMICH_MEDIA_FFMPEG_MAKE_JOBS:-$(nproc)}

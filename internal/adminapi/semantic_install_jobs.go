@@ -159,13 +159,20 @@ func (s *server) semanticInstallJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) startSemanticInstallJob(w http.ResponseWriter, input semanticInstallJobStart, run func(context.Context) (any, string, error)) {
+	parent, release, ok := s.runtime.AcquireBackgroundWork()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "agent_shutting_down", "The Agent is shutting down.")
+		return
+	}
 	job, started := s.semanticInstallJobs.start(input)
-	writeJSON(w, http.StatusAccepted, job)
 	if !started {
+		release()
+		writeJSON(w, http.StatusAccepted, job)
 		return
 	}
 	go func(jobID string, action string) {
-		ctx, cancel := context.WithTimeout(context.Background(), semanticInstallJobTimeout)
+		defer release()
+		ctx, cancel := context.WithTimeout(parent, semanticInstallJobTimeout)
 		defer cancel()
 		result, message, err := run(ctx)
 		if err != nil {
@@ -175,6 +182,7 @@ func (s *server) startSemanticInstallJob(w http.ResponseWriter, input semanticIn
 		}
 		s.semanticInstallJobs.complete(jobID, result, message)
 	}(job.ID, job.Action)
+	writeJSON(w, http.StatusAccepted, job)
 }
 
 func (s *server) semanticInstallJobRunning() bool {

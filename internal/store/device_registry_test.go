@@ -722,6 +722,89 @@ func TestDeviceRegistryStoreEnforcesDeviceLimit(t *testing.T) {
 	}
 }
 
+func TestHostedReviewDeviceRecyclesOnlyReviewDevicesAndReservesOrdinarySlot(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	registry, err := LoadOrCreateDeviceRegistry(dataDir, 3)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	ordinary, err := registry.CreateHostedDevice("Ordinary iPhone", now, now.Add(30*24*time.Hour))
+	if err != nil {
+		t.Fatalf("CreateHostedDevice() error = %v", err)
+	}
+	first, evictedID, err := registry.CreateHostedReviewDevice("Review TV", now.Add(time.Minute), now.Add(30*24*time.Hour))
+	if err != nil || evictedID != "" || !first.ReviewOnly {
+		t.Fatalf("first review device = %+v, evictedID=%q, error=%v", first, evictedID, err)
+	}
+	second, evictedID, err := registry.CreateHostedReviewDevice("Review TV", now.Add(2*time.Minute), now.Add(30*24*time.Hour))
+	if err != nil || evictedID != first.DeviceID {
+		t.Fatalf("second review evictedID=%q error=%v, want %q", evictedID, err, first.DeviceID)
+	}
+	if !registry.HasDevice(ordinary.DeviceID) || registry.HasDevice(first.DeviceID) || !registry.HasDevice(second.DeviceID) {
+		t.Fatal("review recycling removed an ordinary device or retained an old review device")
+	}
+
+	// The reserved third slot remains available to an ordinary pairing.
+	third, err := registry.CreateHostedDevice("Another ordinary device", now.Add(3*time.Minute), now.Add(30*24*time.Hour))
+	if err != nil {
+		t.Fatalf("CreateHostedDevice() with reserved slot error = %v", err)
+	}
+	reloaded, err := LoadOrCreateDeviceRegistry(dataDir, 3)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry(reload) error = %v", err)
+	}
+	if _, evictedID, err := reloaded.CreateHostedReviewDevice("Review TV", now.Add(4*time.Minute), now.Add(30*24*time.Hour)); err != nil || evictedID != second.DeviceID {
+		t.Fatalf("review after reload evictedID=%q error=%v, want %q", evictedID, err, second.DeviceID)
+	}
+	if !reloaded.HasDevice(ordinary.DeviceID) || !reloaded.HasDevice(third.DeviceID) {
+		t.Fatal("review after reload removed an ordinary device")
+	}
+}
+
+func TestHostedReviewDeviceNeverEvictsOrdinaryDevices(t *testing.T) {
+	t.Parallel()
+	registry, err := LoadOrCreateDeviceRegistry(t.TempDir(), 2)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+	now := time.Now().UTC()
+	for range 2 {
+		if _, err := registry.CreateHostedDevice("Ordinary device", now, now.Add(time.Hour)); err != nil {
+			t.Fatalf("CreateHostedDevice() error = %v", err)
+		}
+	}
+	if _, _, err := registry.CreateHostedReviewDevice("Review TV", now, now.Add(time.Hour)); !errors.Is(err, ErrDeviceLimitReached) {
+		t.Fatalf("CreateHostedReviewDevice() error = %v, want device limit", err)
+	}
+}
+
+func TestHostedReviewDeviceKeepsExistingDevicesWhenPersistenceFails(t *testing.T) {
+	t.Parallel()
+	registry, err := LoadOrCreateDeviceRegistry(t.TempDir(), 3)
+	if err != nil {
+		t.Fatalf("LoadOrCreateDeviceRegistry() error = %v", err)
+	}
+	now := time.Now().UTC()
+	ordinary, err := registry.CreateHostedDevice("Ordinary device", now, now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("CreateHostedDevice() error = %v", err)
+	}
+	review, _, err := registry.CreateHostedReviewDevice("Review TV", now, now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("CreateHostedReviewDevice() error = %v", err)
+	}
+	registry.path = filepath.Join(t.TempDir(), "missing", deviceRegistryFileName)
+	if _, _, err := registry.CreateHostedReviewDevice("Review TV", now.Add(time.Minute), now.Add(time.Hour)); err == nil {
+		t.Fatal("CreateHostedReviewDevice() error = nil, want persistence failure")
+	}
+	if !registry.HasDevice(ordinary.DeviceID) || !registry.HasDevice(review.DeviceID) {
+		t.Fatal("failed review replacement removed an existing device")
+	}
+}
+
 func TestDeviceRegistryStoreReplacesExistingPairingSession(t *testing.T) {
 	t.Parallel()
 

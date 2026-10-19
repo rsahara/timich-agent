@@ -539,7 +539,7 @@ paths:
   /v1/uploads/roots:
     get:
       operationId: listAgentUploadRoots
-      summary: List configured device upload roots.
+      summary: List configured device upload roots, optional owner account names, and write/ownership readiness.
       security:
         - AdminBearerAuth: []
       responses:

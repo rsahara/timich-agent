@@ -81,7 +81,12 @@ make semantic-model-registry
 ```
 
 The merged `dist/semantic-models.json` is the Admin UI registry consumed by
-release binaries.
+release binaries. Include the fragments from both native Linux builders to
+publish one runtime pack with `linux-amd64` and `linux-arm64` artifacts. Fragments
+with the same runtime ID must have identical metadata apart from `artifacts`.
+An identical platform artifact can appear more than once; conflicting artifacts
+for the same platform are rejected. Duplicate model entries must still match in
+full.
 
 Older NAS platforms can have older glibc/OpenSSL libraries than a current
 Debian or Ubuntu build container. For QNAP-style native validation, build on a

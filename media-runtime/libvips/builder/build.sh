@@ -43,7 +43,7 @@ if [ -f "$runtime_dir_abs/bin/vips.real" ]; then
   chmod +x "$runtime_dir_abs/bin/vips.real"
 fi
 
-"$script_dir/verify.sh" "$runtime_dir"
+TIMICH_MEDIA_LIBVIPS_DOCKER_PLATFORM="$docker_platform" "$script_dir/verify.sh" "$runtime_dir"
 
 artifact_name="${runtime_id}_${version}_${platform}.tar.gz"
 artifact_path="$pack_dir_abs/$artifact_name"

@@ -74,12 +74,14 @@ flowchart LR
 
 ## Install From a Release Bundle
 
-Release archives are named by version, OS, and CPU architecture. The protected
-0.4 release publisher currently produces and verifies the Linux amd64 bundle.
+Release archives are named by version, OS, and CPU architecture. Check the release assets for your architecture: `amd64` for `x86_64`, or
+`arm64` for `aarch64`/`arm64` (`uname -m`). Older releases may only provide amd64;
+do not run that bundle on ARM64. For example,
+`timich-agent_VERSION_linux_amd64.tar.gz` is for an x86_64 Linux host.
 
 1. Open the latest release:
    <https://github.com/rsahara/timich-agent/releases/latest>
-2. Download `timich-agent_VERSION_linux_amd64.tar.gz`.
+2. Download `timich-agent_VERSION_linux_ARCH.tar.gz` for that architecture.
 3. Download the matching `.sha256` file and verify the archive:
 
 ```bash
@@ -686,6 +688,17 @@ The restart action gracefully stops the running process. It is useful when the
 agent is supervised by Docker Compose, a NAS service, launchd, or systemd. When
 running in the foreground, the process exits and must be started again manually.
 
+If startup reports `recover local scan jobs during startup`, the Agent could not
+return interrupted local metadata or thumbnail jobs to the queue. Startup stops
+before workers and APIs start, so browsing through this Agent is unavailable
+until the next successful start. Check the underlying database error in the
+process logs and resolve its cause; do not delete the state directory to bypass
+the error. A configured supervisor can restart the process. For foreground
+execution, run the Agent again manually after resolving the cause. Database
+recovery alone does not restart a stopped process. Confirm that local processing
+resumes after startup, and stop the previous Agent before starting another
+process against the same data directory.
+
 Admin API:
 
 - `GET http://AGENT_LAN_HOST:8081/`
@@ -1019,6 +1032,93 @@ Compose before selecting that root for a device. `uploadRoots[].tempPath` is
 optional, relative to the upload root, and defaults to `.timich-upload-tmp`.
 Use a nested value such as `working/.timich-upload-tmp` when temporary part
 files should live under an explicit working directory inside the same root.
+
+On Unix, each upload root can optionally set account names for uploaded files
+and their parent directories:
+
+```json
+{
+  "key": "camera-uploads",
+  "path": "/media/uploads",
+  "tempPath": ".timich-upload-tmp",
+  "ownerUser": "photo-user",
+  "ownerGroup": "media-group"
+}
+```
+
+Names are resolved inside the Agent runtime, independently for each field.
+Omitting a field preserves the operating system's default for that ownership
+component; omitting both preserves existing behavior. Account lookups are cached
+for the running process, so restart after changing account mappings. The Agent
+must have permission to assign the requested UID/GID. Unknown accounts,
+unsupported platforms, or failed ownership/read-write probes block that
+upload root and report a reason; the Agent does not silently upload with
+another owner.
+
+The Agent assigns ownership before writing media bytes to the temporary file
+and checks it again before finalization. The final hard link preserves that
+ownership. Newly created temporary subdirectories and final parent directories
+receive the configured ownership. Existing directories keep their ownership
+and permissions, including parents reused by an upload. This avoids changing
+who can access, delete, or rename their existing contents. The root directory
+itself, Agent private state, and other existing media are not recursively
+changed. Existing uploaded files require a separate migration if their
+ownership needs correction. File and directory modes continue to follow the
+process umask and filesystem ACLs.
+
+When either ownership field is configured, prepare file and directory access
+on the host/NAS through ownership, group permissions, or ACLs:
+
+- The Agent needs read (list) and search (execute) access to the upload root
+  and every directory it traverses inside that root. It also needs write
+  access to the root, temporary directory, final destination, and any parent
+  where it creates subdirectories. These permissions must remain available
+  after ownership assignment. Ancestors outside the upload root need search
+  access only. Writable but unreadable directories are not supported with
+  ownership configured.
+- The Agent also needs read and write access to uploaded files after ownership
+  assignment: writing receives chunks, and reading verifies the completion
+  checksum. Write-only access cannot complete an upload.
+- The intended user needs write and search access to the final parent, plus
+  search access through its ancestors, to delete, rename, or save by replacing
+  uploaded files. With a `{filename}` path pattern, that parent is the upload
+  root itself. File ownership alone does not grant these directory permissions.
+
+Existing directories are operator-managed. A different directory owner is
+allowed when the required access is in place; the Agent does not automatically
+repair existing directory ownership or permissions.
+
+An upload root's `ready` status means the Agent can create and remove its own
+file in the root, then create a temporary file, assign the configured ownership,
+reopen it for reading and writing, and remove it. Ownership checks run in the
+temporary directory, where uploaded media is created, using the same creation
+mode, umask, and inherited ACLs. This allows a root with the sticky bit set when
+uploads can be linked into it. A temporary directory that prevents removal of
+files after ownership assignment is blocked before starting an upload.
+
+If a temporary probe cannot be removed because of its assigned ownership, the
+Agent attempts to reclaim and remove that probe while still reporting the
+failed deletion check. These checks do not verify access to every final parent
+or guarantee the intended user's permissions to delete, rename, or replace
+files. An inaccessible final parent can cause finalization to fail even when
+the root reports `ready`.
+
+For Docker, host account names must be visible inside the container. On hosts
+whose `/etc/passwd` and `/etc/group` contain only account metadata (password
+hashes belong in `/etc/shadow`), read-only account-file mounts can provide the
+host name-to-ID mappings:
+
+```yaml
+services:
+  timich-agent:
+    volumes:
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
+```
+
+Use the account names from those files in `ownerUser` and `ownerGroup`; keep
+password databases such as `/etc/shadow` outside the container.
+
 The Agent keeps uploaded-asset ledger rows so media is not re-uploaded after
 destination files are deleted, but it runs daily maintenance to prune old upload
 sessions, audit rows, stale temporary files, and the SQLite WAL.

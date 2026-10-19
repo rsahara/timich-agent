@@ -886,10 +886,38 @@ func (s *UploadStore) ResetDeviceUploadState(input UploadResetInput) (UploadRese
 	}, nil
 }
 
-// CleanupUploadState removes expired or old auxiliary upload state. It keeps
-// the uploaded asset ledger and checksum rows intact so once-only semantics are
-// preserved even when final media files are deleted outside Timich.
+// CleanupUploadState prunes all eligible sessions and auxiliary audit rows.
+// Serving runtimes use the per-session methods below under their lifecycle locks.
 func (s *UploadStore) CleanupUploadState(input UploadCleanupInput) (UploadCleanupResult, error) {
+	candidates, err := s.UploadCleanupCandidates(input)
+	if err != nil {
+		return UploadCleanupResult{}, err
+	}
+	result := UploadCleanupResult{}
+	for _, candidate := range candidates {
+		removed, err := s.CleanupUploadSession(candidate.UploadID, input)
+		if err != nil {
+			return UploadCleanupResult{}, err
+		}
+		result.RemovedExpiredSessions += removed.RemovedExpiredSessions
+		result.RemovedCompleted += removed.RemovedCompleted
+		result.RemovedAborted += removed.RemovedAborted
+		result.RemovedFailed += removed.RemovedFailed
+		result.TempFiles = append(result.TempFiles, removed.TempFiles...)
+	}
+	events, err := s.CleanupUploadEvents(input)
+	if err != nil {
+		return UploadCleanupResult{}, err
+	}
+	result.CleanedAt = events.CleanedAt
+	result.RemovedCommitEvents = events.RemovedCommitEvents
+	result.RemovedResetEvents = events.RemovedResetEvents
+	result.WALCheckpointed = events.WALCheckpointed
+	return result, nil
+}
+
+// CleanupUploadEvents prunes audit rows without touching sessions or files.
+func (s *UploadStore) CleanupUploadEvents(input UploadCleanupInput) (UploadCleanupResult, error) {
 	normalized := normalizeUploadCleanupInput(input)
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -900,43 +928,6 @@ func (s *UploadStore) CleanupUploadState(input UploadCleanupInput) (UploadCleanu
 			_ = tx.Rollback()
 		}
 	}()
-
-	tempFiles, err := uploadSessionTempFilesForCleanupTx(tx, normalized)
-	if err != nil {
-		return UploadCleanupResult{}, err
-	}
-	removedExpired, err := deleteUploadSessionsTx(
-		tx,
-		`status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?`,
-		formatDBTime(normalized.Now),
-	)
-	if err != nil {
-		return UploadCleanupResult{}, err
-	}
-	removedCompleted, err := deleteUploadSessionsTx(
-		tx,
-		`status = 'completed' AND updated_at < ?`,
-		formatDBTime(normalized.Now.Add(-normalized.CompletedSessionRetention)),
-	)
-	if err != nil {
-		return UploadCleanupResult{}, err
-	}
-	removedAborted, err := deleteUploadSessionsTx(
-		tx,
-		`status = 'aborted' AND updated_at < ?`,
-		formatDBTime(normalized.Now.Add(-normalized.AbortedSessionRetention)),
-	)
-	if err != nil {
-		return UploadCleanupResult{}, err
-	}
-	removedFailed, err := deleteUploadSessionsTx(
-		tx,
-		`status = 'failed' AND updated_at < ?`,
-		formatDBTime(normalized.Now.Add(-normalized.FailedSessionRetention)),
-	)
-	if err != nil {
-		return UploadCleanupResult{}, err
-	}
 	commitEventsResult, err := tx.Exec(
 		`DELETE FROM upload_commit_events
 			WHERE created_at < ?
@@ -975,15 +966,10 @@ func (s *UploadStore) CleanupUploadState(input UploadCleanupInput) (UploadCleanu
 		return UploadCleanupResult{}, fmt.Errorf("checkpoint upload store wal: %w", err)
 	}
 	return UploadCleanupResult{
-		CleanedAt:              normalized.Now,
-		RemovedExpiredSessions: removedExpired,
-		RemovedCompleted:       removedCompleted,
-		RemovedAborted:         removedAborted,
-		RemovedFailed:          removedFailed,
-		RemovedCommitEvents:    removedCommitEvents,
-		RemovedResetEvents:     removedResetEvents,
-		TempFiles:              tempFiles,
-		WALCheckpointed:        true,
+		CleanedAt:           normalized.Now,
+		RemovedCommitEvents: removedCommitEvents,
+		RemovedResetEvents:  removedResetEvents,
+		WALCheckpointed:     true,
 	}, nil
 }
 
@@ -1100,55 +1086,6 @@ func uploadSessionTempFilesForResetTx(tx *sql.Tx, input UploadResetInput) ([]Upl
 		return nil, err
 	}
 	return files, nil
-}
-
-func uploadSessionTempFilesForCleanupTx(tx *sql.Tx, input UploadCleanupInput) ([]UploadTempFile, error) {
-	completedCutoff := formatDBTime(input.Now.Add(-input.CompletedSessionRetention))
-	abortedCutoff := formatDBTime(input.Now.Add(-input.AbortedSessionRetention))
-	failedCutoff := formatDBTime(input.Now.Add(-input.FailedSessionRetention))
-	rows, err := tx.Query(
-		`SELECT selected_root_key, temp_relative_path
-			FROM upload_sessions
-			WHERE temp_relative_path <> ''
-				AND (
-					(status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?)
-					OR (status = 'completed' AND updated_at < ?)
-					OR (status = 'aborted' AND updated_at < ?)
-					OR (status = 'failed' AND updated_at < ?)
-				)`,
-		formatDBTime(input.Now),
-		completedCutoff,
-		abortedCutoff,
-		failedCutoff,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var files []UploadTempFile
-	for rows.Next() {
-		var file UploadTempFile
-		if err := rows.Scan(&file.RootKey, &file.RelativePath); err != nil {
-			return nil, err
-		}
-		files = append(files, file)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return files, nil
-}
-
-func deleteUploadSessionsTx(tx *sql.Tx, where string, args ...any) (int64, error) {
-	result, err := tx.Exec(`DELETE FROM upload_sessions WHERE `+where, args...)
-	if err != nil {
-		return 0, fmt.Errorf("cleanup upload sessions: %w", err)
-	}
-	removed, err := result.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	return removed, nil
 }
 
 func resetWhereClause(deviceColumn string, capturedColumn string, input UploadResetInput) (string, []any) {

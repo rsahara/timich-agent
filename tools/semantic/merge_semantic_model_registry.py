@@ -37,7 +37,8 @@ def main() -> int:
             add_unique(models, model_ids, model, "id", path, "model")
         for runtime_pack in manifest.get("runtimePacks") or []:
             normalize_runtime_pack(runtime_pack, path, args.base_url)
-            add_unique(runtime_packs, runtime_pack_ids, runtime_pack, "id", path, "runtime pack")
+            add_unique(runtime_packs, runtime_pack_ids, runtime_pack, "id", path, "runtime pack",
+                       merge_artifacts=True)
 
     if not models and not runtime_packs:
         raise SystemExit("no models or runtime packs found in input manifests")
@@ -107,9 +108,25 @@ def validate_manifest_header(manifest: dict, path: Path) -> None:
         raise SystemExit(f"{path}: product must be {PRODUCT}")
 
 
-def add_unique(items: list[dict], seen: dict[str, dict], item: dict, key: str, path: Path, label: str) -> None:
+def add_unique(items: list[dict], seen: dict[str, dict], item: dict, key: str, path: Path, label: str,
+               *, merge_artifacts: bool = False) -> None:
     item_id = str(item.get(key, "")).strip()
     if item_id in seen:
+        if merge_artifacts:
+            existing = seen[item_id]
+            existing_metadata = {k: v for k, v in existing.items() if k != "artifacts"}
+            incoming_metadata = {k: v for k, v in item.items() if k != "artifacts"}
+            if stable_json(existing_metadata) != stable_json(incoming_metadata):
+                raise SystemExit(f"{path}: duplicate {label} {item_id!r} has different metadata")
+            merged = dict(existing["artifacts"])
+            for platform, artifact in item["artifacts"].items():
+                if platform in merged and stable_json(merged[platform]) != stable_json(artifact):
+                    raise SystemExit(
+                        f"{path}: duplicate {label} {item_id!r} has conflicting artifact for {platform!r}"
+                    )
+                merged[platform] = artifact
+            existing["artifacts"] = merged
+            return
         if stable_json(seen[item_id]) != stable_json(item):
             raise SystemExit(f"{path}: duplicate {label} {item_id!r} has different metadata")
         return

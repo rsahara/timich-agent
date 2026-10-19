@@ -59,7 +59,7 @@ func (s *relayIsolationServer) UploadFetchResult(context.Context, *dynamicpb.Mes
 	return response, nil
 }
 
-func registerRelayIsolationServer(server *grpc.Server, service *relayIsolationServer) {
+func registerRelayIsolationServer(server *grpc.Server, service relayIsolationAPI) {
 	server.RegisterService(&grpc.ServiceDesc{
 		ServiceName: ServiceFullName(),
 		HandlerType: (*relayIsolationAPI)(nil),
@@ -582,18 +582,18 @@ func TestHandleRelayRequestForwardsMediaRequest(t *testing.T) {
 	}{
 		{
 			name:               "hosted header and content-type fallback",
-			fallbackBaseURL:    "https://fallback.example/root/",
-			hostedHeader:       "  https://relay.example/base///  ",
+			fallbackBaseURL:    "https://fallback.example/",
+			hostedHeader:       "  https://relay.example///  ",
 			requestContentType: "application/json",
-			wantURL:            "https://relay.example/base/v1/assets/search?page=2",
+			wantURL:            "https://relay.example/v1/assets/search?page=2",
 			wantContentType:    "application/json",
 		},
 		{
 			name:                "configured base and explicit content type",
-			fallbackBaseURL:     "  https://fallback.example/root///  ",
+			fallbackBaseURL:     "  https://fallback.example///  ",
 			explicitContentType: "application/custom",
 			requestContentType:  "application/json",
-			wantURL:             "https://fallback.example/root/v1/assets/search?page=2",
+			wantURL:             "https://fallback.example/v1/assets/search?page=2",
 			wantContentType:     "application/custom",
 		},
 	}

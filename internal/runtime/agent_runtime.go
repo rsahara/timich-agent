@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"github.com/rsahara/timich-agent/internal/catalog"
 	"github.com/rsahara/timich-agent/internal/compatibility"
 	"github.com/rsahara/timich-agent/internal/config"
+	"github.com/rsahara/timich-agent/internal/lifecycle"
 	"github.com/rsahara/timich-agent/internal/pairing"
 	"github.com/rsahara/timich-agent/internal/security"
 	"github.com/rsahara/timich-agent/internal/store"
@@ -47,6 +49,10 @@ var (
 
 // AgentRuntime exposes redacted runtime state to the local admin and media APIs.
 type AgentRuntime struct {
+	requests                       lifecycle.Group
+	background                     lifecycle.Group
+	closeOnce                      sync.Once
+	closeErr                       error
 	mu                             sync.RWMutex
 	configMutationMu               sync.Mutex
 	build                          BuildInfo
@@ -57,7 +63,8 @@ type AgentRuntime struct {
 	registry                       *store.DeviceRegistryStore
 	profiles                       *store.DeviceProfileStore
 	uploads                        *store.UploadStore
-	uploadMu                       sync.Mutex
+	uploadDevices                  uploadLockRegistry
+	uploadSessions                 uploadLockRegistry
 	maintenanceMu                  sync.Mutex
 	maintenanceCancel              context.CancelFunc
 	maintenanceWG                  sync.WaitGroup
@@ -175,12 +182,14 @@ type LocalMediaRootSummary struct {
 
 // UploadRootSummary exposes administrator-configured upload roots.
 type UploadRootSummary struct {
-	Key      string `json:"key"`
-	Path     string `json:"path"`
-	TempPath string `json:"tempPath,omitempty"`
-	Status   string `json:"status,omitempty"`
-	Writable bool   `json:"writable,omitempty"`
-	Message  string `json:"message,omitempty"`
+	Key        string `json:"key"`
+	Path       string `json:"path"`
+	TempPath   string `json:"tempPath,omitempty"`
+	OwnerUser  string `json:"ownerUser,omitempty"`
+	OwnerGroup string `json:"ownerGroup,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Writable   bool   `json:"writable,omitempty"`
+	Message    string `json:"message,omitempty"`
 }
 
 // LocalDatasourceScanResponse reports configured local roots and scan state.
@@ -475,7 +484,7 @@ func NewAgentRuntime(build BuildInfo, cfg config.ResolvedConfig, state store.Loa
 	resetCount, resetErr := catalogService.ResetRunningLocalScanJobs(resetCtx)
 	resetCancel()
 	if resetErr != nil && !errors.Is(resetErr, catalog.ErrNoDatasourceConfigured) {
-		log.Printf("timich-agent local job recovery failed error=%v", resetErr)
+		return nil, failedLocalJobRecovery(resetErr, catalogService, uploads)
 	} else if resetCount > 0 {
 		log.Printf("timich-agent local job recovery requeued=%d", resetCount)
 	}
@@ -505,8 +514,20 @@ func NewAgentRuntime(build BuildInfo, cfg config.ResolvedConfig, state store.Loa
 		runtime.schedulerWorkStateMarkDirty()
 		runtime.wakeBackgroundWorkerScheduler()
 	})
-	runtime.webrtc = webrtcmedia.NewManager(runtime.Original)
+	runtime.webrtc = webrtcmedia.NewManagerWithLifecycle(runtime.Original, &runtime.requests)
 	return runtime, nil
+}
+
+// No runtime or workers exist yet, so release the stores directly on failure.
+func failedLocalJobRecovery(cause error, catalogResources, uploadResources io.Closer) error {
+	err := fmt.Errorf("recover local scan jobs during startup: %w", cause)
+	if closeErr := catalogResources.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("close catalog after failed local job recovery: %w", closeErr))
+	}
+	if closeErr := uploadResources.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("close upload store after failed local job recovery: %w", closeErr))
+	}
+	return err
 }
 
 // Close releases runtime-owned local resources. Long-running agent processes
@@ -515,22 +536,9 @@ func (a *AgentRuntime) Close() error {
 	if a == nil {
 		return nil
 	}
-	a.stopUploadMaintenance()
-	a.stopDatasourceMirrorSync()
-	a.stopLocalDatasourceScan()
-	a.stopBackgroundWorkerScheduler()
-	a.stopDatasourceIndexingStatusRefresh()
-	if a.semanticONNXRuntime != nil {
-		a.semanticONNXRuntime.Close()
-	}
-	var err error
-	if a.uploads != nil {
-		err = errors.Join(err, a.uploads.Close())
-	}
-	if a.catalog != nil {
-		err = errors.Join(err, a.catalog.Close())
-	}
-	return err
+	a.BeginShutdown()
+	a.CancelRequests()
+	return a.CloseResources(context.Background())
 }
 
 func newCompatibilityService(
@@ -1570,9 +1578,11 @@ func (a *AgentRuntime) uploadRootSummariesLocked() []UploadRootSummary {
 	for _, root := range a.config.UploadRoots {
 		root = normalizedUploadRootConfig(root)
 		summaries = append(summaries, UploadRootSummary{
-			Key:      root.Key,
-			Path:     root.Path,
-			TempPath: root.TempPath,
+			Key:        root.Key,
+			Path:       root.Path,
+			TempPath:   root.TempPath,
+			OwnerUser:  root.OwnerUser,
+			OwnerGroup: root.OwnerGroup,
 		})
 	}
 	return summaries
@@ -1601,10 +1611,12 @@ func uploadRootStatusSummaries(roots []config.UploadRootConfig) []UploadRootSumm
 func uploadRootStatus(root config.UploadRootConfig) UploadRootSummary {
 	root = normalizedUploadRootConfig(root)
 	summary := UploadRootSummary{
-		Key:      root.Key,
-		Path:     root.Path,
-		TempPath: root.TempPath,
-		Status:   "blocked",
+		Key:        root.Key,
+		Path:       root.Path,
+		TempPath:   root.TempPath,
+		OwnerUser:  root.OwnerUser,
+		OwnerGroup: root.OwnerGroup,
+		Status:     "blocked",
 	}
 	info, err := os.Stat(root.Path)
 	if err != nil {
@@ -1617,6 +1629,10 @@ func uploadRootStatus(root config.UploadRootConfig) UploadRootSummary {
 	}
 	if !info.IsDir() {
 		summary.Message = "Upload root path is not a directory."
+		return summary
+	}
+	if _, err := resolveUploadOwner(root); err != nil {
+		summary.Message = "Upload ownership is unavailable: " + err.Error()
 		return summary
 	}
 	if err := probeWritableDirectory(root.Path, ".timich-upload-root-check-*"); err != nil {
@@ -1632,8 +1648,11 @@ func uploadRootStatus(root config.UploadRootConfig) UploadRootSummary {
 		summary.Message = "Upload temp path is invalid."
 		return summary
 	}
-	if err := probeWritableDirectory(tempDir, ".timich-upload-temp-check-*"); err != nil {
+	if err := probeUploadTempDirectory(tempDir, root); err != nil {
 		summary.Message = "Upload temp path is not writable."
+		if uploadOwnershipConfigured(root) {
+			summary.Message = "Upload temp write/ownership check failed: " + err.Error()
+		}
 		return summary
 	}
 	summary.Status = "ready"
@@ -1647,13 +1666,55 @@ func probeWritableDirectory(dir string, pattern string) error {
 	if err != nil {
 		return err
 	}
-	probePath := probe.Name()
-	closeErr := probe.Close()
-	removeErr := os.Remove(probePath)
-	if closeErr != nil {
-		return closeErr
+	return errors.Join(probe.Close(), os.Remove(probe.Name()))
+}
+
+func probeUploadTempDirectory(dir string, root config.UploadRootConfig) (err error) {
+	if !uploadOwnershipConfigured(root) {
+		return probeWritableDirectory(dir, ".timich-upload-temp-check-*")
 	}
-	return removeErr
+	id, err := randomUploadID()
+	if err != nil {
+		return err
+	}
+	// Match media creation so umask and inherited ACLs apply before chown.
+	probePath := filepath.Join(dir, ".timich-upload-temp-check-"+id)
+	probe, err := os.OpenFile(probePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, uploadCreatedFileMode)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		removeErr := os.Remove(probePath)
+		err = errors.Join(err, removeErr)
+		if errors.Is(removeErr, os.ErrPermission) {
+			// Keep the failed unlink in the result, but reclaim only our probe
+			// through its original descriptor so sticky directories do not leak it.
+			cleanupErr := probe.Chown(os.Geteuid(), -1)
+			if cleanupErr == nil {
+				cleanupErr = os.Remove(probePath)
+			}
+			if cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("clean up upload ownership probe: %w", cleanupErr))
+			}
+		}
+		err = errors.Join(err, probe.Close())
+	}()
+	if err := applyUploadOwnership(probe, root); err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(root.Path, probePath)
+	if err == nil {
+		var reopened *os.File
+		// Uploads need writes for chunks and reads for completion checksums.
+		reopened, err = openUploadChild(root, filepath.ToSlash(relative), os.O_RDWR, false)
+		if err == nil {
+			err = reopened.Close()
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("reopen upload file for reading and writing after ownership change: %w", err)
+	}
+	return nil
 }
 
 func (a *AgentRuntime) primaryDatasourceLocked() PrimaryDatasourceResponse {
@@ -2155,6 +2216,26 @@ func (a *AgentRuntime) CreateHostedSession(deviceName string, baseURL string) (p
 	return bundle, nil
 }
 
+// CreateHostedReviewSession replaces only review-only devices when the demo
+// Agent needs capacity for another Google Play review pairing.
+func (a *AgentRuntime) CreateHostedReviewSession(deviceName string, baseURL string) (pairing.SessionBundle, error) {
+	bundle, evictedID, err := a.pairing.CreateHostedReviewSession(deviceName, baseURL)
+	if evictedID != "" {
+		if cleanupErr := a.RevokeDevice(evictedID); cleanupErr != nil && !errors.Is(cleanupErr, store.ErrDeviceNotFound) {
+			log.Printf("clean up replaced review device %q: %v", evictedID, cleanupErr)
+		}
+	}
+	if err != nil {
+		return pairing.SessionBundle{}, err
+	}
+	if err := a.ensureDeviceProfile(bundle.DeviceID); err != nil {
+		_ = a.registry.RevokeDevice(bundle.DeviceID)
+		_ = a.profiles.DeleteProfile(bundle.DeviceID)
+		return pairing.SessionBundle{}, err
+	}
+	return bundle, nil
+}
+
 // RefreshAppSession rotates an app-device refresh token family and returns a new session bundle.
 func (a *AgentRuntime) RefreshAppSession(refreshToken string, baseURL string) (pairing.SessionBundle, error) {
 	return a.pairing.RefreshSession(refreshToken, baseURL)
@@ -2205,6 +2286,8 @@ func (a *AgentRuntime) DeviceSummaries() []DeviceSummary {
 
 // UpdateDevice updates administrator-visible paired-device metadata.
 func (a *AgentRuntime) UpdateDevice(deviceID string, input DeviceUpdate) (DeviceSummary, error) {
+	release := a.uploadDevices.readLock(deviceID)
+	defer release()
 	device, err := a.registry.RenameDevice(deviceID, input.DeviceName)
 	if err != nil {
 		return DeviceSummary{}, err
@@ -2217,6 +2300,8 @@ func (a *AgentRuntime) UpdateDevice(deviceID string, input DeviceUpdate) (Device
 
 // DeviceUploadPolicy returns the admin upload policy for a paired device.
 func (a *AgentRuntime) DeviceUploadPolicy(deviceID string) (DeviceUploadPolicyResponse, error) {
+	release := a.uploadDevices.readLock(deviceID)
+	defer release()
 	device, err := a.deviceRecord(deviceID)
 	if err != nil {
 		return DeviceUploadPolicyResponse{}, err
@@ -2230,6 +2315,8 @@ func (a *AgentRuntime) DeviceUploadPolicy(deviceID string) (DeviceUploadPolicyRe
 
 // UpdateDeviceUploadPolicy updates administrator-owned upload policy for one paired device.
 func (a *AgentRuntime) UpdateDeviceUploadPolicy(deviceID string, input DeviceUploadPolicyUpdate) (DeviceUploadPolicyResponse, error) {
+	release := a.uploadDevices.readLock(deviceID)
+	defer release()
 	device, err := a.deviceRecord(deviceID)
 	if err != nil {
 		return DeviceUploadPolicyResponse{}, err
@@ -2371,6 +2458,9 @@ func (a *AgentRuntime) deviceUploadPolicyStatus(upload store.DeviceUploadProfile
 
 // RevokeDevice removes a paired app device from the local registry.
 func (a *AgentRuntime) RevokeDevice(deviceID string) error {
+	deviceID = strings.TrimSpace(deviceID)
+	release := a.uploadDevices.lock(deviceID)
+	defer release()
 	registryErr := a.registry.RevokeDevice(deviceID)
 	if registryErr != nil && !errors.Is(registryErr, store.ErrDeviceNotFound) {
 		return registryErr
@@ -2390,6 +2480,8 @@ func (a *AgentRuntime) ResetDeviceUploadState(input UploadResetInput) (UploadRes
 	if input.DeviceID == "" {
 		return UploadResetResponse{}, store.ErrDeviceNotFound
 	}
+	release := a.uploadDevices.lock(input.DeviceID)
+	defer release()
 	if _, err := a.deviceRecord(input.DeviceID); err != nil {
 		return UploadResetResponse{}, err
 	}
@@ -2398,9 +2490,7 @@ func (a *AgentRuntime) ResetDeviceUploadState(input UploadResetInput) (UploadRes
 }
 
 func (a *AgentRuntime) resetDeviceUploadState(input UploadResetInput) (UploadResetResponse, error) {
-	a.uploadMu.Lock()
-	defer a.uploadMu.Unlock()
-
+	// Caller holds the exclusive device gate through DB and temp-file deletion.
 	if input.RequireDateRange && (input.CapturedAfter == nil || input.CapturedBefore == nil) {
 		return UploadResetResponse{}, ErrUploadResetRangeRequired
 	}
@@ -2462,6 +2552,8 @@ func (a *AgentRuntime) removeUploadTempFiles(files []store.UploadTempFile) (int6
 }
 
 func normalizedUploadRootConfig(root config.UploadRootConfig) config.UploadRootConfig {
+	root.OwnerUser = strings.TrimSpace(root.OwnerUser)
+	root.OwnerGroup = strings.TrimSpace(root.OwnerGroup)
 	if tempPath, err := config.ValidateUploadRootTempPath(root.TempPath); err == nil {
 		root.TempPath = tempPath
 	}
@@ -2517,6 +2609,8 @@ func (a *AgentRuntime) deviceRecord(deviceID string) (store.DeviceRecord, error)
 }
 
 func (a *AgentRuntime) ensureDeviceProfile(deviceID string) error {
+	release := a.uploadDevices.readLock(deviceID)
+	defer release()
 	snapshot := a.registry.Snapshot()
 	for _, device := range snapshot.Devices {
 		if device.DeviceID != deviceID {
