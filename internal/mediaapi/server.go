@@ -416,7 +416,8 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 			writeMethodNotAllowed(w, "Use POST to answer a WebRTC media offer.")
 			return
 		}
-		if _, ok := authenticateRequest(w, runtime, r); !ok {
+		claims, ok := authenticateRequest(w, runtime, r)
+		if !ok {
 			return
 		}
 
@@ -429,7 +430,7 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 			return
 		}
 
-		response, err := runtime.AnswerWebRTCOffer(r.Context(), request)
+		response, err := runtime.AnswerWebRTCOffer(r.Context(), request, claims)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{
 				"error":   "webrtc_offer_failed",
@@ -438,6 +439,17 @@ func NewMux(runtime *runtimestate.AgentRuntime) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, response)
+	})
+	mux.HandleFunc("POST /v1/webrtc/sessions/{sessionId}/authorize", func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := authenticateRequest(w, runtime, r)
+		if !ok {
+			return
+		}
+		if err := runtime.ReauthorizeWebRTC(r.Context(), r.PathValue("sessionId"), claims); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "webrtc_authorization_expired"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "authorized"})
 	})
 	mux.HandleFunc("/v1/assets/", func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := authenticateRequest(w, runtime, r); !ok {

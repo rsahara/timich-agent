@@ -556,7 +556,7 @@ func TestHandleRelayRequestPropagatesDeadlineToMediaHandler(t *testing.T) {
 func TestRelayRequestUsesReservedSessionWorker(t *testing.T) {
 	t.Parallel()
 
-	for _, path := range []string{"/v1/session/refresh", "/v1/pairing/redeem"} {
+	for _, path := range []string{"/v1/session/refresh", "/v1/pairing/redeem", "/v1/webrtc/sessions/rtc-123/authorize"} {
 		if !relayRequestUsesSessionWorker(&RelayRequest{Path: path}) {
 			t.Fatalf("relayRequestUsesSessionWorker(%q) = false, want true", path)
 		}

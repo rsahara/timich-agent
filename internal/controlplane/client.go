@@ -18,6 +18,7 @@ import (
 	"github.com/rsahara/timich-agent/internal/mediaapi"
 	runtimestate "github.com/rsahara/timich-agent/internal/runtime"
 	"github.com/rsahara/timich-agent/internal/store"
+	"github.com/rsahara/timich-agent/internal/webrtcmedia"
 	"google.golang.org/grpc"
 )
 
@@ -33,6 +34,8 @@ const (
 var controlPlaneDialTimeout = 15 * time.Second
 
 type Client struct {
+	leaseMu                       sync.RWMutex
+	leaseConn                     *grpc.ClientConn
 	version                       string
 	target                        string
 	hostedBaseURL                 string
@@ -74,7 +77,7 @@ func NewClient(
 	options ClientOptions,
 ) *Client {
 	status := runtime.StatusResponse()
-	return &Client{
+	client := &Client{
 		version:                       version,
 		target:                        strings.TrimSpace(target),
 		hostedBaseURL:                 strings.TrimRight(strings.TrimSpace(hostedBaseURL), "/"),
@@ -89,6 +92,8 @@ func NewClient(
 		relayRegistrationReadyFunc:    options.RelayRegistrationReadyFunc,
 		relayCredentialRegisteredFunc: options.RelayCredentialRegisteredFunc,
 	}
+	runtime.SetWebRTCLeaseChecker(client.checkMediaAuthorization)
+	return client
 }
 
 func RegisterRelayCredential(
@@ -246,6 +251,16 @@ func (c *Client) runOnce(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close()
+	c.leaseMu.Lock()
+	c.leaseConn = conn
+	c.leaseMu.Unlock()
+	defer func() {
+		c.leaseMu.Lock()
+		if c.leaseConn == conn {
+			c.leaseConn = nil
+		}
+		c.leaseMu.Unlock()
+	}()
 
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
@@ -372,7 +387,7 @@ func relayRequestUsesSessionWorker(request *RelayRequest) bool {
 	if err != nil {
 		return false
 	}
-	return strings.HasPrefix(parsedURL.Path, "/v1/session/") ||
+	return (strings.HasPrefix(parsedURL.Path, "/v1/webrtc/sessions/") && strings.HasSuffix(parsedURL.Path, "/authorize")) || strings.HasPrefix(parsedURL.Path, "/v1/session/") ||
 		strings.HasPrefix(parsedURL.Path, "/v1/pairing/")
 }
 
@@ -508,6 +523,7 @@ func (c *Client) handleMediaRequest(request *RelayRequest, parsedURL *url.URL) R
 }
 
 func (c *Client) handleMediaRequestContext(ctx context.Context, request *RelayRequest, parsedURL *url.URL) RelayResponse {
+	ctx = webrtcmedia.WithHostedAuthority(ctx, c.mediaAuthority())
 	baseURL := hostedBaseURLFromHeaders(request.Headers, c.hostedBaseURL)
 	if baseURL == "" {
 		return jsonErrorResponse(

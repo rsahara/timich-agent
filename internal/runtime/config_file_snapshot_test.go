@@ -15,12 +15,19 @@ func TestConfigFileSnapshotRestoresExistingFile(t *testing.T) {
 	if err := os.WriteFile(path, original, 0o640); err != nil {
 		t.Fatalf("WriteFile(original) error = %v", err)
 	}
+	// WriteFile applies the process umask; establish the mode being restored.
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatalf("Chmod(original) error = %v", err)
+	}
 	snapshot, err := snapshotConfigFile(path)
 	if err != nil {
 		t.Fatalf("snapshotConfigFile() error = %v", err)
 	}
 	if err := os.WriteFile(path, []byte("{\"datasources\":[]}\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile(mutated) error = %v", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("Chmod(mutated) error = %v", err)
 	}
 	if err := snapshot.restore(); err != nil {
 		t.Fatalf("restore() error = %v", err)
@@ -68,6 +75,10 @@ func TestApplyConfigFileMutationRestoresFileAfterPostReplacementError(t *testing
 	if err := os.WriteFile(path, before, 0o640); err != nil {
 		t.Fatalf("WriteFile(before) error = %v", err)
 	}
+	// WriteFile applies the process umask; establish the mode being restored.
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatalf("Chmod(before) error = %v", err)
+	}
 	snapshot, err := snapshotConfigFile(path)
 	if err != nil {
 		t.Fatalf("snapshotConfigFile() error = %v", err)
@@ -76,6 +87,9 @@ func TestApplyConfigFileMutationRestoresFileAfterPostReplacementError(t *testing
 	writeErr := errors.New("sync parent directory after rename")
 	err = applyConfigFileMutation(snapshot, func() error {
 		if err := os.WriteFile(path, []byte("after\n"), 0o600); err != nil {
+			return err
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
 			return err
 		}
 		return writeErr

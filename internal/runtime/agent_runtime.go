@@ -127,6 +127,7 @@ type AgentRuntime struct {
 	semanticTopologyGeneration     uint64
 	semanticONNXRuntime            *semanticONNXRuntimeManager
 	webrtc                         *webrtcmedia.Manager
+	webrtcDevices                  uploadLockRegistry
 }
 
 type BuildInfo struct {
@@ -2461,7 +2462,12 @@ func (a *AgentRuntime) RevokeDevice(deviceID string) error {
 	deviceID = strings.TrimSpace(deviceID)
 	release := a.uploadDevices.lock(deviceID)
 	defer release()
+	releaseRTC := a.webrtcDevices.lock(deviceID)
 	registryErr := a.registry.RevokeDevice(deviceID)
+	if registryErr == nil || errors.Is(registryErr, store.ErrDeviceNotFound) {
+		a.webrtcManager().RevokeDevice(deviceID)
+	}
+	releaseRTC()
 	if registryErr != nil && !errors.Is(registryErr, store.ErrDeviceNotFound) {
 		return registryErr
 	}
@@ -3849,9 +3855,48 @@ func (a *AgentRuntime) Original(request *http.Request, assetID string) (*catalog
 }
 
 // AnswerWebRTCOffer answers a remote media DataChannel offer for prototype streaming.
-func (a *AgentRuntime) AnswerWebRTCOffer(ctx context.Context, request webrtcmedia.OfferRequest) (webrtcmedia.OfferResponse, error) {
-	webrtcManager := a.webrtcManager()
-	return webrtcManager.AnswerOffer(ctx, request)
+func (a *AgentRuntime) AnswerWebRTCOffer(ctx context.Context, request webrtcmedia.OfferRequest, claims security.AccessTokenClaims) (webrtcmedia.OfferResponse, error) {
+	auth, err := webRTCAuthorization(ctx, claims)
+	if err != nil {
+		return webrtcmedia.OfferResponse{}, err
+	}
+	release := a.webrtcDevices.readLock(claims.AppDeviceID)
+	if !a.registry.HasDevice(claims.AppDeviceID) {
+		release()
+		return webrtcmedia.OfferResponse{}, webrtcmedia.ErrAuthorization
+	}
+	manager := a.webrtcManager()
+	id, err := manager.Prepare(auth)
+	release()
+	if err != nil {
+		return webrtcmedia.OfferResponse{}, err
+	}
+	return manager.AnswerOffer(ctx, request, id)
+}
+
+func webRTCAuthorization(ctx context.Context, claims security.AccessTokenClaims) (webrtcmedia.Authorization, error) {
+	authority, hosted := webrtcmedia.HostedAuthority(ctx)
+	if hosted && authority == "" {
+		return webrtcmedia.Authorization{}, webrtcmedia.ErrAuthorization
+	}
+	return webrtcmedia.Authorization{AgentID: claims.AgentID, DeviceID: claims.AppDeviceID, KeyID: claims.KeyID, Authority: authority, IssuedAt: claims.IssuedAt, ExpiresAt: time.Unix(claims.ExpiresAt, 0)}, nil
+}
+
+func (a *AgentRuntime) ReauthorizeWebRTC(ctx context.Context, id string, claims security.AccessTokenClaims) error {
+	auth, err := webRTCAuthorization(ctx, claims)
+	if err != nil {
+		return err
+	}
+	release := a.webrtcDevices.readLock(claims.AppDeviceID)
+	defer release()
+	if !a.registry.HasDevice(claims.AppDeviceID) {
+		return webrtcmedia.ErrAuthorization
+	}
+	return a.webrtcManager().Reauthorize(id, auth)
+}
+
+func (a *AgentRuntime) SetWebRTCLeaseChecker(check webrtcmedia.LeaseChecker) {
+	a.webrtcManager().SetLeaseChecker(check)
 }
 
 // CompatibilityCheck runs a remote browsing readiness probe from the agent runtime.

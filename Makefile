@@ -680,7 +680,7 @@ dist:
 
 update-manifest:
 	@mkdir -p "$(DIST_DIR)"
-	@archives="$$(find "$(DIST_DIR)" -maxdepth 1 -type f -name 'timich-agent_$(TIMICH_AGENT_VERSION)_*_*.tar.gz' | sort)" && \
+	@archives="$$(find "$(DIST_DIR)" -maxdepth 1 -type f -name 'timich-agent_$(TIMICH_AGENT_VERSION)_*_*.tar.gz' ! -name '*.docker.tar.gz' | sort)" && \
 		if [ -z "$$archives" ]; then echo "No agent archives found for $(TIMICH_AGENT_VERSION) in $(DIST_DIR). Run make dist for each platform first."; exit 1; fi && \
 		tmp="$(AGENT_UPDATE_MANIFEST).tmp" && \
 		printf '%s\n' \

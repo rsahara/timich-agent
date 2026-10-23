@@ -42,7 +42,7 @@ func TestShutdownTracksCanceledRequestAfterMapRemoval(t *testing.T) {
 	if m.work.Go(func(context.Context) { t.Error("post-stop request ran") }) {
 		t.Fatal("new request accepted")
 	}
-	if _, err := m.AnswerOffer(context.Background(), OfferRequest{SDP: "new"}); err == nil {
+	if _, err := m.AnswerOffer(context.Background(), OfferRequest{SDP: "new"}, "missing"); err == nil {
 		t.Fatal("new offer accepted")
 	}
 	finish()
