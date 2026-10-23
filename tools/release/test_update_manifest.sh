@@ -15,6 +15,11 @@ for arch in amd64 arm64; do
   tar -C "$temporary_dir" -czf "$archive" "$(basename "$stage_dir")"
   archive_sha=$(shasum -a 256 "$archive" | awk '{print $1}')
   printf '%s  %s\n' "$archive_sha" "$(basename "$archive")" > "$archive.sha256"
+  # A public Docker-save archive is a separate release asset, not a bundle.
+  image="$dist_dir/$(basename "$stage_dir").docker.tar.gz"
+  printf 'Docker image fixture; must never be opened as a bundle\n' > "$image"
+  image_sha=$(shasum -a 256 "$image" | awk '{print $1}')
+  printf '%s  %s\n' "$image_sha" "$(basename "$image")" > "$image.sha256"
 done
 
 make -C "$agent_root" update-manifest \

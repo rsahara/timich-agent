@@ -130,4 +130,4 @@ for path in "${model_zips[@]}"; do
 done
 
 echo "Uploaded assets to semantic staging draft $repo $staging_tag"
-echo "The protected Release Timich Agent Bundle workflow owns and publishes the final $tag draft."
+echo "This command only prepares semantic staging inputs; final release publication is a separate process."

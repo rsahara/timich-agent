@@ -60,6 +60,8 @@ func buildFileDescriptor() (protoreflect.FileDescriptor, error) {
 		Name:    proto.String("controlplane.proto"),
 		Package: proto.String("timich.controlplane.v1"),
 		MessageType: []*descriptorpb.DescriptorProto{
+			{Name: proto.String("MediaAuthorizationRequest"), Field: []*descriptorpb.FieldDescriptorProto{fieldString("device_id", 1), fieldString("nonce", 2), fieldBool("used", 3)}},
+			{Name: proto.String("MediaAuthorizationResponse"), Field: []*descriptorpb.FieldDescriptorProto{fieldString("nonce", 1), fieldString("decision", 2), fieldInt64("max_age_millis", 3)}},
 			{
 				Name: proto.String("Header"),
 				Field: []*descriptorpb.FieldDescriptorProto{
@@ -140,6 +142,7 @@ func buildFileDescriptor() (protoreflect.FileDescriptor, error) {
 			{
 				Name: proto.String("ControlPlane"),
 				Method: []*descriptorpb.MethodDescriptorProto{
+					{Name: proto.String("CheckMediaAuthorization"), InputType: proto.String(".timich.controlplane.v1.MediaAuthorizationRequest"), OutputType: proto.String(".timich.controlplane.v1.MediaAuthorizationResponse")},
 					{
 						Name:            proto.String("OpenControlStream"),
 						InputType:       proto.String(".timich.controlplane.v1.AgentEvent"),

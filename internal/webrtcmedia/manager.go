@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
 	"github.com/rsahara/timich-agent/internal/catalog"
 	"github.com/rsahara/timich-agent/internal/lifecycle"
@@ -43,12 +42,16 @@ type Manager struct {
 	original OriginalLoader
 	work     *lifecycle.Group
 	offers   lifecycle.Group
+	cleanup  lifecycle.Group
 
 	mu         sync.Mutex
 	sessions   map[string]*session
 	canceled   bool
 	cancelOnce sync.Once
 	cancelErr  error
+	leases     map[string]*leaseScope
+	checkLease LeaseChecker
+	leaseSlots chan struct{}
 }
 
 type OfferRequest struct {
@@ -58,9 +61,10 @@ type OfferRequest struct {
 }
 
 type OfferResponse struct {
-	SessionID string `json:"sessionId"`
-	SDP       string `json:"sdp"`
-	Type      string `json:"type"`
+	AuthorizationVersion int    `json:"authorizationVersion"`
+	SessionID            string `json:"sessionId"`
+	SDP                  string `json:"sdp"`
+	Type                 string `json:"type"`
 }
 
 type ICEServer struct {
@@ -70,12 +74,17 @@ type ICEServer struct {
 }
 
 type session struct {
-	id        string
-	peer      *webrtc.PeerConnection
-	done      chan struct{}
-	sendMu    sync.Mutex
-	requestMu sync.Mutex
-	requests  map[string]*activeMediaRequest
+	auth           Authorization
+	active, closed bool
+	ctx            context.Context
+	cancel         context.CancelFunc
+	tokenTimer     *time.Timer
+	lease          *leaseScope
+	id             string
+	peer           *webrtc.PeerConnection
+	sendMu         sync.Mutex
+	requestMu      sync.Mutex
+	requests       map[string]*activeMediaRequest
 }
 
 type activeMediaRequest struct {
@@ -140,19 +149,44 @@ func NewManager(original OriginalLoader) *Manager {
 
 func NewManagerWithLifecycle(original OriginalLoader, work *lifecycle.Group) *Manager {
 	return &Manager{
-		work:     work,
-		original: original,
-		sessions: make(map[string]*session),
+		work:       work,
+		original:   original,
+		sessions:   make(map[string]*session),
+		leases:     make(map[string]*leaseScope),
+		leaseSlots: make(chan struct{}, 4),
 	}
 }
 
-func (m *Manager) AnswerOffer(ctx context.Context, request OfferRequest) (OfferResponse, error) {
+func (m *Manager) AnswerOffer(ctx context.Context, request OfferRequest, sessionID string) (OfferResponse, error) {
+	m.mu.Lock()
+	active := m.sessions[sessionID]
+	m.mu.Unlock()
+	if active == nil {
+		return OfferResponse{}, ErrAuthorization
+	}
+	accepted := false
+	defer func() {
+		if !accepted {
+			m.closeSession(sessionID, false)
+		}
+	}()
+	if active.lease != nil {
+		select {
+		case <-active.lease.ready:
+		case <-ctx.Done():
+			return OfferResponse{}, ctx.Err()
+		case <-active.ctx.Done():
+			return OfferResponse{}, ErrAuthorization
+		}
+	}
 	_, release, ok := m.offers.Acquire()
 	if !ok {
 		return OfferResponse{}, errors.New("agent is shutting down")
 	}
 	defer release()
 	ctx, cancel := context.WithCancel(ctx)
+	stopSession := context.AfterFunc(active.ctx, cancel)
+	defer stopSession()
 	stop := context.AfterFunc(m.work.Context(), cancel)
 	defer stop()
 	defer cancel()
@@ -166,13 +200,14 @@ func (m *Manager) AnswerOffer(ctx context.Context, request OfferRequest) (OfferR
 		return OfferResponse{}, fmt.Errorf("create peer connection: %w", err)
 	}
 
-	sessionID := "rtc-" + uuid.NewString()
-	active := &session{
-		id:       sessionID,
-		peer:     peer,
-		done:     make(chan struct{}),
-		requests: make(map[string]*activeMediaRequest),
+	active.requestMu.Lock()
+	if !active.authorizedLocked() {
+		active.requestMu.Unlock()
+		_ = peer.Close()
+		return OfferResponse{}, ErrAuthorization
 	}
+	active.peer = peer
+	active.requestMu.Unlock()
 
 	peer.OnDataChannel(func(channel *webrtc.DataChannel) {
 		log.Printf("webrtc media data channel opened label=%q session_id=%q", channel.Label(), sessionID)
@@ -226,9 +261,7 @@ func (m *Manager) AnswerOffer(ctx context.Context, request OfferRequest) (OfferR
 		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed,
 			webrtc.PeerConnectionStateDisconnected:
-			active.cancelAllMediaRequests("peer_" + state.String())
-			m.removeSession(sessionID)
-			_ = peer.Close()
+			m.closeSession(sessionID, false)
 		default:
 		}
 	})
@@ -260,14 +293,13 @@ func (m *Manager) AnswerOffer(ctx context.Context, request OfferRequest) (OfferR
 		return OfferResponse{}, ctx.Err()
 	}
 
-	m.mu.Lock()
-	if m.canceled {
-		m.mu.Unlock()
-		_ = peer.Close()
-		return OfferResponse{}, context.Canceled
+	active.requestMu.Lock()
+	if !active.authorizedLocked() {
+		active.requestMu.Unlock()
+		return OfferResponse{}, ErrAuthorization
 	}
-	m.sessions[sessionID] = active
-	m.mu.Unlock()
+	active.active = true
+	active.requestMu.Unlock()
 
 	local := peer.LocalDescription()
 	if local == nil {
@@ -275,10 +307,12 @@ func (m *Manager) AnswerOffer(ctx context.Context, request OfferRequest) (OfferR
 		return OfferResponse{}, errors.New("local description missing")
 	}
 
+	accepted = true
 	return OfferResponse{
-		SessionID: sessionID,
-		SDP:       local.SDP,
-		Type:      strings.ToLower(local.Type.String()),
+		SessionID:            sessionID,
+		AuthorizationVersion: 1,
+		SDP:                  local.SDP,
+		Type:                 strings.ToLower(local.Type.String()),
 	}, nil
 }
 
@@ -318,6 +352,12 @@ func (m *Manager) handleMediaRequestOwned(ctx context.Context, active *session, 
 	}
 	requestCtx, unregister := active.registerMediaRequestContext(ctx, requestID)
 	defer unregister()
+	if requestCtx.Err() != nil {
+		return
+	}
+	if active.lease != nil {
+		active.lease.used.Store(true)
+	}
 
 	log.Printf(
 		"webrtc media request started session_id=%q request_id=%q method=%q asset_id=%q range=%q",
@@ -363,7 +403,10 @@ func (m *Manager) handleMediaRequestOwned(ctx context.Context, active *session, 
 		})
 		return
 	}
-	defer response.Body.Close()
+	closeBody := sync.OnceFunc(func() { _ = response.Body.Close() })
+	defer closeBody()
+	stopBody := context.AfterFunc(requestCtx, closeBody)
+	defer stopBody()
 
 	if errors.Is(requestCtx.Err(), context.Canceled) {
 		log.Printf(
@@ -623,6 +666,12 @@ func (s *session) registerMediaRequestContext(parent context.Context, requestID 
 	entry := &activeMediaRequest{cancel: cancel}
 
 	s.requestMu.Lock()
+	if !s.active || !s.authorizedLocked() {
+		s.requestMu.Unlock()
+		cancel()
+		return ctx, func() {}
+	}
+	stopSession := context.AfterFunc(s.ctx, cancel)
 	if previous := s.requests[requestID]; previous != nil {
 		previous.cancel()
 		log.Printf("webrtc media replaced active request session_id=%q request_id=%q", s.id, requestID)
@@ -631,6 +680,7 @@ func (s *session) registerMediaRequestContext(parent context.Context, requestID 
 	s.requestMu.Unlock()
 
 	return ctx, func() {
+		stopSession()
 		s.requestMu.Lock()
 		if current := s.requests[requestID]; current == entry {
 			delete(s.requests, requestID)
@@ -684,17 +734,29 @@ func (s *session) cancelAllMediaRequests(reason string) {
 }
 
 func (s *session) sendJSON(channel dataChannel, payload any) {
+	if !s.authorized() {
+		return
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+	if !s.authorized() {
+		return
+	}
 	_ = channel.SendText(string(body))
 }
 
 func (s *session) waitForSendBudget(ctx context.Context, channel dataChannel) error {
+	if !s.authorized() {
+		return ErrAuthorization
+	}
 	for channel.BufferedAmount() > maxDataChannelBufferedAmount {
+		if !s.authorized() {
+			return ErrAuthorization
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

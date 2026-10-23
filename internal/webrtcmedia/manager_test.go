@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 	"github.com/rsahara/timich-agent/internal/catalog"
@@ -39,10 +40,10 @@ func TestAnswerOfferRejectsMissingAndMalformedSDP(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil)
-	if _, err := manager.AnswerOffer(context.Background(), OfferRequest{SDP: "   "}); err == nil || !strings.Contains(err.Error(), "sdp is required") {
+	if _, err := manager.AnswerOffer(context.Background(), OfferRequest{SDP: "   "}, prepareTestSession(t, manager)); err == nil || !strings.Contains(err.Error(), "sdp is required") {
 		t.Fatalf("AnswerOffer(blank SDP) error = %v, want required-SDP error", err)
 	}
-	if _, err := manager.AnswerOffer(context.Background(), OfferRequest{SDP: "not-an-sdp"}); err == nil || !strings.Contains(err.Error(), "set remote description") {
+	if _, err := manager.AnswerOffer(context.Background(), OfferRequest{SDP: "not-an-sdp"}, prepareTestSession(t, manager)); err == nil || !strings.Contains(err.Error(), "set remote description") {
 		t.Fatalf("AnswerOffer(malformed SDP) error = %v, want remote-description error", err)
 	}
 	if got := managerSessionCount(manager); got != 0 {
@@ -653,8 +654,8 @@ func (r *chunkErrorReadCloser) Close() error {
 
 func newTestSession(id string) *session {
 	return &session{
-		id:       id,
-		done:     make(chan struct{}),
+		id:     id,
+		active: true, auth: Authorization{AgentID: "agent", DeviceID: "device", KeyID: "key", ExpiresAt: time.Now().Add(time.Hour)}, ctx: context.Background(),
 		requests: make(map[string]*activeMediaRequest),
 	}
 }
@@ -714,4 +715,13 @@ func managerSessionCount(manager *Manager) int {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	return len(manager.sessions)
+}
+
+func prepareTestSession(t *testing.T, m *Manager) string {
+	t.Helper()
+	id, err := m.Prepare(Authorization{AgentID: "agent", DeviceID: "device", KeyID: "key", ExpiresAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }

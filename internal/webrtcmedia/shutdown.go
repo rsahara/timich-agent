@@ -14,7 +14,16 @@ func (m *Manager) Wait(ctx context.Context) error {
 	if err := m.offers.Wait(ctx); err != nil {
 		return err
 	}
-	return m.work.Wait(ctx)
+	if err := m.work.Wait(ctx); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	canceled := m.canceled
+	m.mu.Unlock()
+	if canceled {
+		return m.cleanup.Wait(ctx)
+	}
+	return nil
 }
 
 // Close cancels active requests and closes peers before waiting. Completion is
@@ -31,17 +40,16 @@ func (m *Manager) cancelPeers() error {
 	m.work.Cancel()
 	m.mu.Lock()
 	m.canceled = true
-	sessions := m.sessions
-	m.sessions = make(map[string]*session)
-	m.mu.Unlock()
-	var err error
-	for _, active := range sessions {
-		active.cancelAllMediaRequests("shutdown")
-		if active.peer != nil {
-			err = errors.Join(err, active.peer.Close())
-		}
+	ids := make([]string, 0, len(m.sessions))
+	for id := range m.sessions {
+		ids = append(ids, id)
 	}
-	return err
+	m.mu.Unlock()
+	for _, id := range ids {
+		m.closeSession(id, false)
+	}
+	m.cleanup.CloseAdmission()
+	return nil
 }
 
 func (m *Manager) Close() error {
