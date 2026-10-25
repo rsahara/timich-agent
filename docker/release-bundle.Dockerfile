@@ -1,6 +1,10 @@
 FROM debian:bookworm-slim
 
-RUN apt-get update && \
+# Bootstrap HTTPS apt without opening port 80 in the disposable build network.
+COPY --from=alpine:3.22 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/debian.sources && \
+	apt-get update && \
 	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
 		ca-certificates \
 		ffmpeg \
